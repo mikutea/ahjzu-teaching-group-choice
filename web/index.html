@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#7f292f">
+  <title>教学组线上抢选</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body class="student-body">
+  <div class="blueprint-grid" aria-hidden="true"></div>
+  <header class="student-brandbar">
+    <a class="college-wordmark college-wordmark--mobile" href="/" aria-label="建筑与空间规划学院教学组抢选首页">
+      <img src="/brand/college-wordmark-official.png" alt="建筑与空间规划学院">
+    </a>
+    <span class="student-brandbar__label">教学事务 · 在线服务</span>
+  </header>
+
+  <main class="student-main">
+    <section class="student-hero" aria-labelledby="activity-title">
+      <p class="eyebrow">TEACHING GROUP SELECTION</p>
+      <h1 id="activity-title">教学组线上抢选</h1>
+      <p id="organization-name" class="student-hero__org">安徽建筑大学 · 建筑与空间规划学院</p>
+      <div id="public-status" class="status-ribbon status-ribbon--closed">
+        <span class="status-dot"></span><span>正在读取活动状态</span>
+      </div>
+    </section>
+
+    <section id="login-view" class="student-card" aria-labelledby="login-title">
+      <div class="section-heading">
+        <span class="section-index">01</span>
+        <div>
+          <h2 id="login-title">身份核验</h2>
+          <p>请填写名单中的信息和一次性激活码</p>
+        </div>
+      </div>
+      <form id="student-login-form" class="form-stack" novalidate>
+        <label class="field">
+          <span>学号</span>
+          <input id="student-no" name="student_no" inputmode="numeric" autocomplete="username" maxlength="40" required placeholder="请输入学号">
+        </label>
+        <label class="field">
+          <span>姓名</span>
+          <input id="student-name" name="name" autocomplete="name" maxlength="80" required placeholder="请输入姓名">
+        </label>
+        <label class="field">
+          <span>激活码</span>
+          <input id="activation-code" name="activation_code" autocomplete="one-time-code" maxlength="64" required placeholder="8 位激活码">
+        </label>
+        <button class="button button--primary button--wide" type="submit">
+          核验并进入 <span aria-hidden="true">→</span>
+        </button>
+      </form>
+      <p class="privacy-note"><span aria-hidden="true">◇</span> 信息仅用于本次教学组抢选核验</p>
+    </section>
+
+    <section id="choice-view" class="student-card is-hidden" aria-labelledby="choice-title">
+      <div class="student-identity">
+        <div class="student-avatar" aria-hidden="true">建</div>
+        <div>
+          <p id="student-display-name" class="student-identity__name"></p>
+          <p id="student-display-meta" class="student-identity__meta"></p>
+        </div>
+        <button id="student-logout" class="button button--quiet button--small" type="button">退出</button>
+      </div>
+      <div class="section-heading section-heading--choice">
+        <span class="section-index">02</span>
+        <div>
+          <h2 id="choice-title">选择教学组</h2>
+          <p>余量由服务器实时判定，提交成功后不可自行修改</p>
+        </div>
+      </div>
+      <div id="group-list" class="group-list" role="radiogroup" aria-label="教学组列表"></div>
+      <button id="submit-choice" class="button button--primary button--wide" type="button" disabled>确认选择</button>
+      <p id="choice-hint" class="choice-hint">请选择一个仍有名额的教学组</p>
+    </section>
+
+    <section id="success-view" class="student-card success-card is-hidden" aria-labelledby="success-title">
+      <div class="success-mark" aria-hidden="true">✓</div>
+      <p class="eyebrow">SUBMITTED</p>
+      <h2 id="success-title">选择成功</h2>
+      <p id="success-message" class="success-card__message"></p>
+      <div class="success-ticket">
+        <span>系统记录时间</span>
+        <strong id="success-time"></strong>
+      </div>
+      <p class="success-card__tip">请截图留存。最终安排以学院发布结果为准。</p>
+      <button id="success-logout" class="button button--secondary button--wide" type="button">安全退出</button>
+    </section>
+
+    <div id="student-message" class="toast" role="status" aria-live="polite"></div>
+  </main>
+
+  <footer class="site-footer site-footer--student">
+    <span id="student-footer-org">安徽建筑大学 · 建筑与空间规划学院</span>
+    <span>制作：<span id="student-footer-owner">Mikutea</span></span>
+  </footer>
+
+  <dialog id="confirm-dialog" class="confirm-dialog">
+    <form method="dialog">
+      <p class="eyebrow">FINAL CHECK</p>
+      <h2>确认提交教学组？</h2>
+      <p id="confirm-group-name" class="confirm-dialog__group"></p>
+      <p>提交成功后学生端不能自行修改，请再次核对。</p>
+      <div class="dialog-actions">
+        <button class="button button--quiet" value="cancel">返回检查</button>
+        <button id="confirm-submit" class="button button--primary" value="confirm">确认提交</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/assets/student.js" defer></script>
+</body>
+</html>
+

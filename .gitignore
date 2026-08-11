@@ -4,6 +4,7 @@
 
 __pycache__/
 *.py[cod]
+.venv/
 .pytest_cache/
 .coverage
 htmlcov/
@@ -29,4 +30,3 @@ deploy/keys/
 .vscode/
 .DS_Store
 Thumbs.db
-

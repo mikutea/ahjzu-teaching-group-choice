@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#7f292f">
+  <title>教学组抢选 · 管理端</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body class="admin-body">
+  <section id="admin-login-view" class="admin-login-shell">
+    <div class="admin-login-brand">
+      <div class="college-wordmark college-wordmark--login">
+        <img src="/brand/college-wordmark-official.png" alt="建筑与空间规划学院">
+      </div>
+      <p class="eyebrow eyebrow--light">TEACHING ADMINISTRATION</p>
+      <h1>教学组抢选管理平台</h1>
+      <p>专业、教学组、配额和名单由学院独立管理</p>
+      <div class="architectural-lines" aria-hidden="true"></div>
+    </div>
+    <div class="admin-login-panel">
+      <form id="admin-login-form" class="admin-login-card" novalidate>
+        <span class="section-index">ADMIN</span>
+        <h2>管理员登录</h2>
+        <p>使用部署时设置的管理账号进入</p>
+        <label class="field">
+          <span>账号</span>
+          <input name="username" autocomplete="username" required value="admin">
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <button class="button button--primary button--wide" type="submit">进入管理平台</button>
+        <p id="admin-login-error" class="form-error" role="alert"></p>
+      </form>
+    </div>
+  </section>
+
+  <div id="admin-app" class="admin-app is-hidden">
+    <aside class="admin-sidebar">
+      <div class="college-wordmark college-wordmark--desktop">
+        <img src="/brand/college-wordmark-official.png" alt="建筑与空间规划学院">
+      </div>
+      <nav class="admin-nav" aria-label="管理功能">
+        <button class="admin-nav__item is-active" data-view="overview" type="button"><span>◫</span>实时大屏</button>
+        <button class="admin-nav__item" data-view="structure" type="button"><span>⌘</span>专业与教学组</button>
+        <button class="admin-nav__item" data-view="students" type="button"><span>◎</span>学生与结果</button>
+        <button class="admin-nav__item" data-view="settings" type="button"><span>◇</span>系统设置</button>
+      </nav>
+      <div class="admin-sidebar__footer">
+        <span id="sidebar-owner">制作：Mikutea</span>
+        <button id="admin-logout" class="button button--sidebar" type="button">安全退出</button>
+      </div>
+    </aside>
+
+    <main class="admin-main">
+      <header class="admin-topbar">
+        <div>
+          <p class="eyebrow">LIVE CONTROL DESK</p>
+          <h1 id="admin-title">教学组线上抢选</h1>
+        </div>
+        <div class="admin-topbar__actions">
+          <span id="last-refresh" class="last-refresh">尚未刷新</span>
+          <span id="admin-status-badge" class="status-badge status-badge--closed">已关闭</span>
+          <button id="toggle-status" class="button button--primary" type="button">开放抢选</button>
+        </div>
+      </header>
+
+      <section id="view-overview" class="admin-view">
+        <div id="live-board" class="live-board">
+          <section class="board-panel board-panel--stats" aria-labelledby="stats-title">
+            <div class="panel-kicker">CURRENT STATUS</div>
+            <h2 id="stats-title">当前选择情况</h2>
+            <div class="stat-pair">
+              <article class="metric-card metric-card--selected">
+                <span>已选</span><strong id="metric-selected">0</strong><small>人</small>
+              </article>
+              <article class="metric-card">
+                <span>未选</span><strong id="metric-unselected">0</strong><small>人</small>
+              </article>
+            </div>
+            <div class="overall-progress">
+              <div class="progress-label"><span>总体完成率</span><strong id="metric-rate">0%</strong></div>
+              <div class="progress-track"><span id="metric-rate-bar"></span></div>
+            </div>
+            <h3>各教学组进度</h3>
+            <div id="group-progress" class="group-progress"></div>
+          </section>
+
+          <section class="board-panel board-panel--qr" aria-labelledby="qr-title">
+            <div class="qr-heading">
+              <div>
+                <div class="panel-kicker">SCAN TO SELECT</div>
+                <h2 id="qr-title">扫码进入学生端</h2>
+              </div>
+              <button id="fullscreen-board" class="button button--outline" type="button">⛶ 全屏展示</button>
+            </div>
+            <div class="qr-frame">
+              <img id="student-qr" alt="学生端二维码">
+              <div id="qr-placeholder" class="qr-placeholder">请先在系统设置中填写学生端访问地址</div>
+              <span class="qr-corner qr-corner--a"></span><span class="qr-corner qr-corner--b"></span>
+              <span class="qr-corner qr-corner--c"></span><span class="qr-corner qr-corner--d"></span>
+            </div>
+            <p id="public-url-label" class="public-url">尚未设置访问地址</p>
+            <div class="qr-notice"><span class="status-dot"></span><strong id="board-status-text">当前未开放</strong><small>手机浏览器扫码，无需安装应用</small></div>
+          </section>
+
+          <section class="board-panel board-panel--unselected" aria-labelledby="unselected-title">
+            <div class="panel-title-row">
+              <div>
+                <div class="panel-kicker">WAITING LIST</div>
+                <h2 id="unselected-title">当前未选学生</h2>
+              </div>
+              <span id="unselected-count" class="count-chip">0 人</span>
+            </div>
+            <label class="compact-search">
+              <span aria-hidden="true">⌕</span>
+              <input id="unselected-search" type="search" placeholder="搜索姓名 / 学号 / 专业">
+            </label>
+            <div id="unselected-list" class="unselected-list"></div>
+            <a class="button button--quiet button--wide" href="/api/admin/export/unselected.csv">导出未选名单</a>
+          </section>
+        </div>
+
+        <section class="content-card recent-card">
+          <div class="content-card__heading">
+            <div><p class="eyebrow">RECENT ACTIVITY</p><h2>最近选择记录</h2></div>
+            <a class="button button--outline" href="/api/admin/export/selections.csv">导出全部结果</a>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table">
+              <thead><tr><th>学生</th><th>专业</th><th>教学组</th><th>时间</th><th>来源</th><th>操作</th></tr></thead>
+              <tbody id="recent-selection-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section id="view-structure" class="admin-view is-hidden">
+        <div class="page-heading">
+          <div><p class="eyebrow">DYNAMIC STRUCTURE</p><h2>专业与教学组</h2><p>名称和数量均可自定义增减；开放抢选后自动锁定结构。</p></div>
+          <span id="structure-lock-hint" class="lock-hint">当前可编辑</span>
+        </div>
+        <div class="structure-grid">
+          <section class="content-card">
+            <div class="content-card__heading"><div><h3>专业设置</h3><p id="major-count-label">0 个专业</p></div></div>
+            <form id="add-major-form" class="inline-add-form">
+              <input name="name" maxlength="80" required placeholder="例如：室内设计">
+              <button class="button button--primary" type="submit">＋ 新增专业</button>
+            </form>
+            <div id="major-editor" class="entity-editor"></div>
+          </section>
+          <section class="content-card">
+            <div class="content-card__heading"><div><h3>教学组设置</h3><p id="group-count-label">0 个教学组</p></div></div>
+            <form id="add-group-form" class="inline-add-form inline-add-form--group">
+              <input name="name" maxlength="80" required placeholder="例如：第七教学组">
+              <input name="capacity" type="number" min="0" max="1000" value="30" aria-label="总容量">
+              <button class="button button--primary" type="submit">＋ 新增教学组</button>
+            </form>
+            <div id="group-editor" class="entity-editor"></div>
+          </section>
+        </div>
+        <section class="content-card quota-card">
+          <div class="content-card__heading">
+            <div><h3>专业 × 教学组配额矩阵</h3><p>每一格都可修改；各专业配额合计不能超过该教学组总容量。</p></div>
+            <span class="legend-chip"><i></i> 已选 / 配额</span>
+          </div>
+          <div id="quota-matrix" class="quota-matrix"></div>
+        </section>
+      </section>
+
+      <section id="view-students" class="admin-view is-hidden">
+        <div class="page-heading">
+          <div><p class="eyebrow">ROSTER & RESULTS</p><h2>学生名单与结果</h2><p>导入只接受当前已建立的专业名称，真实名单不会进入公开仓库。</p></div>
+        </div>
+        <div class="student-admin-grid">
+          <section class="content-card import-card">
+            <h3>导入学生 CSV</h3>
+            <p>表头支持：<code>学号,姓名,专业,激活码</code>。激活码留空时为新生自动生成。</p>
+            <form id="student-import-form" class="upload-form">
+              <label class="file-drop">
+                <span class="file-drop__icon">⇧</span>
+                <strong>选择 CSV 文件</strong>
+                <small id="import-file-name">UTF-8 或 GB18030，最大 1 MB</small>
+                <input id="student-csv" type="file" name="file" accept=".csv,text/csv" required>
+              </label>
+              <button class="button button--primary button--wide" type="submit">导入并校验</button>
+            </form>
+            <button id="download-template" class="button button--quiet button--wide" type="button">下载 CSV 模板</button>
+            <div id="import-result" class="import-result"></div>
+          </section>
+          <section class="content-card">
+            <div class="content-card__heading"><div><h3>未选学生补位</h3><p>选择教学组后由管理员写入，仍受配额上限约束。</p></div></div>
+            <div class="table-scroll table-scroll--tall">
+              <table class="data-table">
+                <thead><tr><th>学号</th><th>姓名</th><th>专业</th><th>补位到</th><th></th></tr></thead>
+                <tbody id="assignment-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="view-settings" class="admin-view is-hidden">
+        <div class="page-heading">
+          <div><p class="eyebrow">SYSTEM SETTINGS</p><h2>活动与版权信息</h2><p>页脚同时保留学校、学院和制作人信息。</p></div>
+        </div>
+        <div class="settings-grid">
+          <form id="settings-form" class="content-card settings-form">
+            <h3>基础设置</h3>
+            <label class="field"><span>活动标题</span><input name="activity_title" maxlength="120" required></label>
+            <label class="field"><span>学校与学院版权文字</span><input name="organization_name" maxlength="160" required></label>
+            <label class="field"><span>制作人</span><input name="owner_name" maxlength="80" required></label>
+            <label class="field"><span>学生端访问地址</span><input name="public_base_url" type="url" maxlength="300" placeholder="例如：http://192.168.22.50"></label>
+            <p class="field-help">二维码将指向该地址。校内 HTTP 可先试用，正式跨网使用应配置 HTTPS。</p>
+            <button class="button button--primary" type="submit">保存设置</button>
+          </form>
+          <form id="password-form" class="content-card settings-form">
+            <h3>修改管理员密码</h3>
+            <label class="field"><span>当前密码</span><input name="current_password" type="password" autocomplete="current-password" required></label>
+            <label class="field"><span>新密码</span><input name="new_password" type="password" minlength="12" autocomplete="new-password" required></label>
+            <label class="field"><span>确认新密码</span><input name="confirm_password" type="password" minlength="12" autocomplete="new-password" required></label>
+            <p class="field-help">至少 12 位；修改后其他管理端会话自动失效。</p>
+            <button class="button button--secondary" type="submit">更新密码</button>
+          </form>
+        </div>
+      </section>
+
+      <footer class="site-footer site-footer--admin">
+        <span id="admin-footer-org">安徽建筑大学 · 建筑与空间规划学院</span>
+        <span>制作：<span id="admin-footer-owner">Mikutea</span></span>
+      </footer>
+      <div id="admin-toast" class="toast toast--admin" role="status" aria-live="polite"></div>
+    </main>
+  </div>
+
+  <dialog id="danger-dialog" class="confirm-dialog">
+    <form method="dialog">
+      <p class="eyebrow">CONFIRM ACTION</p>
+      <h2 id="danger-dialog-title">确认操作</h2>
+      <p id="danger-dialog-message"></p>
+      <div class="dialog-actions">
+        <button class="button button--quiet" value="cancel">取消</button>
+        <button class="button button--danger" value="confirm">确认</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/assets/admin.js" defer></script>
+</body>
+</html>
+

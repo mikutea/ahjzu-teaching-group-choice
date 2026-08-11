@@ -1,0 +1,14 @@
+.git
+.github
+.env
+data
+backups
+design
+docs
+tests
+deploy
+scripts
+*.db
+__pycache__
+.pytest_cache
+

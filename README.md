@@ -2,7 +2,7 @@
 
 面向手机扫码使用的网页抢选工具。学生无需安装 App，扫码后完成身份核验并选择教学组；管理端可维护专业、教学组名称及数量，控制开放时间，并实时查看已选、未选和未选学生名单。
 
-> 当前状态：学院品牌界面定稿已完成，业务功能与独立虚拟机部署正在实现。
+> 当前状态：响应式学生端、管理端、动态专业/教学组、配额事务、名单导入导出和 Docker 部署代码已完成；独立虚拟机部署与现场验收进行中。
 
 ## 定稿界面
 
@@ -39,9 +39,28 @@
 - 审计日志、CSV 导入导出、备份与恢复脚本；
 - 自动化测试覆盖身份核验、重复提交、末位并发和权限边界。
 
+## 本地运行
+
+```powershell
+Copy-Item .env.example .env
+# 将 .env 中的 APP_SECRET、ADMIN_INITIAL_PASSWORD 和 PUBLIC_BASE_URL 改为本机测试值
+python -m pip install -r server/requirements-dev.txt
+uvicorn server.main:create_app --factory --host 127.0.0.1 --port 8765
+```
+
+- 学生端：<http://127.0.0.1:8765/>
+- 管理端：<http://127.0.0.1:8765/admin>
+
+运行测试：
+
+```powershell
+python -m pytest --basetemp "$env:LOCALAPPDATA\Codex\teaching-choice-tests\manual-run"
+```
+
+独立虚拟机部署见 [docs/deployment.md](docs/deployment.md)。
+
 ## 品牌与许可
 
 代码以 [MIT License](LICENSE) 发布。学院标识及学校、学院名称不在 MIT 授权范围内，详见 [NOTICE.md](NOTICE.md)。
 
 页面页脚版权信息设计为：`安徽建筑大学 · 建筑与空间规划学院 · 制作：Mikutea`，其中制作人名称可在管理端修改。
-

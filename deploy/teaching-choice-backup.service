@@ -1,0 +1,10 @@
+[Unit]
+Description=Backup teaching group choice SQLite database
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/ahjzu-teaching-group-choice
+ExecStart=/usr/bin/docker compose exec -T app python -m server.maintenance backup --retain 30
+

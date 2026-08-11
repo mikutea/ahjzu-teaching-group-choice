@@ -1,0 +1,30 @@
+services:
+  app:
+    build:
+      context: .
+    image: teaching-group-choice:local
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    ports:
+      - "80:8080"
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3)"]
+      interval: 20s
+      timeout: 4s
+      retries: 3
+      start_period: 15s
+
