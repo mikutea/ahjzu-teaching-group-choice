@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>学生端设计稿</title>
+  <link rel="stylesheet" href="./common.css" />
+  <style>
+    body { min-width: 1800px; overflow: auto; }
+    .board {
+      position: relative;
+      display: flex;
+      width: 1800px;
+      min-height: 930px;
+      margin: 0 auto;
+      padding: 46px 42px 50px;
+      gap: 30px;
+      align-items: center;
+      justify-content: center;
+      background: #fdfbfa;
+      overflow: hidden;
+    }
+    .board::before {
+      position: absolute;
+      top: 16px;
+      left: 64px;
+      width: 480px;
+      height: 46px;
+      content: "7800     3900     3900     7800";
+      color: rgba(127, 41, 47, .28);
+      font: 12px/46px var(--font);
+      letter-spacing: 30px;
+      border-top: 1px solid rgba(127,41,47,.2);
+      border-bottom: 1px solid rgba(127,41,47,.2);
+    }
+    .phone {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      width: 386px;
+      height: 820px;
+      overflow: hidden;
+      border: 1px solid #d4c5c7;
+      border-radius: 34px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+    }
+    .statusbar {
+      display: flex;
+      height: 26px;
+      padding: 8px 20px 0;
+      justify-content: space-between;
+      color: #fff;
+      background: var(--college-dark);
+      font: 700 11px/1 var(--font);
+    }
+    .brandbar {
+      position: relative;
+      display: flex;
+      height: 66px;
+      align-items: center;
+      justify-content: center;
+      background: var(--college);
+      border-bottom: 1px solid rgba(255,255,255,.3);
+    }
+    .brandbar .logo-clip { transform: scale(.92); }
+    .page {
+      position: relative;
+      display: flex;
+      flex: 1;
+      flex-direction: column;
+      padding: 25px 28px 20px;
+      overflow: hidden;
+    }
+    .page > *:not(.blueprint-grid):not(.contours):not(.elevation) { position: relative; z-index: 2; }
+    .page h1 {
+      margin: 2px 0 23px;
+      color: var(--college);
+      font-size: 28px;
+      letter-spacing: .12em;
+      text-align: center;
+    }
+    .page h2 { margin: 4px 0 18px; font-size: 20px; }
+    .field {
+      display: grid;
+      grid-template-columns: 74px 1fr;
+      align-items: center;
+      margin-bottom: 13px;
+      font-size: 15px;
+      font-weight: 650;
+    }
+    .field input {
+      width: 100%;
+      height: 48px;
+      padding: 0 14px;
+      color: #a19395;
+      border: 1px solid var(--rule-strong);
+      border-radius: 6px;
+      background: rgba(255,255,255,.92);
+    }
+    .student-action { width: 100%; height: 54px; margin-top: 23px; font-size: 18px; }
+    .page-spacer { flex: 1; }
+    .elevation {
+      position: absolute;
+      left: 12px;
+      right: 12px;
+      bottom: 36px;
+      height: 150px;
+      opacity: .12;
+    }
+    .group-head {
+      display: grid;
+      grid-template-columns: 1.2fr .7fr .8fr 30px;
+      padding: 0 9px 9px;
+      color: var(--muted);
+      border-bottom: 1px solid var(--rule);
+      font-size: 11px;
+    }
+    .group-row {
+      display: grid;
+      grid-template-columns: 1.2fr .7fr .8fr 30px;
+      min-height: 58px;
+      padding: 8px 9px;
+      align-items: center;
+      border-bottom: 1px solid var(--rule);
+      background: rgba(255,255,255,.82);
+    }
+    .group-row.selected {
+      margin: 2px 0;
+      border: 1px solid var(--college);
+      border-radius: 7px;
+      background: var(--college-soft);
+    }
+    .group-name { font-size: 15px; font-weight: 700; }
+    .quota { font-size: 17px; }
+    .quota small { display: block; color: var(--muted); font-size: 9px; }
+    .radio {
+      display: grid;
+      width: 23px;
+      height: 23px;
+      place-items: center;
+      color: #fff;
+      border: 1px solid var(--rule-strong);
+      border-radius: 50%;
+    }
+    .selected .radio { border-color: var(--college); background: var(--college); }
+    .select-action { height: 52px; margin-top: 18px; font-size: 18px; }
+    .warning-copy { margin: 9px 0 0; color: var(--warning); font-size: 11px; text-align: center; }
+    .state-page { align-items: center; justify-content: center; text-align: center; }
+    .state-icon {
+      display: grid;
+      width: 84px;
+      height: 84px;
+      margin-bottom: 24px;
+      place-items: center;
+      color: var(--college);
+      border: 3px solid var(--college);
+      border-radius: 50%;
+      font-size: 48px;
+      line-height: 1;
+    }
+    .state-page h1 { margin-bottom: 12px; font-size: 29px; line-height: 1.45; }
+    .state-page .secondary-button { width: 100%; height: 52px; margin-top: 36px; font-size: 17px; }
+    .receipt {
+      width: 100%;
+      margin: 12px 0 18px;
+      padding: 16px;
+      text-align: left;
+      border: 1px solid var(--rule-strong);
+      border-radius: 8px;
+      background: rgba(248,243,243,.8);
+    }
+    .receipt-row { display: flex; padding: 9px 0; justify-content: space-between; border-bottom: 1px solid var(--rule); }
+    .receipt-row:last-child { border-bottom: 0; }
+    .receipt strong { color: var(--college); font-size: 20px; }
+    .footer-signature { margin-top: auto; }
+  </style>
+</head>
+<body>
+  <main class="board">
+    <article class="phone">
+      <div class="statusbar"><span>9:41</span><span>● ● ▰</span></div>
+      <header class="brandbar"><div class="logo-clip logo-clip--mobile"><img src="../../assets/brand/college-wordmark-official.png" alt="建筑与空间规划学院" /></div></header>
+      <section class="page">
+        <div class="blueprint-grid"></div>
+        <h1>教学组抢选</h1>
+        <h2 class="section-title">身份验证</h2>
+        <label class="field"><span>学号</span><input value="请输入学号" readonly /></label>
+        <label class="field"><span>姓名</span><input value="请输入姓名" readonly /></label>
+        <label class="field"><span>专业</span><input value="请选择专业" readonly /></label>
+        <label class="field"><span>激活码</span><input value="请输入激活码" readonly /></label>
+        <button class="primary-button student-action">验证身份</button>
+        <div class="page-spacer"></div>
+        <svg class="elevation" viewBox="0 0 360 150" aria-hidden="true"><g fill="none" stroke="#7f292f" stroke-width="1.5"><path d="M5 129H355M35 129V105h54V74h65v55M154 129V51h54v78M208 129V82h66v47M274 129V98h44v31M51 105l18-15 20 15M155 51l26-24 27 24M219 82l22-18 33 18"/><path d="M0 140H360M18 140v-8m54 8v-8m54 8v-8m54 8v-8m54 8v-8m54 8v-8"/></g></svg>
+        <p class="footer-signature">安徽建筑大学 · 建筑与空间规划学院 · 制作：姓名</p>
+      </section>
+    </article>
+
+    <article class="phone">
+      <div class="statusbar"><span>9:41</span><span>● ● ▰</span></div>
+      <header class="brandbar"><div class="logo-clip logo-clip--mobile"><img src="../../assets/brand/college-wordmark-official.png" alt="建筑与空间规划学院" /></div></header>
+      <section class="page">
+        <div class="blueprint-grid"></div>
+        <h1>教学组抢选</h1>
+        <div class="group-head"><span>教学组</span><span>总余量</span><span>本专业余量</span><span></span></div>
+        <div class="group-row"><span class="group-name">教学组 1</span><span class="quota">12<small>剩余</small></span><span class="quota">3<small>本专业</small></span><span class="radio"></span></div>
+        <div class="group-row"><span class="group-name">教学组 2</span><span class="quota">8<small>剩余</small></span><span class="quota">2<small>本专业</small></span><span class="radio"></span></div>
+        <div class="group-row selected"><span class="group-name">教学组 3</span><span class="quota">15<small>剩余</small></span><span class="quota">6<small>本专业</small></span><span class="radio">✓</span></div>
+        <div class="group-row"><span class="group-name">教学组 4</span><span class="quota">6<small>剩余</small></span><span class="quota">1<small>本专业</small></span><span class="radio"></span></div>
+        <div class="group-row"><span class="group-name">教学组 5</span><span class="quota">9<small>剩余</small></span><span class="quota">2<small>本专业</small></span><span class="radio"></span></div>
+        <div class="group-row"><span class="group-name">教学组 6</span><span class="quota">10<small>剩余</small></span><span class="quota">3<small>本专业</small></span><span class="radio"></span></div>
+        <button class="primary-button select-action">确认选择</button>
+        <p class="warning-copy">△ 提交后不可更改，请仔细确认</p>
+        <p class="footer-signature">安徽建筑大学 · 建筑与空间规划学院 · 制作：姓名</p>
+      </section>
+    </article>
+
+    <article class="phone">
+      <div class="statusbar"><span>9:41</span><span>● ● ▰</span></div>
+      <header class="brandbar"><div class="logo-clip logo-clip--mobile"><img src="../../assets/brand/college-wordmark-official.png" alt="建筑与空间规划学院" /></div></header>
+      <section class="page state-page">
+        <div class="blueprint-grid"></div>
+        <svg class="contours" viewBox="0 0 300 240" aria-hidden="true"><g fill="none" stroke="#7f292f"><path d="M3 120c41-73 89-57 124-9s82 47 170-31"/><path d="M0 137c49-79 96-61 133-10s88 48 167-25"/><path d="M3 153c56-82 103-61 141-9s91 48 153-10"/><path d="M19 171c61-70 107-51 144-7s77 45 124 3"/></g></svg>
+        <div class="state-icon">×</div>
+        <h1>名额已满，<br />请选择其他教学组</h1>
+        <button class="secondary-button">返回重选</button>
+        <p class="footer-signature">安徽建筑大学 · 建筑与空间规划学院 · 制作：姓名</p>
+      </section>
+    </article>
+
+    <article class="phone">
+      <div class="statusbar"><span>9:41</span><span>● ● ▰</span></div>
+      <header class="brandbar"><div class="logo-clip logo-clip--mobile"><img src="../../assets/brand/college-wordmark-official.png" alt="建筑与空间规划学院" /></div></header>
+      <section class="page state-page">
+        <div class="blueprint-grid"></div>
+        <div class="state-icon">✓</div>
+        <h1>抢选成功<br />结果已锁定</h1>
+        <div class="receipt">
+          <div class="receipt-row"><span>教学组</span><strong>教学组 3</strong></div>
+          <div class="receipt-row"><span>服务器时间</span><span>2026-08-11 22:18:32</span></div>
+        </div>
+        <p style="color:#7b6d6f;font-size:12px">▣ 结果已锁定，不可更改</p>
+        <button class="primary-button" style="width:100%;height:52px;margin-top:26px">查看结果</button>
+        <p class="footer-signature">安徽建筑大学 · 建筑与空间规划学院 · 制作：姓名</p>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

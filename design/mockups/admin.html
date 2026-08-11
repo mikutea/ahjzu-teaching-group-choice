@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>管理端设计稿</title>
+  <link rel="stylesheet" href="./common.css" />
+  <style>
+    body { min-width: 1600px; overflow: auto; }
+    .admin-board {
+      position: relative;
+      display: grid;
+      width: 1600px;
+      height: 1000px;
+      margin: 0 auto;
+      grid-template: 78px 1fr 34px / 176px 1fr;
+      background: var(--paper);
+      overflow: hidden;
+    }
+    .admin-board::after {
+      position: absolute;
+      right: -90px;
+      bottom: -65px;
+      width: 470px;
+      height: 270px;
+      content: "";
+      opacity: .06;
+      border: 1px solid var(--college);
+      border-radius: 50%;
+      box-shadow: inset 0 0 0 22px transparent, 0 0 0 22px var(--college-soft), 0 0 0 23px var(--college), 0 0 0 46px var(--college-soft), 0 0 0 47px var(--college);
+      transform: rotate(-12deg);
+    }
+    .topbar {
+      position: relative;
+      z-index: 2;
+      display: flex;
+      grid-column: 1 / -1;
+      padding: 0 24px;
+      align-items: center;
+      border-bottom: 1px solid var(--rule);
+      background: var(--college);
+    }
+    .topbar .logo-clip { transform: scale(.88); transform-origin: left center; }
+    .topbar h1 {
+      margin: 0 0 0 26px;
+      padding-left: 26px;
+      color: #fff;
+      border-left: 1px solid rgba(255,255,255,.34);
+      font-size: 27px;
+      letter-spacing: .06em;
+    }
+    .topbar-actions { display: flex; margin-left: auto; gap: 10px; align-items: center; }
+    .state-label { color: #ffe9e9; font-weight: 700; }
+    .topbar button { min-width: 116px; height: 40px; }
+    .topbar .primary-button { background: #fff; color: var(--college); border-color: #fff; }
+    .topbar .secondary-button { color: #fff; border-color: rgba(255,255,255,.7); background: transparent; }
+    .sidebar {
+      position: relative;
+      z-index: 2;
+      padding: 18px 12px;
+      background: var(--college-dark);
+      color: #fff;
+    }
+    .nav-item { display: flex; height: 50px; padding: 0 15px; align-items: center; gap: 12px; border-radius: 7px; font-weight: 650; }
+    .nav-item.active { background: rgba(255,255,255,.14); box-shadow: inset 3px 0 #fff; }
+    .nav-icon { width: 22px; text-align: center; font-size: 18px; }
+    .main {
+      position: relative;
+      z-index: 1;
+      padding: 15px 18px 13px;
+      overflow: hidden;
+      background-image:
+        linear-gradient(rgba(127,41,47,.025) 1px,transparent 1px),
+        linear-gradient(90deg,rgba(127,41,47,.025) 1px,transparent 1px);
+      background-size: 32px 32px;
+    }
+    .dashboard {
+      display: grid;
+      height: 100%;
+      grid-template-columns: minmax(600px, 1fr) 250px 302px;
+      gap: 13px;
+    }
+    .column { display: flex; min-width: 0; flex-direction: column; gap: 12px; }
+    .panel {
+      min-width: 0;
+      border: 1px solid var(--rule);
+      border-radius: 8px;
+      background: rgba(255,255,255,.94);
+    }
+    .panel-head { display: flex; min-height: 43px; padding: 10px 13px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--rule); }
+    .panel-head h2 { margin: 0; font-size: 15px; }
+    .panel-head small { color: var(--muted); }
+    .config { padding: 10px 12px 11px; }
+    .config-line { display: grid; grid-template-columns: 68px 1fr auto; gap: 8px; align-items: center; margin-bottom: 8px; }
+    .config-label { color: var(--muted); font-size: 12px; font-weight: 700; }
+    .name-list { display: flex; gap: 6px; flex-wrap: wrap; }
+    .name-input { display: flex; height: 31px; border: 1px solid var(--rule-strong); border-radius: 5px; overflow: hidden; background: #fff; }
+    .name-input input { width: 88px; padding: 0 8px; border: 0; color: var(--ink); font-size: 12px; }
+    .name-input button { width: 25px; color: var(--college); border: 0; border-left: 1px solid var(--rule); background: var(--college-soft); }
+    .add-button { height: 31px; padding: 0 9px; color: var(--college); border: 1px solid var(--college); border-radius: 5px; background: #fff; font-size: 12px; font-weight: 700; }
+    .quota-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
+    .quota-table th, .quota-table td { height: 37px; padding: 4px 6px; border: 1px solid var(--rule); text-align: center; }
+    .quota-table th { background: var(--college-soft); color: var(--college-dark); font-weight: 750; }
+    .quota-table th:first-child { width: 105px; }
+    .quota-table th:last-child { width: 74px; }
+    .quota-table input { width: 52px; height: 25px; text-align: center; border: 1px solid var(--rule-strong); border-radius: 4px; }
+    .quota-summary { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: 9px; border-top: 1px solid var(--rule); }
+    .metric { padding: 9px; text-align: center; }
+    .metric + .metric { border-left: 1px solid var(--rule); }
+    .metric strong { display: block; color: var(--college); font-size: 22px; }
+    .metric span { color: var(--muted); font-size: 11px; }
+    .table-actions { display: flex; padding: 10px 12px; gap: 8px; border-top: 1px solid var(--rule); }
+    .table-actions button { height: 34px; padding: 0 12px; font-size: 12px; }
+    .audit-table, .student-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 11px; }
+    .audit-table th, .audit-table td, .student-table th, .student-table td { padding: 7px 8px; border-bottom: 1px solid var(--rule); text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .audit-table th, .student-table th { color: var(--muted); background: #fbf8f8; }
+    .qr-panel { padding-bottom: 10px; text-align: center; }
+    .qr {
+      display: grid;
+      width: 152px;
+      height: 152px;
+      margin: 12px auto 9px;
+      padding: 8px;
+      grid-template-columns: repeat(11, 1fr);
+      grid-template-rows: repeat(11, 1fr);
+      gap: 2px;
+      border: 1px dashed var(--rule-strong);
+      background: #fff;
+    }
+    .qr i { background: #2d2526; }
+    .qr i:nth-child(3n), .qr i:nth-child(7n+2), .qr i:nth-child(11n+5) { background: transparent; }
+    .qr-actions { display: grid; margin: 0 12px; gap: 7px; }
+    .qr-actions button { height: 36px; font-size: 12px; }
+    .full-screen-hint { margin: 8px 12px 0; color: var(--muted); font-size: 10px; }
+    .live-summary { padding: 12px; }
+    .big-counts { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; }
+    .big-count { padding: 12px 5px; text-align: center; }
+    .big-count + .big-count { border-left: 1px solid var(--rule); }
+    .big-count strong { display: block; color: var(--college); font-size: 27px; }
+    .big-count span { color: var(--muted); font-size: 11px; }
+    .distribution { margin-top: 12px; }
+    .dist-row { margin-bottom: 10px; }
+    .dist-head { display: flex; justify-content: space-between; font-size: 11px; }
+    .bar { height: 5px; margin-top: 5px; border-radius: 4px; background: #eadfe0; overflow: hidden; }
+    .bar span { display: block; height: 100%; background: var(--college); }
+    .search { width: calc(100% - 22px); height: 34px; margin: 10px 11px; padding: 0 10px; border: 1px solid var(--rule-strong); border-radius: 5px; }
+    .student-list { max-height: 520px; overflow: hidden; }
+    .student-table th:nth-child(1) { width: 82px; }
+    .student-table th:nth-child(3) { width: 78px; }
+    .list-footer { display: flex; padding: 10px 11px; justify-content: space-between; align-items: center; border-top: 1px solid var(--rule); color: var(--muted); font-size: 11px; }
+    .list-footer button { height: 30px; padding: 0 9px; font-size: 11px; }
+    .copyright { position: relative; z-index: 3; display: flex; grid-column: 1 / -1; align-items: center; justify-content: center; color: #8b7a7c; border-top: 1px solid var(--rule); background: #fff; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <main class="admin-board">
+    <header class="topbar">
+      <div class="logo-clip logo-clip--desktop"><img src="../../assets/brand/college-wordmark-official.png" alt="建筑与空间规划学院" /></div>
+      <h1>教学组抢选管理</h1>
+      <div class="topbar-actions"><span class="state-label">● 当前：抢选关闭</span><button class="primary-button">开放抢选</button><button class="secondary-button">保持关闭</button></div>
+    </header>
+    <nav class="sidebar">
+      <div class="nav-item active"><span class="nav-icon">▦</span>总览</div>
+      <div class="nav-item"><span class="nav-icon">⌘</span>结构与配额</div>
+      <div class="nav-item"><span class="nav-icon">□</span>学生名册</div>
+      <div class="nav-item"><span class="nav-icon">◴</span>抢选记录</div>
+      <div class="nav-item"><span class="nav-icon">◇</span>审计日志</div>
+      <div class="nav-item"><span class="nav-icon">⚙</span>系统设置</div>
+    </nav>
+    <section class="main">
+      <div class="dashboard">
+        <div class="column">
+          <section class="panel">
+            <div class="panel-head"><h2 class="section-title">名称与数量设置</h2><small>可新增、删除、改名；配额矩阵自动扩缩</small></div>
+            <div class="config">
+              <div class="config-line"><span class="config-label">专业</span><div class="name-list"><label class="name-input"><input value="专业 A" readonly><button>×</button></label><label class="name-input"><input value="专业 B" readonly><button>×</button></label><label class="name-input"><input value="专业 C" readonly><button>×</button></label></div><button class="add-button">＋ 添加专业</button></div>
+              <div class="config-line"><span class="config-label">教学组</span><div class="name-list"><label class="name-input"><input value="教学组 1" readonly><button>×</button></label><label class="name-input"><input value="教学组 2" readonly><button>×</button></label><label class="name-input"><input value="教学组 3" readonly><button>×</button></label><label class="name-input"><input value="教学组 4" readonly><button>×</button></label><label class="name-input"><input value="教学组 5" readonly><button>×</button></label><label class="name-input"><input value="教学组 6" readonly><button>×</button></label></div><button class="add-button">＋ 添加教学组</button></div>
+            </div>
+          </section>
+          <section class="panel">
+            <div class="panel-head"><h2 class="section-title">教学组 × 专业配额</h2><small>操作将被记录</small></div>
+            <div style="padding:10px 11px 0">
+              <table class="quota-table">
+                <thead><tr><th>教学组</th><th>专业 A<br>已选 / 配额</th><th>专业 B<br>已选 / 配额</th><th>专业 C<br>已选 / 配额</th><th>总容量</th></tr></thead>
+                <tbody>
+                  <tr><th>教学组 1</th><td>0 / <input value="10" readonly></td><td>0 / <input value="10" readonly></td><td>0 / <input value="10" readonly></td><td><input value="30" readonly></td></tr>
+                  <tr><th>教学组 2</th><td>0 / <input value="10" readonly></td><td>0 / <input value="10" readonly></td><td>0 / <input value="10" readonly></td><td><input value="30" readonly></td></tr>
+                  <tr><th>教学组 3</th><td>0 / <input value="10" readonly></td><td>0 / <input value="10" readonly></td><td>0 / <input value="10" readonly></td><td><input value="30" readonly></td></tr>
+                  <tr><th>教学组 4</th><td>0 / <input value="10" readonly></td><td>0 / <input value="10" readonly></td><td>0 / <input value="10" readonly></td><td><input value="30" readonly></td></tr>
+                  <tr><th>教学组 5</th><td>0 / <input value="10" readonly></td><td>0 / <input value="10" readonly></td><td>0 / <input value="10" readonly></td><td><input value="30" readonly></td></tr>
+                  <tr><th>教学组 6</th><td>0 / <input value="10" readonly></td><td>0 / <input value="10" readonly></td><td>0 / <input value="10" readonly></td><td><input value="30" readonly></td></tr>
+                </tbody>
+              </table>
+              <div class="quota-summary"><div class="metric"><strong>0 / 180</strong><span>已选 / 总容量</span></div><div class="metric"><strong>145</strong><span>名册人数</span></div><div class="metric"><strong>145</strong><span>当前未选</span></div></div>
+            </div>
+            <div class="table-actions"><button class="primary-button">保存结构与配额</button><button class="secondary-button">管理员补位</button><button class="secondary-button">撤销异常记录</button></div>
+          </section>
+          <section class="panel" style="flex:1">
+            <div class="panel-head"><h2 class="section-title">最近操作</h2><small>完整审计日志 →</small></div>
+            <table class="audit-table"><thead><tr><th>时间</th><th>操作人</th><th>操作</th><th>对象</th><th>结果</th></tr></thead><tbody><tr><td>22:20:31</td><td>管理员</td><td>修改教学组名称</td><td>教学组 3</td><td>成功</td></tr><tr><td>22:18:09</td><td>管理员</td><td>保存配额</td><td>专业 A × 教学组 1</td><td>成功</td></tr></tbody></table>
+          </section>
+        </div>
+
+        <aside class="column">
+          <section class="panel qr-panel">
+            <div class="panel-head"><h2>学生入口二维码</h2><small>实时入口</small></div>
+            <div class="qr" aria-label="二维码示意"> 
+              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            </div>
+            <div class="qr-actions"><button class="primary-button">⛶ 全屏展示二维码</button><button class="secondary-button">下载二维码 PNG</button></div>
+            <p class="full-screen-hint">全屏模式保留学院字标、入口地址和实时已选/未选人数，适合投影。</p>
+          </section>
+          <section class="panel" style="flex:1">
+            <div class="panel-head"><h2>当前已选 / 未选</h2><small>3 秒刷新</small></div>
+            <div class="live-summary">
+              <div class="big-counts"><div class="big-count"><strong>0</strong><span>已选</span></div><div class="big-count"><strong>145</strong><span>未选</span></div></div>
+              <div class="distribution"><div class="dist-row"><div class="dist-head"><span>专业 A</span><span>0 / 48</span></div><div class="bar"><span style="width:0%"></span></div></div><div class="dist-row"><div class="dist-head"><span>专业 B</span><span>0 / 49</span></div><div class="bar"><span style="width:0%"></span></div></div><div class="dist-row"><div class="dist-head"><span>专业 C</span><span>0 / 48</span></div><div class="bar"><span style="width:0%"></span></div></div></div>
+            </div>
+          </section>
+        </aside>
+
+        <aside class="column">
+          <section class="panel" style="height:100%">
+            <div class="panel-head"><h2 class="section-title">当前未选学生</h2><small>145 人</small></div>
+            <input class="search" value="按学号、姓名或专业搜索" readonly />
+            <div class="student-list">
+              <table class="student-table"><thead><tr><th>学号</th><th>姓名</th><th>专业</th></tr></thead><tbody>
+                <tr><td>2026••01</td><td>示例学生 01</td><td>专业 A</td></tr><tr><td>2026••02</td><td>示例学生 02</td><td>专业 B</td></tr><tr><td>2026••03</td><td>示例学生 03</td><td>专业 C</td></tr><tr><td>2026••04</td><td>示例学生 04</td><td>专业 A</td></tr><tr><td>2026••05</td><td>示例学生 05</td><td>专业 B</td></tr><tr><td>2026••06</td><td>示例学生 06</td><td>专业 C</td></tr><tr><td>2026••07</td><td>示例学生 07</td><td>专业 A</td></tr><tr><td>2026••08</td><td>示例学生 08</td><td>专业 B</td></tr><tr><td>2026••09</td><td>示例学生 09</td><td>专业 C</td></tr><tr><td>2026••10</td><td>示例学生 10</td><td>专业 A</td></tr><tr><td>2026••11</td><td>示例学生 11</td><td>专业 B</td></tr><tr><td>2026••12</td><td>示例学生 12</td><td>专业 C</td></tr>
+              </tbody></table>
+            </div>
+            <div class="list-footer"><span>仅管理员可见 · 姓名脱敏预览</span><button class="secondary-button">导出未选名单</button></div>
+          </section>
+        </aside>
+      </div>
+    </section>
+    <footer class="copyright">安徽建筑大学 · 建筑与空间规划学院 · 制作：姓名</footer>
+  </main>
+</body>
+</html>

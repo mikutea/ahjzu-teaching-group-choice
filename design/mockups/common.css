@@ -1,0 +1,138 @@
+:root {
+  --college: #7f292f;
+  --college-dark: #5d1d22;
+  --college-soft: #f8f3f3;
+  --paper: #fffdfc;
+  --ink: #333333;
+  --muted: #6f6667;
+  --rule: #decfd0;
+  --rule-strong: #c9aaad;
+  --warning: #b86d14;
+  --success: #2f7560;
+  --danger: #a63232;
+  --shadow: 0 12px 34px rgba(75, 26, 31, 0.12);
+  --font: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+  color: var(--ink);
+  font-family: var(--font);
+  background: #f3eded;
+}
+
+body {
+  background-image:
+    linear-gradient(rgba(127, 41, 47, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(127, 41, 47, 0.025) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+button, input, select { font: inherit; }
+
+.logo-clip {
+  position: relative;
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+
+.logo-clip img {
+  position: absolute;
+  display: block;
+  max-width: none;
+}
+
+.logo-clip--mobile {
+  width: 174px;
+  height: 42px;
+}
+
+.logo-clip--mobile img {
+  width: 190px;
+  left: -15px;
+  top: -7px;
+}
+
+.logo-clip--desktop {
+  width: 286px;
+  height: 58px;
+}
+
+.logo-clip--desktop img {
+  width: 312px;
+  left: -24px;
+  top: -11px;
+}
+
+.blueprint-grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(127, 41, 47, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(127, 41, 47, 0.035) 1px, transparent 1px);
+  background-size: 28px 28px;
+  mask-image: linear-gradient(to bottom, rgba(0,0,0,.6), transparent 82%);
+}
+
+.contours {
+  position: absolute;
+  width: 54%;
+  height: 42%;
+  right: -8%;
+  bottom: -8%;
+  opacity: 0.08;
+  pointer-events: none;
+}
+
+.footer-signature {
+  color: #8b7a7c;
+  font-size: 11px;
+  letter-spacing: .02em;
+  text-align: center;
+}
+
+.primary-button {
+  border: 1px solid var(--college);
+  border-radius: 8px;
+  background: var(--college);
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: .04em;
+}
+
+.secondary-button {
+  border: 1px solid var(--college);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--college);
+  font-weight: 650;
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0;
+  font-weight: 750;
+}
+
+.section-title::before {
+  width: 4px;
+  height: 22px;
+  content: "";
+  background: var(--college);
+}
+
+.artboard-label {
+  position: fixed;
+  top: 10px;
+  right: 14px;
+  z-index: 100;
+  color: #8f7b7d;
+  font-size: 11px;
+}
+
