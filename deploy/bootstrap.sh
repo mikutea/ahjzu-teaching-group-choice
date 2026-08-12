@@ -28,6 +28,11 @@ if [[ -z "${PUBLIC_URL}" ]]; then
   PUBLIC_URL="http://${PRIMARY_IP}"
 fi
 
+COOKIE_SECURE_VALUE=false
+if [[ "${PUBLIC_URL}" == https://* ]]; then
+  COOKIE_SECURE_VALUE=true
+fi
+
 if [[ ! -f .env ]]; then
   APP_SECRET_VALUE="$(openssl rand -hex 32)"
   ADMIN_PASSWORD_VALUE="$(openssl rand -base64 18 | tr -d '\n')"
@@ -39,9 +44,11 @@ if [[ ! -f .env ]]; then
     echo "ADMIN_USERNAME=admin"
     echo "ADMIN_INITIAL_PASSWORD=${ADMIN_PASSWORD_VALUE}"
     echo "PUBLIC_BASE_URL=${PUBLIC_URL}"
-    echo "COOKIE_SECURE=false"
+    echo "COOKIE_SECURE=${COOKIE_SECURE_VALUE}"
+    echo "TRUSTED_PROXY_IPS=${TRUSTED_PROXY_IPS:-}"
     echo "SESSION_HOURS=12"
-    echo "SEED_DEMO_STRUCTURE=true"
+    echo "SEED_DEMO_STRUCTURE=false"
+    echo "APP_VERSION=$(git rev-parse --short HEAD 2>/dev/null || echo local)"
   } > .env
   install -m 600 /dev/null /root/teaching-choice-initial-password.txt
   printf '账号：admin\n初始密码：%s\n管理端：%s/admin\n' "${ADMIN_PASSWORD_VALUE}" "${PUBLIC_URL}" > /root/teaching-choice-initial-password.txt
@@ -65,11 +72,13 @@ done
 sed -i 's/^ADMIN_INITIAL_PASSWORD=.*/ADMIN_INITIAL_PASSWORD=/' .env
 docker compose up -d
 
-install -m 644 deploy/teaching-choice-backup.service /etc/systemd/system/teaching-choice-backup.service
+sed "s|@APP_DIR@|${APP_DIR}|g" deploy/teaching-choice-backup.service \
+  > /etc/systemd/system/teaching-choice-backup.service
+chmod 0644 /etc/systemd/system/teaching-choice-backup.service
 install -m 644 deploy/teaching-choice-backup.timer /etc/systemd/system/teaching-choice-backup.timer
+install -m 0700 deploy/update.sh /usr/local/sbin/teaching-choice-update
 systemctl daemon-reload
 systemctl enable --now teaching-choice-backup.timer
 
 echo "部署完成：${PUBLIC_URL}"
 echo "首次登录凭据保存在 /root/teaching-choice-initial-password.txt（权限 600）"
-

@@ -50,4 +50,9 @@ def admin_login(client: TestClient) -> str:
 
 @pytest.fixture()
 def admin_headers(client: TestClient) -> dict[str, str]:
-    return {"X-CSRF-Token": admin_login(client)}
+    csrf = admin_login(client)
+    activity_id = client.get("/api/admin/dashboard").json()["settings"]["activity_id"]
+    return {
+        "X-CSRF-Token": csrf,
+        "X-Activity-ID": str(activity_id),
+    }

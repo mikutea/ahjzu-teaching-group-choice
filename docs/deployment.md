@@ -21,12 +21,34 @@ sudo APP_DIR=/opt/ahjzu-teaching-group-choice ./deploy/bootstrap.sh
 
 ## 更新
 
+旧版本首次升级到带更新器的版本时，先从已审核并完整指定的提交安装脚本；不要先启动
+新容器或迁移数据库：
+
 ```bash
-cd /opt/ahjzu-teaching-group-choice
-git pull --ff-only
-sudo docker compose up -d --build
-sudo docker compose exec -T app python -m server.maintenance check
+commit="完整的 40 位 Git 提交号"
+sudo git -c safe.directory=/opt/ahjzu-teaching-group-choice \
+  -C /opt/ahjzu-teaching-group-choice fetch origin
+sudo git -c safe.directory=/opt/ahjzu-teaching-group-choice \
+  -C /opt/ahjzu-teaching-group-choice show \
+  "${commit}:deploy/update.sh" | sudo install -m 0700 /dev/stdin \
+  /usr/local/sbin/teaching-choice-update
+sudo UPDATE_TARGET="${commit}" /usr/local/sbin/teaching-choice-update
 ```
+
+后续升级只需：
+
+```bash
+sudo /usr/local/sbin/teaching-choice-update
+```
+
+更新脚本以 root 单入口运行，并使用文件锁拒绝并发升级。它会先创建在线备份和旧镜像
+回滚标签，再在隔离的备份副本上执行真实数据库迁移与业务数据摘要对比。只有预演通过
+才进入维护窗：关闭 Tunnel、迁移正式库、等待新容器健康并完成本机检查，最后恢复
+Tunnel 并验收公网健康地址。维护窗内失败会在公网恢复前还原旧数据库和旧镜像。
+
+每次发布的提交、镜像 ID、升级前数据库及校验值记录在
+`/var/backups/teaching-choice/releases/`。该目录仍位于同一 VM，只用于版本回滚；
+正式使用前还应把备份加密同步到异机或异盘，并定期做隔离恢复演练。
 
 ## Cloudflare Tunnel
 
@@ -47,6 +69,12 @@ sudo APP_DIR=/opt/ahjzu-teaching-group-choice \
 `cloudflared` 系统用户运行。Token 文件最终权限为 `root:cloudflared 0640`，
 不会写入 Git、环境变量或进程参数。公网验收通过后，仍应保留
 `/api/health`、学生页、管理端登录页和二维码域名一致性检查。
+
+应用整体由 Docker Compose 管理，SQLite 数据只写入宿主机 `data/` 持久目录；
+镜像以 Git 提交号作为版本标签，升级脚本同时记录实际 image ID 并保留旧镜像回滚标签。
+数据库升级前必须先生成在线备份，数据库迁移失败时镜像与数据库必须成对恢复。
+名额权威账本不依赖 Redis，原因和并发验收标准
+见 [architecture.md](architecture.md)。
 
 为避免 Tunnel 后的所有学生共用同一个登录限流键，应把 Cloudflare 请求进入
 应用容器时的 Docker 网关地址写入 `.env` 的 `TRUSTED_PROXY_IPS`。系统只会在

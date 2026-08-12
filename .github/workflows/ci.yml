@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: server/requirements-dev.txt
+      - name: Install test dependencies
+        run: python -m pip install --requirement server/requirements-dev.txt
+      - name: Run API and concurrency tests
+        run: python -m pytest -q
+      - name: Validate browser scripts and deployment scripts
+        run: |
+          node --check web/admin.js
+          node --check web/student.js
+          bash -n deploy/bootstrap.sh
+          bash -n deploy/install-cloudflared.sh
+          bash -n deploy/update.sh
+      - name: Build production image
+        run: docker build --build-arg APP_VERSION="${GITHUB_SHA}" --tag teaching-group-choice:ci .

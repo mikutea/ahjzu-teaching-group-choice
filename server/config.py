@@ -56,5 +56,5 @@ class Config:
                 for value in os.getenv("TRUSTED_PROXY_IPS", "").split(",")
                 if value.strip()
             ),
-            seed_demo_structure=_as_bool(os.getenv("SEED_DEMO_STRUCTURE"), True),
+            seed_demo_structure=_as_bool(os.getenv("SEED_DEMO_STRUCTURE"), False),
         )
