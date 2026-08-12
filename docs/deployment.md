@@ -48,6 +48,17 @@ sudo APP_DIR=/opt/ahjzu-teaching-group-choice \
 不会写入 Git、环境变量或进程参数。公网验收通过后，仍应保留
 `/api/health`、学生页、管理端登录页和二维码域名一致性检查。
 
+为避免 Tunnel 后的所有学生共用同一个登录限流键，应把 Cloudflare 请求进入
+应用容器时的 Docker 网关地址写入 `.env` 的 `TRUSTED_PROXY_IPS`。系统只会在
+直连来源匹配该白名单时读取 Cloudflare 的 `CF-Connecting-IP`，其他来源不能
+通过伪造请求头绕过限流。例如当前 VM 的配置为：
+
+```dotenv
+PUBLIC_BASE_URL=https://choice.example.com
+COOKIE_SECURE=true
+TRUSTED_PROXY_IPS=172.18.0.1
+```
+
 ## 备份与恢复边界
 
 - 每日备份保存在 `data/backups/`，默认保留 30 份；

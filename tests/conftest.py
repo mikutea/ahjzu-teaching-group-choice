@@ -23,6 +23,7 @@ def app_config(tmp_path: Path) -> Config:
         cookie_secure=False,
         session_hours=12,
         public_base_url="http://127.0.0.1:8765",
+        trusted_proxy_ips=(),
         seed_demo_structure=True,
     )
 
@@ -50,4 +51,3 @@ def admin_login(client: TestClient) -> str:
 @pytest.fixture()
 def admin_headers(client: TestClient) -> dict[str, str]:
     return {"X-CSRF-Token": admin_login(client)}
-

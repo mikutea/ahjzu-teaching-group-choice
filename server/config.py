@@ -24,6 +24,7 @@ class Config:
     cookie_secure: bool
     session_hours: int
     public_base_url: str
+    trusted_proxy_ips: tuple[str, ...]
     seed_demo_structure: bool
 
     @classmethod
@@ -50,6 +51,10 @@ class Config:
             cookie_secure=_as_bool(os.getenv("COOKIE_SECURE"), False),
             session_hours=max(1, int(os.getenv("SESSION_HOURS", "12"))),
             public_base_url=os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/"),
+            trusted_proxy_ips=tuple(
+                value.strip()
+                for value in os.getenv("TRUSTED_PROXY_IPS", "").split(",")
+                if value.strip()
+            ),
             seed_demo_structure=_as_bool(os.getenv("SEED_DEMO_STRUCTURE"), True),
         )
-
