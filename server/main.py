@@ -34,6 +34,8 @@ from .database import (
 )
 from .security import (
     activation_code_hash,
+    decrypt_activation_code,
+    encrypt_activation_code,
     hash_password,
     new_activation_code,
     new_csrf_token,
@@ -54,6 +56,17 @@ MAX_ROSTER_ROWS = 2_000
 MAX_CONCURRENT_IMPORTS = 4
 IMPORT_BODY_TIMEOUT_SECONDS = 20
 ACTIVATION_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+FIXED_ORGANIZATION_NAME = "安徽建筑大学 · 建筑与空间规划学院"
+FIXED_OWNER_NAME = "Mikutea"
+COUNTDOWN_SECONDS = 10
+PRESENCE_FRESH_SECONDS = 35
+HEARTBEAT_WRITE_INTERVAL_SECONDS = 15
+
+
+def session_utc_now() -> str:
+    """Wall clock for credential expiry, intentionally separate from event test clocks."""
+
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 class ImportBodyLimitMiddleware:
@@ -211,13 +224,9 @@ class StatusUpdate(StrictModel):
 
 class SettingsUpdate(StrictModel):
     activity_title: str | None = Field(default=None, min_length=2, max_length=120)
-    organization_name: str | None = Field(default=None, min_length=2, max_length=160)
-    owner_name: str | None = Field(default=None, min_length=1, max_length=80)
     public_base_url: str | None = Field(default=None, max_length=300)
 
-    @field_validator(
-        "activity_title", "organization_name", "owner_name", mode="before"
-    )
+    @field_validator("activity_title", mode="before")
     @classmethod
     def normalize_names(cls, value: Any) -> Any:
         return clean_text(value) if isinstance(value, str) else value
@@ -386,7 +395,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         if config.cookie_secure or config.public_base_url.startswith("https://"):
             response.headers["Strict-Transport-Security"] = "max-age=31536000"
         if request.url.path.startswith("/api/") or request.url.path in {"/", "/admin"}:
-            response.headers["Cache-Control"] = "no-store"
+            if not response.headers.get("Cache-Control"):
+                response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.exception_handler(sqlite3.IntegrityError)
@@ -439,7 +449,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             FROM sessions
             WHERE token_hash = ? AND expires_at > ?
             """,
-            (token_hash, utc_now()),
+            (token_hash, session_utc_now()),
         ).fetchone()
         if not row or row["role"] != role:
             raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
@@ -491,7 +501,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         now_dt: datetime,
     ) -> None:
         expires = now_dt + timedelta(hours=config.session_hours)
-        connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (utc_now(),))
+        connection.execute(
+            "DELETE FROM sessions WHERE expires_at <= ?", (session_utc_now(),)
+        )
         connection.execute(
             "DELETE FROM sessions WHERE role = ? AND subject_id = ?",
             (role, subject_id),
@@ -499,14 +511,16 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection.execute(
             """
             INSERT INTO sessions
-                (token_hash, role, subject_id, csrf_token, created_at, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (token_hash, role, subject_id, csrf_token, created_at,
+                 last_seen_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_token_hash(token),
                 role,
                 subject_id,
                 csrf_token,
+                now_dt.isoformat(timespec="seconds"),
                 now_dt.isoformat(timespec="seconds"),
                 expires.isoformat(timespec="seconds"),
             ),
@@ -535,6 +549,24 @@ def create_app(config: Config | None = None) -> FastAPI:
         if not activity:
             raise RuntimeError("当前活动不存在")
         return activity
+
+    def parse_utc(value: str) -> datetime:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    def activity_phase(activity: sqlite3.Row, *, server_now: str | None = None) -> str:
+        if activity["status"] != "open":
+            return (
+                "waiting"
+                if activity["status"] == "closed" and activity["opened_at"] is None
+                else "closed"
+            )
+        opens_at = activity["selection_opens_at"]
+        if opens_at and parse_utc(server_now or utc_now()) < parse_utc(str(opens_at)):
+            return "countdown"
+        return "open"
 
     def ensure_closed(connection: sqlite3.Connection) -> None:
         status = current_activity(connection)["status"]
@@ -565,19 +597,25 @@ def create_app(config: Config | None = None) -> FastAPI:
             """
             SELECT s.*, a.id AS activity_id, a.code AS activity_code,
                    a.title AS current_activity_title, a.status AS activity_status,
-                   a.created_at AS activity_created_at
+                   a.created_at AS activity_created_at,
+                   a.opened_at AS opened_at,
+                   a.selection_opens_at AS selection_opens_at
             FROM settings s JOIN activities a ON a.id = s.current_activity_id
             WHERE s.id = 1
             """
         ).fetchone()
+        server_now = utc_now()
         return {
             "activity_id": row["activity_id"],
             "activity_code": row["activity_code"],
             "activity_title": row["current_activity_title"],
             "activity_created_at": row["activity_created_at"],
-            "organization_name": row["organization_name"],
-            "owner_name": row["owner_name"],
+            "organization_name": FIXED_ORGANIZATION_NAME,
+            "owner_name": FIXED_OWNER_NAME,
             "status": row["activity_status"],
+            "phase": activity_phase(row, server_now=server_now),
+            "server_now": server_now,
+            "selection_opens_at": row["selection_opens_at"],
             "public_base_url": row["public_base_url"],
             "updated_at": row["updated_at"],
         }
@@ -752,6 +790,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         ).fetchall()
         settings = setting_dict(connection)
         return {
+            "server_now": settings["server_now"],
+            "selection_opens_at": settings["selection_opens_at"],
+            "phase": settings["phase"],
             "student": {
                 "id": student["id"],
                 "student_no": student["student_no"],
@@ -803,8 +844,12 @@ def create_app(config: Config | None = None) -> FastAPI:
                 raise HTTPException(status_code=403, detail="不能代替其他学生提交选择")
             if operator != str(identity.subject_id):
                 raise HTTPException(status_code=403, detail="操作人身份校验失败")
-            if require_open and activity["status"] != "open":
-                raise HTTPException(status_code=409, detail="抢选尚未开放或已经结束")
+            if require_open:
+                phase = activity_phase(activity)
+                if phase == "countdown":
+                    raise HTTPException(status_code=409, detail="统一倒计时尚未结束，请等待开抢")
+                if phase != "open":
+                    raise HTTPException(status_code=409, detail="抢选尚未开放或已经结束")
             student = connection.execute(
                 """
                 SELECT s.id, s.major_id, s.active, m.active AS major_active
@@ -976,6 +1021,51 @@ def create_app(config: Config | None = None) -> FastAPI:
         finally:
             connection.close()
 
+    @app.post("/api/student/heartbeat")
+    def student_heartbeat(request: Request):
+        """Refresh waiting-room presence without turning every poll into a write.
+
+        The browser may call this every five seconds.  SQLite is updated at most once
+        per student per write interval, preserving the write lock for actual selections.
+        """
+
+        identity = require_session(request, "student", csrf=True)
+        connection = connect(config.database_path)
+        try:
+            require_expected_activity(request, connection, identity=identity)
+            row = connection.execute(
+                "SELECT last_seen_at FROM sessions WHERE token_hash = ?",
+                (identity.token_hash,),
+            ).fetchone()
+            now_text = utc_now()
+            write_cutoff = (
+                parse_utc(now_text) - timedelta(seconds=HEARTBEAT_WRITE_INTERVAL_SECONDS)
+            ).isoformat(timespec="seconds")
+            if not row or not row["last_seen_at"] or row["last_seen_at"] <= write_cutoff:
+                connection.execute("BEGIN IMMEDIATE")
+                require_expected_activity(request, connection, identity=identity)
+                connection.execute(
+                    """
+                    UPDATE sessions SET last_seen_at = ?
+                    WHERE token_hash = ?
+                      AND (last_seen_at IS NULL OR last_seen_at <= ?)
+                    """,
+                    (now_text, identity.token_hash, write_cutoff),
+                )
+                connection.commit()
+            settings = setting_dict(connection)
+            return {
+                "ok": True,
+                "server_now": settings["server_now"],
+                "selection_opens_at": settings["selection_opens_at"],
+                "phase": settings["phase"],
+            }
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     @app.post("/api/student/select")
     def student_select(payload: StudentSelect, request: Request):
         identity = require_session(request, "student", csrf=True)
@@ -1137,6 +1227,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         try:
             connection.execute("BEGIN")
             settings = setting_dict(connection)
+            presence_cutoff = (
+                parse_utc(settings["server_now"])
+                - timedelta(seconds=PRESENCE_FRESH_SECONDS)
+            ).isoformat(timespec="seconds")
             majors = connection.execute(
                 """
                 SELECT m.*,
@@ -1200,16 +1294,42 @@ def create_app(config: Config | None = None) -> FastAPI:
             students = connection.execute(
                 """
                 SELECT s.id, s.student_no, s.name, m.name AS major_name, s.active,
-                       g.name AS group_name, se.selected_at
+                       g.name AS group_name, se.selected_at,
+                       CASE WHEN EXISTS (
+                           SELECT 1 FROM sessions ss
+                           WHERE ss.role = 'student' AND ss.subject_id = s.id
+                             AND ss.expires_at > ? AND ss.last_seen_at >= ?
+                       ) THEN 1 ELSE 0 END AS entered
                 FROM students s
                 JOIN majors m ON m.id = s.major_id
                 LEFT JOIN selections se
                     ON se.student_id = s.id AND se.revoked_at IS NULL
                 LEFT JOIN teaching_groups g ON g.id = se.group_id
                 ORDER BY s.active DESC, m.sort_order, s.student_no
-                """
+                """,
+                (session_utc_now(), presence_cutoff),
             ).fetchall()
+            presence_rows = connection.execute(
+                """
+                SELECT s.id, s.student_no, s.name, m.name AS major_name,
+                       MAX(ss.last_seen_at) AS last_seen_at
+                FROM students s
+                JOIN majors m ON m.id = s.major_id
+                LEFT JOIN sessions ss
+                  ON ss.role = 'student' AND ss.subject_id = s.id
+                 AND ss.expires_at > ? AND ss.last_seen_at >= ?
+                WHERE s.active = 1
+                GROUP BY s.id, s.student_no, s.name, m.name, m.sort_order
+                ORDER BY m.sort_order, s.student_no
+                """,
+                (session_utc_now(), presence_cutoff),
+            ).fetchall()
+            online_students = [dict(row) for row in presence_rows if row["last_seen_at"]]
+            absent_students = [dict(row) for row in presence_rows if not row["last_seen_at"]]
             return {
+                "server_now": settings["server_now"],
+                "selection_opens_at": settings["selection_opens_at"],
+                "phase": settings["phase"],
                 "settings": settings,
                 "totals": {
                     "students": totals["students"],
@@ -1222,6 +1342,15 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "unselected_students": [dict(row) for row in unselected],
                 "recent_selections": [dict(row) for row in recent],
                 "students": [dict(row) for row in students],
+                "presence": {
+                    "total": len(presence_rows),
+                    "online_count": len(online_students),
+                    "absent_count": len(absent_students),
+                    "online_students": online_students,
+                    "absent_students": absent_students,
+                },
+                "entered_students": online_students,
+                "absent_students": absent_students,
                 "readiness": activity_readiness(connection),
                 "activities": activity_list(connection),
             }
@@ -1250,8 +1379,6 @@ def create_app(config: Config | None = None) -> FastAPI:
                     (title,),
                 )
             settings_updates = {
-                "organization_name": "UPDATE settings SET organization_name = ?, updated_at = ? WHERE id = 1",
-                "owner_name": "UPDATE settings SET owner_name = ?, updated_at = ? WHERE id = 1",
                 "public_base_url": "UPDATE settings SET public_base_url = ?, updated_at = ? WHERE id = 1",
             }
             for column, value in values.items():
@@ -1292,18 +1419,36 @@ def create_app(config: Config | None = None) -> FastAPI:
                         status_code=409,
                         detail="开放前检查未通过：" + "；".join(readiness["blockers"]),
                     )
+            now = utc_now()
             connection.execute(
                 """
                 UPDATE activities SET status = ?,
-                    opened_at = CASE WHEN ? = 'open' THEN COALESCE(opened_at, ?) ELSE opened_at END,
-                    closed_at = CASE WHEN ? = 'closed' THEN ? ELSE closed_at END
+                    opened_at = CASE
+                        WHEN ? = 'open' THEN COALESCE(opened_at, ?)
+                        WHEN selection_opens_at IS NOT NULL
+                             AND selection_opens_at > ?
+                             AND opened_at = selection_opens_at THEN NULL
+                        ELSE opened_at
+                    END,
+                    closed_at = CASE WHEN ? = 'closed' THEN ? ELSE closed_at END,
+                    selection_opens_at = CASE WHEN ? = 'open' THEN ? ELSE NULL END
                 WHERE id = ?
                 """,
-                (payload.status, payload.status, utc_now(), payload.status, utc_now(), activity["id"]),
+                (
+                    payload.status,
+                    payload.status,
+                    now,
+                    now,
+                    payload.status,
+                    now,
+                    payload.status,
+                    now,
+                    activity["id"],
+                ),
             )
             connection.execute(
                 "UPDATE settings SET status = ?, updated_at = ? WHERE id = 1",
-                (payload.status, utc_now()),
+                (payload.status, now),
             )
             audit(
                 connection,
@@ -1321,6 +1466,66 @@ def create_app(config: Config | None = None) -> FastAPI:
         finally:
             connection.close()
         return {"status": payload.status}
+
+    @app.post("/api/admin/countdown")
+    @app.post("/api/admin/start-countdown")
+    def start_countdown(request: Request):
+        identity = require_session(request, "admin", csrf=True)
+        connection = connect(config.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            activity = require_expected_activity(request, connection, identity=identity)
+            if activity["status"] == "open":
+                raise HTTPException(status_code=409, detail="本场抢选已在倒计时或已开放")
+            readiness = activity_readiness(connection)
+            if not readiness["ready"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="开始前检查未通过：" + "；".join(readiness["blockers"]),
+                )
+            now = utc_now()
+            target_timespec = "milliseconds" if "." in now else "seconds"
+            opens_at = (
+                parse_utc(now) + timedelta(seconds=COUNTDOWN_SECONDS)
+            ).isoformat(timespec=target_timespec)
+            connection.execute(
+                """
+                UPDATE activities
+                SET status = 'open', selection_opens_at = ?,
+                    opened_at = ?
+                WHERE id = ? AND status = 'closed'
+                """,
+                (opens_at, opens_at, activity["id"]),
+            )
+            connection.execute(
+                "UPDATE settings SET status = 'open', updated_at = ? WHERE id = 1",
+                (now,),
+            )
+            audit(
+                connection,
+                actor_type="admin",
+                actor_id=identity.subject_id,
+                action="activity.countdown.start",
+                entity_type="activity",
+                entity_id=activity["id"],
+                details={
+                    "countdown_seconds": COUNTDOWN_SECONDS,
+                    "selection_opens_at": opens_at,
+                },
+            )
+            connection.commit()
+            settings = setting_dict(connection)
+            return {
+                "status": settings["status"],
+                "phase": settings["phase"],
+                "server_now": settings["server_now"],
+                "selection_opens_at": settings["selection_opens_at"],
+            }
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     @app.get("/api/admin/activities")
     def list_activities(request: Request):
@@ -1651,6 +1856,21 @@ def create_app(config: Config | None = None) -> FastAPI:
             before = connection.execute("SELECT * FROM majors WHERE id = ?", (major_id,)).fetchone()
             if not before:
                 raise HTTPException(status_code=404, detail="专业不存在")
+            if values.get("active") == 0 and bool(before["active"]):
+                active_students = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM students WHERE major_id = ? AND active = 1",
+                        (major_id,),
+                    ).fetchone()[0]
+                )
+                if active_students:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"该专业仍有 {active_students} 名有效学生，不能停用；"
+                            "请先通过学生名单将其迁移或停用"
+                        ),
+                    )
             major_updates = {
                 "name": "UPDATE majors SET name = ?, updated_at = ? WHERE id = ?",
                 "active": "UPDATE majors SET active = ?, updated_at = ? WHERE id = ?",
@@ -1792,8 +2012,14 @@ def create_app(config: Config | None = None) -> FastAPI:
                     status_code=409,
                     detail=f"总容量不能小于当前配额合计 {quota_sum} 或已选人数 {selected}",
                 )
-            if values.get("active") == 0 and selected:
-                raise HTTPException(status_code=409, detail="该教学组已有选择，不能直接停用")
+            if values.get("active") == 0 and bool(before["active"]) and selected:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"该教学组仍有 {selected} 条有效选择，不能停用；"
+                        "请先撤销这些选择"
+                    ),
+                )
             group_updates = {
                 "name": "UPDATE teaching_groups SET name = ?, updated_at = ? WHERE id = ?",
                 "total_capacity": (
@@ -2068,6 +2294,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                         connection.execute(
                             """
                             UPDATE students SET name = ?, major_id = ?, activation_hash = ?,
+                                                activation_ciphertext = ?,
                                                 active = 1, updated_at = ?
                             WHERE id = ?
                             """,
@@ -2075,6 +2302,9 @@ def create_app(config: Config | None = None) -> FastAPI:
                                 name,
                                 major_map[major_name],
                                 activation_code_hash(config.app_secret, code),
+                                encrypt_activation_code(
+                                    config.app_secret, student_no, code
+                                ),
                                 utc_now(),
                                 existing["id"],
                             ),
@@ -2100,14 +2330,16 @@ def create_app(config: Config | None = None) -> FastAPI:
                     connection.execute(
                         """
                         INSERT INTO students
-                            (student_no, name, major_id, activation_hash, active, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, 1, ?, ?)
+                            (student_no, name, major_id, activation_hash,
+                             activation_ciphertext, active, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, 1, ?, ?)
                         """,
                         (
                             student_no,
                             name,
                             major_map[major_name],
                             activation_code_hash(config.app_secret, code),
+                            encrypt_activation_code(config.app_secret, student_no, code),
                             now,
                             now,
                         ),
@@ -2207,8 +2439,17 @@ def create_app(config: Config | None = None) -> FastAPI:
                 raise HTTPException(status_code=409, detail="学生已停用，请先通过名单重新启用")
             code = new_activation_code()
             connection.execute(
-                "UPDATE students SET activation_hash = ?, updated_at = ? WHERE id = ?",
-                (activation_code_hash(config.app_secret, code), utc_now(), student_id),
+                """
+                UPDATE students
+                SET activation_hash = ?, activation_ciphertext = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    activation_code_hash(config.app_secret, code),
+                    encrypt_activation_code(config.app_secret, student["student_no"], code),
+                    utc_now(),
+                    student_id,
+                ),
             )
             connection.execute(
                 "DELETE FROM sessions WHERE role = 'student' AND subject_id = ?",
@@ -2232,6 +2473,82 @@ def create_app(config: Config | None = None) -> FastAPI:
                     "activation_code": code,
                 }
             }
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @app.post("/api/admin/students/{student_id}/activation-code/reveal")
+    def reveal_student_activation_code(student_id: int, request: Request):
+        identity = require_session(request, "admin", csrf=True)
+        limiter.check(
+            principal_key("activation-code-reveal", str(identity.subject_id)),
+            limit=500,
+            window_seconds=300,
+        )
+        connection = connect(config.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            require_expected_activity(request, connection, identity=identity)
+            student = connection.execute(
+                """
+                SELECT s.id, s.student_no, s.name, s.activation_hash,
+                       s.activation_ciphertext, m.name AS major_name
+                FROM students s JOIN majors m ON m.id = s.major_id
+                WHERE s.id = ?
+                """,
+                (student_id,),
+            ).fetchone()
+            if not student:
+                raise HTTPException(status_code=404, detail="学生不存在")
+            if not student["activation_ciphertext"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="该学生为历史哈希凭据，原激活码无法显示；请先重置激活码",
+                )
+            try:
+                code = decrypt_activation_code(
+                    config.app_secret,
+                    student["student_no"],
+                    student["activation_ciphertext"],
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="激活码密文无法校验，请重置激活码",
+                ) from exc
+            if not verify_activation_code(
+                config.app_secret, code, student["activation_hash"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="激活码密文与登录凭据不一致，请重置激活码",
+                )
+            audit(
+                connection,
+                actor_type="admin",
+                actor_id=identity.subject_id,
+                action="student.activation_code.reveal",
+                entity_type="student",
+                entity_id=student_id,
+                details={"student_no": student["student_no"]},
+            )
+            connection.commit()
+            return JSONResponse(
+                content={
+                    "credential": {
+                        "student_no": student["student_no"],
+                        "name": student["name"],
+                        "major": student["major_name"],
+                        "activation_code": code,
+                    }
+                },
+                headers={
+                    "Cache-Control": "no-store, private",
+                    "Pragma": "no-cache",
+                },
+            )
         except Exception:
             connection.rollback()
             raise

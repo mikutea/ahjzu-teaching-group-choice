@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from .conftest import admin_login
-from server.database import connect, initialize_database
+from server.database import SCHEMA_VERSION, connect, initialize_database
 from server.maintenance import (
     check_database,
     create_backup,
@@ -382,7 +382,7 @@ def test_existing_single_activity_database_migrates_without_losing_settings(app_
             "created_at": "2026-01-01T00:00:00+00:00",
             "closed_at": "2026-01-01T00:00:00+00:00",
         }
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert migrated.execute(
             "SELECT activity_id FROM audit_logs WHERE action = 'legacy.event'"
         ).fetchone()[0] == 1
@@ -442,7 +442,7 @@ def test_complete_v0_database_migrates_without_changing_business_rows(app_config
     assert migration_business_digest(database_path) == before
     migrated = connect(database_path)
     try:
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert migrated.execute("SELECT COUNT(*) FROM activities").fetchone()[0] == 1
         assert migrated.execute("SELECT COUNT(*) FROM selections").fetchone()[0] == 1
         assert migrated.execute("SELECT activity_id FROM audit_logs").fetchone()[0] == 1
