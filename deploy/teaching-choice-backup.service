@@ -5,6 +5,5 @@ After=docker.service
 
 [Service]
 Type=oneshot
-WorkingDirectory=/opt/ahjzu-teaching-group-choice
+WorkingDirectory=@APP_DIR@
 ExecStart=/usr/bin/docker compose exec -T app python -m server.maintenance backup --retain 30
-

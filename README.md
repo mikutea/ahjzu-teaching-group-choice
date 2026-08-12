@@ -34,8 +34,10 @@
 ## 技术路线
 
 - 响应式网页：手机学生端 + 桌面管理端；
-- Python API + SQLite 单机事务，适配约 145 人的校内单次抢选；
+- Python API + SQLite 原子事务，已纳入 150 人同时抢 30 席的防超卖回归；
+- 支持多届、多学期连续使用：旧活动带 SHA-256 校验归档，新活动可复制原结构；
 - Docker Compose 部署到独立 Proxmox 虚拟机；
+- 提供带备份副本迁移演练、健康等待与失败恢复的单入口更新脚本；
 - 审计日志、CSV 导入导出、备份与恢复脚本；
 - 自动化测试覆盖身份核验、重复提交、末位并发和权限边界。
 
@@ -58,6 +60,7 @@ python -m pytest --basetemp "$env:LOCALAPPDATA\Codex\teaching-choice-tests\manua
 ```
 
 独立虚拟机部署见 [docs/deployment.md](docs/deployment.md)。
+并发、Redis 取舍和多活动归档设计见 [docs/architecture.md](docs/architecture.md)。
 
 ## 品牌与许可
 

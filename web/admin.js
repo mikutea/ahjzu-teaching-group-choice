@@ -41,6 +41,9 @@ const adminEls = {
   quotaMatrix: document.querySelector("#quota-matrix"),
   assignmentBody: document.querySelector("#assignment-body"),
   settingsForm: document.querySelector("#settings-form"),
+  activityList: document.querySelector("#activity-list"),
+  activityCount: document.querySelector("#activity-count-label"),
+  newActivityForm: document.querySelector("#new-activity-form"),
   importForm: document.querySelector("#student-import-form"),
   importFile: document.querySelector("#student-csv"),
   importFileName: document.querySelector("#import-file-name"),
@@ -51,11 +54,20 @@ const adminEls = {
 
 async function adminApi(path, options = {}) {
   const headers = new Headers(options.headers || {});
+  const activityId = options.activityId ?? adminState.dashboard?.settings.activity_id;
   if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
   if (adminState.csrf && !["GET", "HEAD"].includes((options.method || "GET").toUpperCase())) {
     headers.set("X-CSRF-Token", adminState.csrf);
   }
-  const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
+  if (
+    activityId
+    && !["GET", "HEAD"].includes((options.method || "GET").toUpperCase())
+    && !["/api/admin/logout", "/api/admin/password"].includes(path)
+  ) {
+    headers.set("X-Activity-ID", String(activityId));
+  }
+  const { activityId: _activityId, ...fetchOptions } = options;
+  const response = await fetch(path, { ...fetchOptions, headers, credentials: "same-origin" });
   const type = response.headers.get("content-type") || "";
   const data = type.includes("application/json") ? await response.json() : null;
   if (!response.ok) {
@@ -170,9 +182,47 @@ function renderDashboard(data) {
   renderQr(data.settings.public_base_url);
   renderUnselectedList();
   renderRecentSelections(data.recent_selections);
+  adminEls.recentBody.dataset.activityId = String(data.settings.activity_id);
   renderStructure(data, open);
   renderAssignmentTable(data);
+  adminEls.assignmentBody.dataset.activityId = String(data.settings.activity_id);
+  renderActivities(data.activities || []);
   fillSettingsForm(data.settings);
+}
+
+function renderActivities(activities) {
+  adminEls.activityCount.textContent = `${activities.length} 场`;
+  const statusLabels = { open: "进行中", closed: "已关闭", archived: "已归档" };
+  const rows = activities.map((activity) => {
+    const row = document.createElement("article");
+    row.className = `activity-row${activity.current ? " is-current" : ""}`;
+    const info = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = activity.title;
+    const summary = activity.summary || { students: 0, selected: 0, unselected: 0 };
+    const detail = document.createElement("small");
+    detail.textContent = `${activity.code} · 名单 ${summary.students || 0} 人 · 已选 ${summary.selected || 0} 人`;
+    info.append(title, detail);
+    const meta = document.createElement("div");
+    meta.className = "activity-row__meta";
+    const status = document.createElement("span");
+    status.className = `activity-row__status${activity.status === "open" ? " is-open" : ""}${activity.current ? " is-current" : ""}`;
+    status.textContent = activity.current ? `当前 · ${statusLabels[activity.status]}` : statusLabels[activity.status];
+    meta.append(status);
+    if (activity.status === "archived") {
+      const download = document.createElement("a");
+      download.href = `/api/admin/activities/${activity.id}/archive.json`;
+      download.textContent = "下载归档";
+      download.title = activity.snapshot_sha256 ? `SHA-256：${activity.snapshot_sha256}` : "下载活动归档";
+      meta.append(download);
+    }
+    row.append(info, meta);
+    return row;
+  });
+  adminEls.activityList.replaceChildren(...rows);
+  const current = activities.find((activity) => activity.current);
+  const disabled = current?.status === "open";
+  adminEls.newActivityForm.querySelectorAll("input, button").forEach((element) => { element.disabled = disabled; });
 }
 
 function renderGroupProgress(groups) {
@@ -427,6 +477,9 @@ function renderQuotaMatrix(data, locked) {
 }
 
 function renderStructure(data, locked) {
+  adminEls.majorEditor.dataset.activityId = String(data.settings.activity_id);
+  adminEls.groupEditor.dataset.activityId = String(data.settings.activity_id);
+  adminEls.quotaMatrix.dataset.activityId = String(data.settings.activity_id);
   adminEls.majorCount.textContent = `${data.majors.length} 个专业`;
   adminEls.groupCount.textContent = `${data.groups.length} 个教学组`;
   adminEls.structureLock.textContent = locked ? "抢选开放中 · 已锁定" : "当前可编辑数量和名称";
@@ -536,13 +589,18 @@ document.querySelector("#admin-logout").addEventListener("click", async () => {
 
 adminEls.statusButton.addEventListener("click", async () => {
   const next = adminState.dashboard?.settings.status === "open" ? "closed" : "open";
+  const activityId = adminState.dashboard?.settings.activity_id;
   const confirmed = await confirmDanger(
     next === "open" ? "开放学生抢选" : "关闭学生抢选",
     next === "open" ? "开放后专业、教学组数量和配额会被锁定，学生可立即提交。" : "关闭后学生无法继续提交，管理员仍可补位和撤销。",
   );
   if (!confirmed) return;
   try {
-    await adminApi("/api/admin/status", { method: "POST", body: JSON.stringify({ status: next }) });
+    await adminApi("/api/admin/status", {
+      method: "POST",
+      body: JSON.stringify({ status: next }),
+      activityId,
+    });
     showAdminToast(next === "open" ? "抢选已开放" : "抢选已关闭", "success");
     await loadDashboard();
   } catch (error) { showAdminToast(error.message, "error"); }
@@ -591,12 +649,29 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+for (const form of document.querySelectorAll(
+  "#add-major-form, #add-group-form, #settings-form, #new-activity-form, #student-import-form",
+)) {
+  form.addEventListener("focusin", () => {
+    if (!form.dataset.activityId && adminState.dashboard?.settings.activity_id) {
+      form.dataset.activityId = String(adminState.dashboard.settings.activity_id);
+    }
+  });
+}
+
 document.querySelector("#add-major-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  const form = event.currentTarget;
   const input = event.currentTarget.elements.namedItem("name");
+  const activityId = Number(form.dataset.activityId || adminState.dashboard.settings.activity_id);
   try {
-    await adminApi("/api/admin/majors", { method: "POST", body: JSON.stringify({ name: input.value }) });
+    await adminApi("/api/admin/majors", {
+      method: "POST",
+      body: JSON.stringify({ name: input.value }),
+      activityId,
+    });
     input.value = "";
+    delete form.dataset.activityId;
     showAdminToast("专业已新增，配额矩阵已自动扩展", "success");
     await loadDashboard();
   } catch (error) { showAdminToast(error.message, "error"); }
@@ -605,12 +680,15 @@ document.querySelector("#add-major-form").addEventListener("submit", async (even
 document.querySelector("#add-group-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
+  const activityId = Number(form.dataset.activityId || adminState.dashboard.settings.activity_id);
   try {
     await adminApi("/api/admin/groups", {
       method: "POST",
       body: JSON.stringify({ name: form.elements.namedItem("name").value, total_capacity: Number(form.elements.namedItem("capacity").value) }),
+      activityId,
     });
     form.elements.namedItem("name").value = "";
+    delete form.dataset.activityId;
     showAdminToast("教学组已新增，所有专业已自动补齐零配额", "success");
     await loadDashboard();
   } catch (error) { showAdminToast(error.message, "error"); }
@@ -621,13 +699,14 @@ adminEls.majorEditor.addEventListener("click", async (event) => {
   if (!button) return;
   const row = button.closest(".entity-row");
   const id = Number(row.dataset.id);
+  const activityId = Number(adminEls.majorEditor.dataset.activityId);
   try {
     if (button.dataset.action === "save-major") {
-      await adminApi(`/api/admin/majors/${id}`, { method: "PATCH", body: JSON.stringify({ name: row._nameInput.value, active: row._activeInput.checked }) });
+      await adminApi(`/api/admin/majors/${id}`, { method: "PATCH", body: JSON.stringify({ name: row._nameInput.value, active: row._activeInput.checked }), activityId });
       showAdminToast("专业设置已保存", "success");
     } else if (button.dataset.action === "delete-major") {
       if (!await confirmDanger("删除专业", `确认删除“${row._nameInput.value}”？已有学生时系统会阻止删除。`)) return;
-      await adminApi(`/api/admin/majors/${id}`, { method: "DELETE", body: JSON.stringify({}) });
+      await adminApi(`/api/admin/majors/${id}`, { method: "DELETE", body: JSON.stringify({}), activityId });
       showAdminToast("专业已删除，配额矩阵已同步缩减", "success");
     }
     await loadDashboard();
@@ -639,13 +718,14 @@ adminEls.groupEditor.addEventListener("click", async (event) => {
   if (!button) return;
   const row = button.closest(".entity-row");
   const id = Number(row.dataset.id);
+  const activityId = Number(adminEls.groupEditor.dataset.activityId);
   try {
     if (button.dataset.action === "save-group") {
-      await adminApi(`/api/admin/groups/${id}`, { method: "PATCH", body: JSON.stringify({ name: row._nameInput.value, total_capacity: Number(row._capacityInput.value), active: row._activeInput.checked }) });
+      await adminApi(`/api/admin/groups/${id}`, { method: "PATCH", body: JSON.stringify({ name: row._nameInput.value, total_capacity: Number(row._capacityInput.value), active: row._activeInput.checked }), activityId });
       showAdminToast("教学组设置已保存", "success");
     } else if (button.dataset.action === "delete-group") {
       if (!await confirmDanger("删除教学组", `确认删除“${row._nameInput.value}”？有历史选择时系统会阻止删除。`)) return;
-      await adminApi(`/api/admin/groups/${id}`, { method: "DELETE", body: JSON.stringify({}) });
+      await adminApi(`/api/admin/groups/${id}`, { method: "DELETE", body: JSON.stringify({}), activityId });
       showAdminToast("教学组已删除，配额矩阵已同步缩减", "success");
     }
     await loadDashboard();
@@ -655,8 +735,9 @@ adminEls.groupEditor.addEventListener("click", async (event) => {
 adminEls.quotaMatrix.addEventListener("change", async (event) => {
   const input = event.target.closest("input[data-major-id]");
   if (!input) return;
+  const activityId = Number(adminEls.quotaMatrix.dataset.activityId);
   try {
-    await adminApi(`/api/admin/quotas/${input.dataset.majorId}/${input.dataset.groupId}`, { method: "PUT", body: JSON.stringify({ capacity: Number(input.value) }) });
+    await adminApi(`/api/admin/quotas/${input.dataset.majorId}/${input.dataset.groupId}`, { method: "PUT", body: JSON.stringify({ capacity: Number(input.value) }), activityId });
     input.dataset.original = input.value;
     showAdminToast("配额已保存", "success");
     await loadDashboard();
@@ -669,11 +750,50 @@ adminEls.quotaMatrix.addEventListener("change", async (event) => {
 adminEls.settingsForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const values = Object.fromEntries(new FormData(adminEls.settingsForm).entries());
+  const activityId = Number(adminEls.settingsForm.dataset.activityId || adminState.dashboard.settings.activity_id);
   try {
-    await adminApi("/api/admin/settings", { method: "PATCH", body: JSON.stringify(values) });
+    await adminApi("/api/admin/settings", { method: "PATCH", body: JSON.stringify(values), activityId });
+    delete adminEls.settingsForm.dataset.activityId;
     showAdminToast("活动、访问地址和版权信息已保存", "success");
     await loadDashboard();
   } catch (error) { showAdminToast(error.message, "error"); }
+});
+
+adminEls.newActivityForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const title = form.elements.namedItem("title").value.trim();
+  const code = form.elements.namedItem("code").value.trim();
+  const copyStructure = form.elements.namedItem("copy_structure").checked;
+  const previousActivityId = Number(form.dataset.activityId || adminState.dashboard.settings.activity_id);
+  const confirmed = await confirmDanger(
+    "归档并新建活动",
+    `确认封存“${adminState.dashboard?.settings.activity_title}”并创建“${title}”？旧结果可下载查看，但不能再修改。`,
+  );
+  if (!confirmed) return;
+  const submitButton = form.querySelector('button[type="submit"]');
+  submitButton.disabled = true;
+  try {
+    await adminApi("/api/admin/activities", {
+      method: "POST",
+      body: JSON.stringify({
+        title,
+        code: code || null,
+        copy_structure: copyStructure,
+        previous_activity_id: previousActivityId,
+      }),
+      activityId: previousActivityId,
+    });
+    form.reset();
+    delete form.dataset.activityId;
+    form.elements.namedItem("copy_structure").checked = true;
+    showAdminToast("旧活动已归档，新活动已创建", "success");
+    await loadDashboard();
+  } catch (error) {
+    showAdminToast(error.message, "error");
+  } finally {
+    submitButton.disabled = adminState.dashboard?.settings.status === "open";
+  }
 });
 
 document.querySelector("#password-form").addEventListener("submit", async (event) => {
@@ -691,6 +811,9 @@ document.querySelector("#password-form").addEventListener("submit", async (event
 });
 
 adminEls.importFile.addEventListener("change", () => {
+  if (!adminEls.importForm.dataset.activityId && adminState.dashboard?.settings.activity_id) {
+    adminEls.importForm.dataset.activityId = String(adminState.dashboard.settings.activity_id);
+  }
   adminEls.importFileName.textContent = adminEls.importFile.files[0]?.name || "UTF-8 或 GB18030，最大 1 MB";
 });
 
@@ -699,12 +822,14 @@ adminEls.importForm.addEventListener("submit", async (event) => {
   if (!adminEls.importFile.files[0]) return;
   const body = new FormData();
   body.append("file", adminEls.importFile.files[0]);
+  const activityId = Number(adminEls.importForm.dataset.activityId || adminState.dashboard.settings.activity_id);
   try {
-    const result = await adminApi("/api/admin/students/import", { method: "POST", body });
+    const result = await adminApi("/api/admin/students/import", { method: "POST", body, activityId });
     adminState.generatedCredentials = result.credentials;
     adminEls.importResult.className = "import-result is-success";
     adminEls.importResult.textContent = `导入完成：新增 ${result.created} 人，更新 ${result.updated} 人；本次返回 ${result.credentials.length} 条激活码。请立即下载并妥善保管。`;
     adminEls.importForm.reset();
+    delete adminEls.importForm.dataset.activityId;
     adminEls.importFileName.textContent = "UTF-8 或 GB18030，最大 1 MB";
     if (result.credentials.length) downloadCredentials(result.credentials);
     await loadDashboard();
@@ -746,9 +871,10 @@ adminEls.assignmentBody.addEventListener("click", async (event) => {
   if (!button) return;
   const row = button.closest("tr");
   const groupId = Number(row._groupSelect.value);
+  const activityId = Number(adminEls.assignmentBody.dataset.activityId);
   if (!groupId) { showAdminToast("请先选择补位教学组", "error"); return; }
   try {
-    await adminApi("/api/admin/selections", { method: "POST", body: JSON.stringify({ student_id: Number(row.dataset.studentId), group_id: groupId }) });
+    await adminApi("/api/admin/selections", { method: "POST", body: JSON.stringify({ student_id: Number(row.dataset.studentId), group_id: groupId }), activityId });
     showAdminToast("补位已写入并记录审计日志", "success");
     await loadDashboard();
   } catch (error) { showAdminToast(error.message, "error"); }
@@ -757,9 +883,10 @@ adminEls.assignmentBody.addEventListener("click", async (event) => {
 adminEls.recentBody.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-action=revoke-selection]");
   if (!button) return;
+  const activityId = Number(adminEls.recentBody.dataset.activityId);
   if (!await confirmDanger("撤销当前选择", `确认撤销 ${button.dataset.studentName} 的当前教学组？名额会立即释放。`)) return;
   try {
-    await adminApi("/api/admin/selections/revoke", { method: "POST", body: JSON.stringify({ student_id: Number(button.dataset.studentId), reason: "管理员在管理端撤销" }) });
+    await adminApi("/api/admin/selections/revoke", { method: "POST", body: JSON.stringify({ student_id: Number(button.dataset.studentId), reason: "管理员在管理端撤销" }), activityId });
     showAdminToast("选择已撤销，名额已释放", "success");
     await loadDashboard();
   } catch (error) { showAdminToast(error.message, "error"); }
