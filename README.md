@@ -37,8 +37,10 @@
 - Python API + SQLite 原子事务，已纳入 150 人同时抢 30 席的防超卖回归；
 - 支持多届、多学期连续使用：旧活动带 SHA-256 校验归档，新活动可复制原结构；
 - Docker Compose 部署到独立 Proxmox 虚拟机；
-- 提供带备份副本迁移演练、健康等待与失败恢复的单入口更新脚本；
-- 审计日志、CSV 导入导出、备份与恢复脚本；
+- 源站端口默认只绑定 `127.0.0.1`，由同机 Cloudflare Tunnel 提供公网 HTTPS；
+- 提供带备份副本迁移演练、健康等待与失败恢复的单入口更新脚本，发布目标必须是完整 40 位提交号；
+- 审计日志、CSV 导入导出、备份完整性检查与受控恢复流程；
+- CI 使用固定版本的 `pip-audit` 审计生产和开发依赖；
 - 自动化测试覆盖身份核验、重复提交、末位并发和权限边界。
 
 ## 本地运行
@@ -58,6 +60,9 @@ uvicorn server.main:create_app --factory --host 127.0.0.1 --port 8765
 ```powershell
 python -m pytest --basetemp "$env:LOCALAPPDATA\Codex\teaching-choice-tests\manual-run"
 ```
+
+批量验收可使用 [180 人虚构学生名单](examples/fictional-students-180.csv)；数据边界见
+[示例数据说明](examples/README.md)。该名单不含激活码，导入后由系统随机生成并一次性展示给管理员下载。
 
 独立虚拟机部署见 [docs/deployment.md](docs/deployment.md)。
 并发、Redis 取舍和多活动归档设计见 [docs/architecture.md](docs/architecture.md)。

@@ -37,10 +37,8 @@ class Config:
         app_secret = os.getenv("APP_SECRET", "")
         admin_initial_password = os.getenv("ADMIN_INITIAL_PASSWORD", "")
 
-        if environment == "production" and len(app_secret) < 32:
-            raise RuntimeError("生产环境 APP_SECRET 必须至少 32 个字符")
-        if not app_secret:
-            app_secret = "development-only-secret-change-before-production"
+        if len(app_secret) < 32:
+            raise RuntimeError("APP_SECRET 必须至少 32 个字符")
 
         return cls(
             environment=environment,

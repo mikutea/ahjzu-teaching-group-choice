@@ -5,12 +5,18 @@ umask 077
 APP_DIR="/opt/ahjzu-teaching-group-choice"
 DATA_DIR="${APP_DIR}/data"
 ENV_FILE="${APP_DIR}/.env"
-UPDATE_TARGET="${UPDATE_TARGET:-origin/main}"
+UPDATE_TARGET="${UPDATE_TARGET:-}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "请使用 root 运行更新脚本" >&2
   exit 1
 fi
+
+if [[ ! "${UPDATE_TARGET}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+  echo "必须通过 UPDATE_TARGET 指定经审核的完整 40 位 Git 提交号" >&2
+  exit 1
+fi
+UPDATE_TARGET="${UPDATE_TARGET,,}"
 
 if [[ "${TEACHING_CHOICE_UPDATE_REEXEC:-0}" != "1" ]]; then
   runtime_copy="/run/teaching-choice-update.$$.sh"
@@ -43,6 +49,7 @@ PHASE="PRECHECK"
 TIMER_WAS_ACTIVE=0
 PREFLIGHT_DIR=""
 OLD_COMMIT=""
+OLD_FULL_COMMIT=""
 ROLLBACK_TAG=""
 FINAL_BACKUP_READY=0
 
@@ -78,6 +85,22 @@ cleanup_preflight() {
       *) log "拒绝清理非预期迁移临时目录：${resolved}" ;;
     esac
   fi
+}
+
+restore_source_checkout() {
+  if [[ -z "${OLD_FULL_COMMIT:-}" ]]; then
+    return 0
+  fi
+  local current
+  current="$("${GIT[@]}" rev-parse HEAD 2>/dev/null || true)"
+  if [[ "${current}" == "${OLD_FULL_COMMIT}" ]]; then
+    return 0
+  fi
+  if [[ -n "$("${GIT[@]}" status --porcelain)" ]]; then
+    log "源码目录在更新过程中出现额外改动，拒绝自动覆盖"
+    return 1
+  fi
+  "${GIT[@]}" reset --hard "${OLD_FULL_COMMIT}"
 }
 
 restore_old_release() {
@@ -123,6 +146,9 @@ restore_old_release() {
   if ! install -o root -g root -m 0600 "${RELEASE_DIR}/env.before" "${ENV_FILE}"; then
     return 1
   fi
+  if ! restore_source_checkout; then
+    return 1
+  fi
   if ! set_env SEED_DEMO_STRUCTURE false || ! set_env APP_VERSION "rollback-${OLD_COMMIT}"; then
     return 1
   fi
@@ -146,10 +172,14 @@ on_exit() {
   cleanup_preflight
   if (( result != 0 )); then
     case "${PHASE:-PRECHECK}" in
-      ENV_READY)
+      PRECHECK|PREFLIGHT_OK)
+        restore_source_checkout || true
+        ;;
+      ENV_MUTATING|ENV_READY)
         if [[ -f "${RELEASE_DIR}/env.before" ]]; then
           install -o root -g root -m 0600 "${RELEASE_DIR}/env.before" "${ENV_FILE}"
         fi
+        restore_source_checkout || true
         ;;
       QUIESCING)
         if [[ -f "${RELEASE_DIR}/env.before" ]]; then
@@ -157,6 +187,7 @@ on_exit() {
           set_env SEED_DEMO_STRUCTURE false || true
           set_env APP_VERSION "rollback-${OLD_COMMIT}" || true
         fi
+        restore_source_checkout || true
         if ! "${COMPOSE[@]}" up -d --no-build --wait --wait-timeout 180 app \
           || ! curl -fsS --max-time 5 http://127.0.0.1/api/health >/dev/null; then
           log "旧应用未能恢复，Tunnel 保持关闭，请人工处理"
@@ -224,7 +255,8 @@ if systemctl is-active --quiet teaching-choice-backup.service; then
   exit 1
 fi
 
-OLD_COMMIT="$("${GIT[@]}" rev-parse --short=12 HEAD)"
+OLD_FULL_COMMIT="$("${GIT[@]}" rev-parse HEAD)"
+OLD_COMMIT="${OLD_FULL_COMMIT:0:12}"
 OLD_IMAGE_ID="$(docker inspect -f '{{.Image}}' "${OLD_CONTAINER_ID}")"
 ROLLBACK_TAG="teaching-group-choice:rollback-${OLD_COMMIT}"
 docker image tag "${OLD_IMAGE_ID}" "${ROLLBACK_TAG}"
@@ -247,7 +279,11 @@ sha256sum "${RELEASE_DIR}/preflight-source.db" > "${RELEASE_DIR}/preflight-sourc
 
 log "获取并构建 ${UPDATE_TARGET}"
 "${GIT[@]}" fetch --prune origin
-TARGET_COMMIT="$("${GIT[@]}" rev-parse "${UPDATE_TARGET}")"
+TARGET_COMMIT="$("${GIT[@]}" rev-parse --verify "${UPDATE_TARGET}^{commit}")"
+if [[ "${TARGET_COMMIT}" != "${UPDATE_TARGET}" ]]; then
+  echo "UPDATE_TARGET 未解析为指定的提交对象" >&2
+  exit 1
+fi
 "${GIT[@]}" merge --ff-only "${TARGET_COMMIT}"
 NEW_COMMIT="$("${GIT[@]}" rev-parse --short=12 HEAD)"
 NEW_IMAGE="teaching-group-choice:${NEW_COMMIT}"
@@ -279,6 +315,7 @@ docker run --rm --env-file "${ENV_FILE}" \
   | tee "${RELEASE_DIR}/preflight.log"
 PHASE="PREFLIGHT_OK"
 
+PHASE="ENV_MUTATING"
 set_env SEED_DEMO_STRUCTURE false
 set_env APP_VERSION "${NEW_COMMIT}"
 PHASE="ENV_READY"
