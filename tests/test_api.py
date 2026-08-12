@@ -71,6 +71,19 @@ def test_professional_and_group_counts_are_dynamic(client: TestClient, admin_hea
 
 
 def test_structure_is_locked_while_open(client: TestClient, admin_headers: dict[str, str]):
+    major_name = client.get("/api/admin/dashboard").json()["majors"][0]["name"]
+    imported = client.post(
+        "/api/admin/students/import",
+        headers=admin_headers,
+        files={
+            "file": (
+                "student.csv",
+                f"学号,姓名,专业\n20260000,结构锁测试,{major_name}\n".encode("utf-8"),
+                "text/csv",
+            )
+        },
+    )
+    assert imported.status_code == 200, imported.text
     assert client.post("/api/admin/status", headers=admin_headers, json={"status": "open"}).status_code == 200
     blocked = client.post("/api/admin/majors", headers=admin_headers, json={"name": "不可新增"})
     assert blocked.status_code == 409
@@ -187,7 +200,22 @@ def test_new_activity_archives_history_and_resets_roster(
 
 
 def test_new_activity_requires_current_activity_closed(client: TestClient, admin_headers: dict[str, str]):
-    activity_id = client.get("/api/admin/dashboard").json()["settings"]["activity_id"]
+    dashboard = client.get("/api/admin/dashboard").json()
+    activity_id = dashboard["settings"]["activity_id"]
+    imported = client.post(
+        "/api/admin/students/import",
+        headers=admin_headers,
+        files={
+            "file": (
+                "student.csv",
+                f"学号,姓名,专业\n20260000,活动状态测试,{dashboard['majors'][0]['name']}\n".encode(
+                    "utf-8"
+                ),
+                "text/csv",
+            )
+        },
+    )
+    assert imported.status_code == 200, imported.text
     assert client.post(
         "/api/admin/status", headers=admin_headers, json={"status": "open"}
     ).status_code == 200
@@ -343,11 +371,17 @@ def test_existing_single_activity_database_migrates_without_losing_settings(app_
     try:
         activity = migrated.execute(
             """
-            SELECT a.id, a.title, a.status FROM activities a
+            SELECT a.id, a.title, a.status, a.created_at, a.closed_at FROM activities a
             JOIN settings s ON s.current_activity_id = a.id WHERE s.id = 1
             """
         ).fetchone()
-        assert dict(activity) == {"id": 1, "title": "旧版活动", "status": "closed"}
+        assert dict(activity) == {
+            "id": 1,
+            "title": "旧版活动",
+            "status": "closed",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "closed_at": "2026-01-01T00:00:00+00:00",
+        }
         assert migrated.execute("PRAGMA user_version").fetchone()[0] == 2
         assert migrated.execute(
             "SELECT activity_id FROM audit_logs WHERE action = 'legacy.event'"
@@ -617,17 +651,21 @@ def test_one_hundred_fifty_students_competing_for_thirty_seats_never_oversells(a
         major = dashboard["majors"][0]
         group = dashboard["groups"][0]
         for quota in dashboard["quotas"]:
-            if quota["group_id"] == group["id"] and quota["major_id"] != major["id"]:
-                assert admin_client.put(
-                    f"/api/admin/quotas/{quota['major_id']}/{group['id']}",
-                    headers=admin_headers,
-                    json={"capacity": 0},
-                ).status_code == 200
-        assert admin_client.put(
-            f"/api/admin/quotas/{major['id']}/{group['id']}",
-            headers=admin_headers,
-            json={"capacity": 30},
-        ).status_code == 200
+            if quota["major_id"] == major["id"]:
+                continue
+            assert admin_client.put(
+                f"/api/admin/quotas/{quota['major_id']}/{quota['group_id']}",
+                headers=admin_headers,
+                json={"capacity": 0},
+            ).status_code == 200
+        for quota in dashboard["quotas"]:
+            if quota["major_id"] != major["id"]:
+                continue
+            assert admin_client.put(
+                f"/api/admin/quotas/{quota['major_id']}/{quota['group_id']}",
+                headers=admin_headers,
+                json={"capacity": 30},
+            ).status_code == 200
         rows = ["学号,姓名,专业,激活码"]
         for index in range(150):
             rows.append(f"2027{index:04d},并发{index:03d},{major['name']},LOAD{index:04d}")

@@ -68,6 +68,36 @@ CREATE TABLE IF NOT EXISTS quotas (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (major_id, group_id)
 );
+CREATE TRIGGER IF NOT EXISTS quota_group_capacity_guard_insert
+BEFORE INSERT ON quotas
+WHEN NEW.capacity + COALESCE((
+    SELECT SUM(capacity) FROM quotas WHERE group_id = NEW.group_id
+), 0) > COALESCE((
+    SELECT total_capacity FROM teaching_groups WHERE id = NEW.group_id
+), -1)
+BEGIN
+    SELECT RAISE(ABORT, 'group quota sum exceeds total capacity');
+END;
+CREATE TRIGGER IF NOT EXISTS quota_group_capacity_guard_update
+BEFORE UPDATE OF major_id, group_id, capacity ON quotas
+WHEN NEW.capacity + COALESCE((
+    SELECT SUM(capacity) FROM quotas
+    WHERE group_id = NEW.group_id
+      AND NOT (major_id = OLD.major_id AND group_id = OLD.group_id)
+), 0) > COALESCE((
+    SELECT total_capacity FROM teaching_groups WHERE id = NEW.group_id
+), -1)
+BEGIN
+    SELECT RAISE(ABORT, 'group quota sum exceeds total capacity');
+END;
+CREATE TRIGGER IF NOT EXISTS group_total_capacity_guard_update
+BEFORE UPDATE OF total_capacity ON teaching_groups
+WHEN NEW.total_capacity < COALESCE((
+    SELECT SUM(capacity) FROM quotas WHERE group_id = OLD.id
+), 0)
+BEGIN
+    SELECT RAISE(ABORT, 'group total capacity below quota sum');
+END;
 
 CREATE TABLE IF NOT EXISTS students (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -276,7 +306,10 @@ def _ensure_activity_schema(connection: sqlite3.Connection, now: str) -> int:
     )
 
     settings = connection.execute(
-        "SELECT activity_title, status, current_activity_id FROM settings WHERE id = 1"
+        """
+        SELECT activity_title, status, current_activity_id, created_at, updated_at
+        FROM settings WHERE id = 1
+        """
     ).fetchone()
     if not settings:
         raise RuntimeError("系统设置尚未初始化")
@@ -298,9 +331,9 @@ def _ensure_activity_schema(connection: sqlite3.Connection, now: str) -> int:
                 "activity-1",
                 settings["activity_title"],
                 settings["status"],
-                now,
-                now if settings["status"] == "open" else None,
-                now if settings["status"] == "closed" else None,
+                settings["created_at"] or now,
+                (settings["updated_at"] or now) if settings["status"] == "open" else None,
+                (settings["updated_at"] or now) if settings["status"] == "closed" else None,
             ),
         )
         activity_id = int(cursor.lastrowid)
@@ -488,7 +521,10 @@ def audit(
 
 
 def activity_snapshot(
-    connection: sqlite3.Connection, activity_id: int
+    connection: sqlite3.Connection,
+    activity_id: int,
+    *,
+    archived_at: str | None = None,
 ) -> tuple[dict[str, Any], str]:
     activity = connection.execute(
         "SELECT id, code, title, status, created_at, opened_at, closed_at FROM activities WHERE id = ?",
@@ -502,7 +538,7 @@ def activity_snapshot(
 
     snapshot = {
         "schema_version": 1,
-        "archived_at": utc_now(),
+        "archived_at": archived_at or utc_now(),
         "activity": dict(activity),
         "majors": rows("SELECT * FROM majors ORDER BY sort_order, id"),
         "teaching_groups": rows("SELECT * FROM teaching_groups ORDER BY sort_order, id"),

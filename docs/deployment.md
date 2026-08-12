@@ -31,13 +31,20 @@ sudo APP_DIR=/opt/ahjzu-teaching-group-choice \
 新容器或迁移数据库：
 
 ```bash
+set -euo pipefail
 commit="完整的 40 位 Git 提交号"
+repo="/opt/ahjzu-teaching-group-choice"
+temporary="$(mktemp)"
+trap 'rm -f "${temporary}"' EXIT
 sudo git -c safe.directory=/opt/ahjzu-teaching-group-choice \
-  -C /opt/ahjzu-teaching-group-choice fetch origin
+  -C "${repo}" fetch origin
 sudo git -c safe.directory=/opt/ahjzu-teaching-group-choice \
-  -C /opt/ahjzu-teaching-group-choice show \
-  "${commit}:deploy/update.sh" | sudo install -m 0700 /dev/stdin \
-  /usr/local/sbin/teaching-choice-update
+  -C "${repo}" show "${commit}:deploy/update.sh" > "${temporary}"
+expected_blob="$(sudo git -c safe.directory=/opt/ahjzu-teaching-group-choice \
+  -C "${repo}" rev-parse "${commit}:deploy/update.sh")"
+test "$(git hash-object "${temporary}")" = "${expected_blob}"
+bash -n "${temporary}"
+sudo install -m 0700 "${temporary}" /usr/local/sbin/teaching-choice-update
 sudo UPDATE_TARGET="${commit}" /usr/local/sbin/teaching-choice-update
 ```
 
@@ -146,7 +153,6 @@ HSTS 生效后，在 `max-age` 到期前移除 HTTPS、暂停 Cloudflare 或改�
 ## 依赖与基础镜像门禁
 
 CI 固定使用 `pip-audit==2.10.1`，分别审计生产与开发 requirements；发现已知漏洞或
-依赖解析失败都会阻断合并。`Dockerfile` 当前仍使用 `python:3.12-slim` 标签。基础镜像
-digest 必须先在目标架构的受控构建环境中核验，再以
-`python:3.12-slim@sha256:<已核验值>` 固定；在无法可靠确认 digest 时不得猜写，本项保留
-为发布清单待办。
+依赖解析失败都会阻断合并。GitHub Actions 均固定到完整提交 SHA。`Dockerfile` 使用
+Docker Hub 官方 API 于 2026-08-13 返回的 `python:3.12-slim` 多架构清单 digest；后续
+升级 Python 基础镜像时，必须重新核验官方摘要、构建并跑完整回归，不得只改回浮动标签。
