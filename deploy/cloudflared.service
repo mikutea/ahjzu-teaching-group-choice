@@ -6,7 +6,7 @@ Wants=network-online.target
 Requires=docker.service
 
 [Service]
-Type=notify
+Type=simple
 User=cloudflared
 Group=cloudflared
 ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token-file /etc/cloudflared/teaching-choice.token
