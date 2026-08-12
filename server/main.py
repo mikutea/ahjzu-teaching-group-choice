@@ -9,6 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -39,6 +40,18 @@ STUDENT_COOKIE = "tg_student_session"
 
 def clean_text(value: str) -> str:
     return " ".join(value.strip().split())
+
+
+def resolve_client_host(request: Request, trusted_proxy_ips: tuple[str, ...]) -> str:
+    direct_host = request.client.host if request.client else "unknown"
+    if direct_host not in trusted_proxy_ips:
+        return direct_host
+
+    cloudflare_host = request.headers.get("CF-Connecting-IP", "").strip()
+    try:
+        return str(ip_address(cloudflare_host))
+    except ValueError:
+        return direct_host
 
 
 class StrictModel(BaseModel):
@@ -223,7 +236,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         return JSONResponse(status_code=409, content={"detail": detail})
 
     def client_key(request: Request, namespace: str) -> str:
-        host = request.client.host if request.client else "unknown"
+        host = resolve_client_host(request, config.trusted_proxy_ips)
         return f"{namespace}:{host}"
 
     def require_session(
