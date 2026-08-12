@@ -5,6 +5,8 @@ import hashlib
 import hmac
 import secrets
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 
 PBKDF2_ITERATIONS = 600_000
 
@@ -65,3 +67,40 @@ def new_activation_code() -> str:
     alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
     return "".join(secrets.choice(alphabet) for _ in range(8))
 
+
+def _activation_encryption_key(app_secret: str) -> bytes:
+    return hashlib.sha256(
+        b"teaching-choice/activation-code/aes-gcm/v1\0" + app_secret.encode("utf-8")
+    ).digest()
+
+
+def encrypt_activation_code(app_secret: str, student_no: str, code: str) -> str:
+    """Encrypt a normalized activation code for administrator-only recovery.
+
+    Authentication continues to use ``activation_code_hash``.  This encrypted copy is
+    deliberately separate so a future display feature cannot weaken the login path.
+    """
+
+    normalized_code = "".join(code.strip().upper().split())
+    nonce = secrets.token_bytes(12)
+    aad = f"student:{student_no}".encode("utf-8")
+    ciphertext = AESGCM(_activation_encryption_key(app_secret)).encrypt(
+        nonce, normalized_code.encode("utf-8"), aad
+    )
+    encoded = base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii").rstrip("=")
+    return f"v1.{encoded}"
+
+
+def decrypt_activation_code(app_secret: str, student_no: str, encoded: str) -> str:
+    version, payload = encoded.split(".", 1)
+    if version != "v1":
+        raise ValueError("unsupported activation-code ciphertext version")
+    payload += "=" * (-len(payload) % 4)
+    packed = base64.urlsafe_b64decode(payload.encode("ascii"))
+    if len(packed) < 29:
+        raise ValueError("invalid activation-code ciphertext")
+    nonce, ciphertext = packed[:12], packed[12:]
+    aad = f"student:{student_no}".encode("utf-8")
+    return AESGCM(_activation_encryption_key(app_secret)).decrypt(
+        nonce, ciphertext, aad
+    ).decode("utf-8")

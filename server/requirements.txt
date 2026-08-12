@@ -3,3 +3,4 @@ uvicorn[standard]==0.42.0
 python-multipart==0.0.32
 qrcode[pil]==8.2
 Pillow==12.3.0
+cryptography==50.0.0

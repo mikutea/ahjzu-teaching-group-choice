@@ -49,7 +49,8 @@
         <button class="admin-nav__item" data-view="settings" type="button"><span>◇</span>系统设置</button>
       </nav>
       <div class="admin-sidebar__footer">
-        <span id="sidebar-owner">制作：Mikutea</span>
+        <span>安徽建筑大学 · 建筑与空间规划学院</span>
+        <span>制作：Mikutea</span>
         <button id="admin-logout" class="button button--sidebar" type="button">安全退出</button>
       </div>
     </aside>
@@ -78,9 +79,19 @@
 
       <section id="view-overview" class="admin-view">
         <div id="live-board" class="live-board">
+          <header class="board-presentation-header">
+            <div class="board-presentation-brand">
+              <span class="college-wordmark college-wordmark--board"><img src="/brand/college-wordmark-official.png" alt="建筑与空间规划学院"></span>
+              <h1 id="board-activity-title">教学组线上抢选</h1>
+            </div>
+            <strong id="board-header-phase" class="board-header-phase">候场中</strong>
+            <div class="board-presentation-sync"><span class="status-dot"></span><span>实时同步</span></div>
+            <time id="board-clock" class="board-clock">--:--:--</time>
+            <button id="board-exit-fullscreen" class="button board-exit-fullscreen" type="button">退出全屏</button>
+          </header>
           <section class="board-panel board-panel--stats" aria-labelledby="stats-title">
             <div class="panel-kicker">CURRENT STATUS</div>
-            <h2 id="stats-title">当前选择情况</h2>
+            <h2 id="stats-title">当前抢选进度</h2>
             <div class="stat-pair">
               <article class="metric-card metric-card--selected">
                 <span>已选</span><strong id="metric-selected">0</strong><small>人</small>
@@ -93,7 +104,10 @@
               <div class="progress-label"><span>总体完成率</span><strong id="metric-rate">0%</strong></div>
               <div class="progress-track"><span id="metric-rate-bar"></span></div>
             </div>
-            <h3>各教学组进度</h3>
+            <div class="board-subheading">
+              <h3>各教学组进度</h3>
+              <span id="group-progress-page" class="board-page-indicator" aria-live="polite"></span>
+            </div>
             <div id="group-progress" class="group-progress"></div>
           </section>
 
@@ -112,24 +126,44 @@
               <span class="qr-corner qr-corner--c"></span><span class="qr-corner qr-corner--d"></span>
             </div>
             <p id="public-url-label" class="public-url">尚未设置访问地址</p>
-            <div class="qr-notice"><span class="status-dot"></span><strong id="board-status-text">当前未开放</strong><small>手机浏览器扫码，无需安装应用</small></div>
+            <div id="board-stage" class="board-stage board-stage--waiting" aria-live="polite" aria-atomic="true">
+              <div>
+                <span id="board-stage-label" class="board-stage__label">候场中</span>
+                <strong id="board-countdown-value" class="board-stage__countdown">READY</strong>
+              </div>
+              <p id="board-stage-detail">学生扫码核验后将在手机端等待</p>
+              <button id="board-start-countdown" class="button button--primary button--wide" type="button">开始 10 秒倒计时</button>
+            </div>
+            <div class="qr-notice"><span class="status-dot"></span><strong id="board-status-text">候场数据实时更新</strong><small id="board-live-note">每秒自动同步，无需手动刷新</small></div>
           </section>
 
           <section class="board-panel board-panel--unselected" aria-labelledby="unselected-title">
+            <div class="stat-pair stat-pair--presence" aria-label="候场情况">
+              <article class="metric-card metric-card--online">
+                <span>已进入候场</span><strong id="metric-online">0</strong><small>人</small>
+              </article>
+              <article class="metric-card">
+                <span>尚未进入</span><strong id="metric-absent">0</strong><small>人</small>
+              </article>
+            </div>
             <div class="panel-title-row">
               <div>
-                <div class="panel-kicker">WAITING LIST</div>
-                <h2 id="unselected-title">当前未选学生</h2>
+                <div id="student-list-kicker" class="panel-kicker">CHECK-IN LIST</div>
+                <h2 id="unselected-title">尚未进入候场</h2>
               </div>
-              <span id="unselected-count" class="count-chip">0 人</span>
+              <div class="board-list-meta">
+                <span id="unselected-count" class="count-chip">0 人</span>
+                <span id="unselected-page" class="board-page-indicator" aria-live="polite"></span>
+              </div>
             </div>
             <label class="compact-search">
               <span aria-hidden="true">⌕</span>
               <input id="unselected-search" type="search" placeholder="搜索姓名 / 学号 / 专业">
             </label>
-            <div id="unselected-list" class="unselected-list"></div>
+            <div id="unselected-list" class="unselected-list" aria-live="polite"></div>
             <a id="export-unselected" class="button button--quiet button--wide" href="/api/admin/export/unselected.csv">导出未选名单</a>
           </section>
+          <footer class="board-presentation-footer">安徽建筑大学 · 建筑与空间规划学院 制作：Mikutea</footer>
         </div>
 
         <section class="content-card recent-card">
@@ -153,7 +187,7 @@
         </div>
         <div class="structure-grid">
           <section class="content-card">
-            <div class="content-card__heading"><div><h3>专业设置</h3><p id="major-count-label">0 个专业</p></div></div>
+            <div class="content-card__heading"><div><h3>专业设置</h3><p id="major-count-label">0 个专业</p><p class="entity-status-help">“停用”不会删除历史记录，只会让该专业不再参与本场抢选；有在册学生时系统会阻止停用。</p></div></div>
             <form id="add-major-form" class="inline-add-form">
               <input name="name" maxlength="80" required placeholder="例如：室内设计">
               <button class="button button--primary" type="submit">＋ 新增专业</button>
@@ -161,7 +195,7 @@
             <div id="major-editor" class="entity-editor"></div>
           </section>
           <section class="content-card">
-            <div class="content-card__heading"><div><h3>教学组设置</h3><p id="group-count-label">0 个教学组</p></div></div>
+            <div class="content-card__heading"><div><h3>教学组设置</h3><p id="group-count-label">0 个教学组</p><p class="entity-status-help">“停用”不会删除教学组；已有选择记录时系统会阻止停用。重新启用后请复核各专业配额。</p></div></div>
             <form id="add-group-form" class="inline-add-form inline-add-form--group">
               <input name="name" maxlength="80" required placeholder="例如：第七教学组">
               <input name="capacity" type="number" min="0" max="1000" value="30" aria-label="总容量">
@@ -224,7 +258,7 @@
         </div>
         <section class="content-card roster-card">
           <div class="content-card__heading roster-card__heading">
-            <div><h3>本场完整学生名单</h3><p>包含有效与已停用学生、当前选择结果；重置个人激活码会使旧码及该生现有登录失效。</p></div>
+            <div><h3>本场完整学生名单</h3><p>激活码默认掩码保护，可按需显示并在 60 秒后自动隐藏；重置会使旧码及该生现有登录立即失效。</p></div>
             <span id="student-roster-count" class="count-chip">0 人</span>
           </div>
           <label class="compact-search roster-search">
@@ -242,7 +276,7 @@
 
       <section id="view-settings" class="admin-view is-hidden">
         <div class="page-heading">
-          <div><p class="eyebrow">SYSTEM SETTINGS</p><h2>活动与版权信息</h2><p>每次抢选独立归档，可继续建立下一届或下一轮活动。</p></div>
+          <div><p class="eyebrow">SYSTEM SETTINGS</p><h2>活动与访问设置</h2><p>每次抢选独立归档，可继续建立下一届或下一轮活动；学院版权信息由系统固定保护。</p></div>
         </div>
         <section class="content-card activity-manager">
           <div class="content-card__heading">
@@ -264,10 +298,13 @@
           <form id="settings-form" class="content-card settings-form">
             <h3>基础设置</h3>
             <label class="field"><span>活动标题</span><input name="activity_title" maxlength="120" required></label>
-            <label class="field"><span>学校与学院版权文字</span><input name="organization_name" maxlength="160" required></label>
-            <label class="field"><span>制作人</span><input name="owner_name" maxlength="80" required></label>
             <label class="field"><span>学生端访问地址</span><input name="public_base_url" type="url" maxlength="300" placeholder="例如：http://192.168.22.50"></label>
             <p class="field-help">二维码将指向该地址。校内 HTTP 可先试用，正式跨网使用应配置 HTTPS。</p>
+            <div class="fixed-copyright" aria-label="固定版权信息">
+              <span>固定版权信息</span>
+              <strong>安徽建筑大学 · 建筑与空间规划学院 制作：Mikutea</strong>
+              <small>该信息不可在管理端修改。</small>
+            </div>
             <button class="button button--primary" type="submit">保存设置</button>
           </form>
           <form id="password-form" class="content-card settings-form">
@@ -282,8 +319,7 @@
       </section>
 
       <footer class="site-footer site-footer--admin">
-        <span id="admin-footer-org">安徽建筑大学 · 建筑与空间规划学院</span>
-        <span>制作：<span id="admin-footer-owner">Mikutea</span></span>
+        <span>安徽建筑大学 · 建筑与空间规划学院 制作：Mikutea</span>
       </footer>
       <div id="admin-toast" class="toast toast--admin" role="status" aria-live="polite"></div>
     </main>
