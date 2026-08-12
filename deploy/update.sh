@@ -5,12 +5,18 @@ umask 077
 APP_DIR="/opt/ahjzu-teaching-group-choice"
 DATA_DIR="${APP_DIR}/data"
 ENV_FILE="${APP_DIR}/.env"
-UPDATE_TARGET="${UPDATE_TARGET:-origin/main}"
+UPDATE_TARGET="${UPDATE_TARGET:-}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "请使用 root 运行更新脚本" >&2
   exit 1
 fi
+
+if [[ ! "${UPDATE_TARGET}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+  echo "必须通过 UPDATE_TARGET 指定经审核的完整 40 位 Git 提交号" >&2
+  exit 1
+fi
+UPDATE_TARGET="${UPDATE_TARGET,,}"
 
 if [[ "${TEACHING_CHOICE_UPDATE_REEXEC:-0}" != "1" ]]; then
   runtime_copy="/run/teaching-choice-update.$$.sh"
@@ -247,7 +253,11 @@ sha256sum "${RELEASE_DIR}/preflight-source.db" > "${RELEASE_DIR}/preflight-sourc
 
 log "获取并构建 ${UPDATE_TARGET}"
 "${GIT[@]}" fetch --prune origin
-TARGET_COMMIT="$("${GIT[@]}" rev-parse "${UPDATE_TARGET}")"
+TARGET_COMMIT="$("${GIT[@]}" rev-parse --verify "${UPDATE_TARGET}^{commit}")"
+if [[ "${TARGET_COMMIT}" != "${UPDATE_TARGET}" ]]; then
+  echo "UPDATE_TARGET 未解析为指定的提交对象" >&2
+  exit 1
+fi
 "${GIT[@]}" merge --ff-only "${TARGET_COMMIT}"
 NEW_COMMIT="$("${GIT[@]}" rev-parse --short=12 HEAD)"
 NEW_IMAGE="teaching-group-choice:${NEW_COMMIT}"
