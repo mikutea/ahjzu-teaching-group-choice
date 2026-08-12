@@ -8,6 +8,7 @@ fi
 
 APP_DIR="${APP_DIR:-/opt/ahjzu-teaching-group-choice}"
 PUBLIC_URL="${PUBLIC_URL:-}"
+ORIGIN_BIND_VALUE="${ORIGIN_BIND:-127.0.0.1}"
 
 if [[ ! -f "${APP_DIR}/docker-compose.yml" ]]; then
   echo "未找到 ${APP_DIR}/docker-compose.yml" >&2
@@ -40,6 +41,7 @@ if [[ ! -f .env ]]; then
   {
     echo "ENVIRONMENT=production"
     echo "DATA_DIR=/data"
+    echo "ORIGIN_BIND=${ORIGIN_BIND_VALUE}"
     echo "APP_SECRET=${APP_SECRET_VALUE}"
     echo "ADMIN_USERNAME=admin"
     echo "ADMIN_INITIAL_PASSWORD=${ADMIN_PASSWORD_VALUE}"
@@ -81,4 +83,5 @@ systemctl daemon-reload
 systemctl enable --now teaching-choice-backup.timer
 
 echo "部署完成：${PUBLIC_URL}"
+echo "源站绑定：${ORIGIN_BIND_VALUE}:80；Cloudflare Tunnel 应指向 http://127.0.0.1:80"
 echo "首次登录凭据保存在 /root/teaching-choice-initial-password.txt（权限 600）"

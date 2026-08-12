@@ -31,7 +31,7 @@
         <span class="section-index">01</span>
         <div>
           <h2 id="login-title">身份核验</h2>
-          <p>请填写名单中的信息和一次性激活码</p>
+          <p>请填写名单中的信息和个人激活码</p>
         </div>
       </div>
       <form id="student-login-form" class="form-stack" novalidate>
@@ -44,8 +44,8 @@
           <input id="student-name" name="name" autocomplete="name" maxlength="80" required placeholder="请输入姓名">
         </label>
         <label class="field">
-          <span>激活码</span>
-          <input id="activation-code" name="activation_code" autocomplete="one-time-code" maxlength="64" required placeholder="8 位激活码">
+          <span>个人激活码</span>
+          <input id="activation-code" name="activation_code" autocomplete="one-time-code" maxlength="64" required placeholder="请输入个人激活码">
         </label>
         <button class="button button--primary button--wide" type="submit">
           核验并进入 <span aria-hidden="true">→</span>
@@ -112,4 +112,3 @@
   <script src="/assets/student.js" defer></script>
 </body>
 </html>
-
