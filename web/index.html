@@ -75,6 +75,28 @@
       <p id="choice-hint" class="choice-hint">请选择一个仍有名额的教学组</p>
     </section>
 
+    <section id="waiting-view" class="student-card waiting-card is-hidden" aria-labelledby="waiting-title">
+      <div class="student-identity">
+        <div class="student-avatar" aria-hidden="true">建</div>
+        <div>
+          <p id="waiting-student-name" class="student-identity__name"></p>
+          <p id="waiting-student-meta" class="student-identity__meta"></p>
+        </div>
+        <button id="waiting-logout" class="button button--quiet button--small" type="button">退出</button>
+      </div>
+      <div id="waiting-visual" class="waiting-visual" aria-hidden="true">
+        <span class="waiting-visual__ring"></span>
+        <strong id="student-countdown-value">READY</strong>
+      </div>
+      <p class="eyebrow">CHECK-IN COMPLETE</p>
+      <h2 id="waiting-title">已进入抢选候场</h2>
+      <p id="waiting-message" class="waiting-card__message">请保持页面打开，等待老师开始抢选。</p>
+      <div class="waiting-card__notice">
+        <span class="status-dot"></span>
+        <span id="waiting-live-note">状态每秒自动同步</span>
+      </div>
+    </section>
+
     <section id="success-view" class="student-card success-card is-hidden" aria-labelledby="success-title">
       <div class="success-mark" aria-hidden="true">✓</div>
       <p class="eyebrow">SUBMITTED</p>
@@ -92,8 +114,7 @@
   </main>
 
   <footer class="site-footer site-footer--student">
-    <span id="student-footer-org">安徽建筑大学 · 建筑与空间规划学院</span>
-    <span>制作：<span id="student-footer-owner">Mikutea</span></span>
+    <span>安徽建筑大学 · 建筑与空间规划学院 制作：Mikutea</span>
   </footer>
 
   <dialog id="confirm-dialog" class="confirm-dialog">

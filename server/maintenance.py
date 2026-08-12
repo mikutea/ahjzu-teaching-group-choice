@@ -16,16 +16,22 @@ from .database import SCHEMA_VERSION, connect, initialize_database
 
 MIGRATION_DIGEST_QUERIES = {
     "settings": (
-        "SELECT id, activity_title, organization_name, owner_name, status, "
+        "SELECT id, activity_title, status, "
         "public_base_url, created_at, updated_at FROM settings ORDER BY id"
     ),
     "majors": "SELECT * FROM majors ORDER BY id",
     "teaching_groups": "SELECT * FROM teaching_groups ORDER BY id",
     "quotas": "SELECT * FROM quotas ORDER BY major_id, group_id",
-    "students": "SELECT * FROM students ORDER BY id",
+    "students": (
+        "SELECT id, student_no, name, major_id, activation_hash, active, "
+        "created_at, updated_at FROM students ORDER BY id"
+    ),
     "selections": "SELECT * FROM selections ORDER BY id",
     "admin_users": "SELECT * FROM admin_users ORDER BY id",
-    "sessions": "SELECT * FROM sessions ORDER BY token_hash",
+    "sessions": (
+        "SELECT token_hash, role, subject_id, csrf_token, created_at, expires_at "
+        "FROM sessions ORDER BY token_hash"
+    ),
     "audit_logs": (
         "SELECT id, occurred_at, actor_type, actor_id, action, entity_type, "
         "entity_id, details_json FROM audit_logs ORDER BY id"
@@ -154,9 +160,32 @@ def check_database(database_path: Path) -> str:
             "sync_settings_title_to_activity",
             "sync_settings_status_to_activity",
             "assign_current_activity_to_audit",
+            "copyright_settings_guard_update",
+            "copyright_settings_guard_insert",
         }
         if not required_triggers <= triggers:
             raise RuntimeError("数据库缺少名额约束触发器")
+        copyright_row = connection.execute(
+            "SELECT organization_name, owner_name FROM settings WHERE id = 1"
+        ).fetchone()
+        if (
+            not copyright_row
+            or str(copyright_row[0]) != "安徽建筑大学 · 建筑与空间规划学院"
+            or str(copyright_row[1]) != "Mikutea"
+        ):
+            raise RuntimeError("数据库版权信息与固定发布信息不一致")
+        required_columns = {
+            "activities": {"selection_opens_at"},
+            "students": {"activation_ciphertext"},
+            "sessions": {"last_seen_at"},
+        }
+        for table, expected_columns in required_columns.items():
+            actual_columns = {
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if not expected_columns <= actual_columns:
+                raise RuntimeError(f"数据库表 {table} 缺少新版本字段")
         live_activities = connection.execute(
             "SELECT id FROM activities WHERE status <> 'archived'"
         ).fetchall()
@@ -167,6 +196,41 @@ def check_database(database_path: Path) -> str:
         ).fetchone()
         if not current or int(current[0]) != int(live_activities[0][0]):
             raise RuntimeError("系统设置指向的当前活动不正确")
+        live = connection.execute(
+            """
+            SELECT id, status, opened_at, closed_at, selection_opens_at
+            FROM activities WHERE id = ?
+            """,
+            (live_activities[0][0],),
+        ).fetchone()
+        selection_opens_at = live[4]
+        if live[1] == "closed" and selection_opens_at is not None:
+            raise RuntimeError("已关闭活动不能保留开抢时间")
+        if live[1] == "open":
+            if selection_opens_at is None:
+                raise RuntimeError("开放活动缺少开抢时间")
+            try:
+                opens_at_dt = datetime.fromisoformat(str(selection_opens_at))
+                opened_at_dt = (
+                    datetime.fromisoformat(str(live[2])) if live[2] is not None else None
+                )
+            except ValueError as exc:
+                raise RuntimeError("当前活动开抢时间无法解析") from exc
+            if opens_at_dt.utcoffset() is None or (
+                opened_at_dt is not None and opened_at_dt.utcoffset() is None
+            ):
+                raise RuntimeError("当前活动开抢时间必须包含时区")
+            if opens_at_dt > datetime.now(UTC) and live[2] != selection_opens_at:
+                raise RuntimeError("倒计时活动的开放时间与开抢时间不一致")
+        archived_countdown = connection.execute(
+            """
+            SELECT id FROM activities
+            WHERE status = 'archived' AND selection_opens_at IS NOT NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        if archived_countdown:
+            raise RuntimeError(f"归档活动 {archived_countdown[0]} 仍保留开抢时间")
         for row in connection.execute(
             """
             SELECT id, code, title, created_at, opened_at, closed_at, archived_at,
@@ -184,10 +248,6 @@ def check_database(database_path: Path) -> str:
                 raise RuntimeError(f"归档活动 {row[0]} JSON 无法解析") from exc
             if not isinstance(summary, dict) or not isinstance(snapshot, dict):
                 raise RuntimeError(f"归档活动 {row[0]} JSON 结构不正确")
-            if archived_at.utcoffset() is None or snapshot.get("archived_at") != row[6]:
-                raise RuntimeError(f"归档活动 {row[0]} 归档时间不正确")
-            if not {"students", "selected", "unselected"} <= summary.keys():
-                raise RuntimeError(f"归档活动 {row[0]} 汇总字段不完整")
             required_snapshot_keys = {
                 "activity",
                 "majors",
@@ -213,6 +273,10 @@ def check_database(database_path: Path) -> str:
                 for key, value in expected_activity.items()
             ):
                 raise RuntimeError(f"归档活动 {row[0]} 快照归属不正确")
+            if archived_at.utcoffset() is None or snapshot.get("archived_at") != row[6]:
+                raise RuntimeError(f"归档活动 {row[0]} 归档时间不正确")
+            if not {"students", "selected", "unselected"} <= summary.keys():
+                raise RuntimeError(f"归档活动 {row[0]} 汇总字段不完整")
             active_student_ids = {
                 int(student["id"])
                 for student in snapshot["students"]

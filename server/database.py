@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS activities (
     opened_at TEXT,
     closed_at TEXT,
     archived_at TEXT,
+    selection_opens_at TEXT,
     summary_json TEXT,
     snapshot_json TEXT,
     snapshot_sha256 TEXT
@@ -39,6 +40,20 @@ CREATE TABLE IF NOT EXISTS settings (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TRIGGER IF NOT EXISTS copyright_settings_guard_update
+BEFORE UPDATE OF organization_name, owner_name ON settings
+WHEN NEW.organization_name <> '安徽建筑大学 · 建筑与空间规划学院'
+  OR NEW.owner_name <> 'Mikutea'
+BEGIN
+    SELECT RAISE(ABORT, 'copyright settings are fixed');
+END;
+CREATE TRIGGER IF NOT EXISTS copyright_settings_guard_insert
+BEFORE INSERT ON settings
+WHEN NEW.organization_name <> '安徽建筑大学 · 建筑与空间规划学院'
+  OR NEW.owner_name <> 'Mikutea'
+BEGIN
+    SELECT RAISE(ABORT, 'copyright settings are fixed');
+END;
 
 CREATE TABLE IF NOT EXISTS majors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,6 +120,7 @@ CREATE TABLE IF NOT EXISTS students (
     name TEXT NOT NULL,
     major_id INTEGER NOT NULL REFERENCES majors(id) ON DELETE RESTRICT,
     activation_hash TEXT NOT NULL,
+    activation_ciphertext TEXT,
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -203,6 +219,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     subject_id INTEGER NOT NULL,
     csrf_token TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    last_seen_at TEXT,
     expires_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
@@ -272,7 +289,7 @@ END;
 
 
 DEFAULT_MAJORS = ["建筑学", "城乡规划", "风景园林"]
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_GROUPS = [f"第{i}教学组" for i in range(1, 7)]
 DEFAULT_QUOTAS = {
     "建筑学": [10, 10, 10, 10, 10, 10],
@@ -282,7 +299,9 @@ DEFAULT_QUOTAS = {
 
 
 def utc_now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds")
+    # Millisecond precision prevents a nominal ten-second countdown from being
+    # shortened by truncating both ends to whole seconds.
+    return datetime.now(UTC).isoformat(timespec="milliseconds")
 
 
 def connect(database_path: Path) -> sqlite3.Connection:
@@ -382,10 +401,33 @@ def initialize_database(config: Config) -> None:
                 "ALTER TABLE audit_logs ADD COLUMN activity_id "
                 "INTEGER REFERENCES activities(id);"
             )
-        trigger_marker = "CREATE TRIGGER IF NOT EXISTS sync_activity_title_to_settings"
+        if "activities" in existing_tables and "selection_opens_at" not in _columns(
+            connection, "activities"
+        ):
+            alterations.append(
+                "ALTER TABLE activities ADD COLUMN selection_opens_at TEXT;"
+            )
+        if "students" in existing_tables and "activation_ciphertext" not in _columns(
+            connection, "students"
+        ):
+            alterations.append(
+                "ALTER TABLE students ADD COLUMN activation_ciphertext TEXT;"
+            )
+        if "sessions" in existing_tables and "last_seen_at" not in _columns(
+            connection, "sessions"
+        ):
+            alterations.append("ALTER TABLE sessions ADD COLUMN last_seen_at TEXT;")
+        trigger_marker = "CREATE TRIGGER IF NOT EXISTS copyright_settings_guard_update"
+        migration_steps = alterations + [
+            "UPDATE settings SET "
+            "organization_name = '安徽建筑大学 · 建筑与空间规划学院', "
+            "owner_name = 'Mikutea' WHERE id = 1;",
+            "UPDATE activities SET selection_opens_at = COALESCE(opened_at, created_at) "
+            "WHERE status = 'open' AND selection_opens_at IS NULL;",
+        ]
         migration_schema = SCHEMA.replace(
             trigger_marker,
-            "\n".join(alterations + [trigger_marker]),
+            "\n".join(migration_steps + [trigger_marker]),
             1,
         )
         connection.executescript("BEGIN IMMEDIATE;\n" + migration_schema)
