@@ -1,0 +1,36 @@
+[Unit]
+Description=Cloudflare Tunnel for AHJZU Teaching Group Choice
+Documentation=https://developers.cloudflare.com/tunnel/
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=notify
+User=cloudflared
+Group=cloudflared
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token-file /etc/cloudflared/teaching-choice.token
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=0
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
