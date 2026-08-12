@@ -38,6 +38,13 @@ async function studentApi(path, options = {}) {
   if (studentState.csrf && !["GET", "HEAD"].includes((options.method || "GET").toUpperCase())) {
     headers.set("X-CSRF-Token", studentState.csrf);
   }
+  if (
+    path === "/api/student/select"
+    && studentState.payload?.settings.activity_id
+    && !headers.has("X-Activity-ID")
+  ) {
+    headers.set("X-Activity-ID", String(studentState.payload.settings.activity_id));
+  }
   const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
   const type = response.headers.get("content-type") || "";
   const data = type.includes("application/json") ? await response.json() : null;
@@ -208,6 +215,7 @@ studentEls.loginForm.addEventListener("submit", async (event) => {
 studentEls.submitChoice.addEventListener("click", () => {
   const group = studentState.payload?.groups.find((item) => item.id === studentState.selectedGroupId);
   if (!group) return;
+  studentEls.confirmDialog.dataset.activityId = String(studentState.payload.settings.activity_id);
   studentEls.confirmGroupName.textContent = group.name;
   studentEls.confirmDialog.showModal();
 });
@@ -221,6 +229,7 @@ studentEls.confirmDialog.addEventListener("close", async () => {
     const data = await studentApi("/api/student/select", {
       method: "POST",
       body: JSON.stringify({ group_id: groupId }),
+      headers: { "X-Activity-ID": studentEls.confirmDialog.dataset.activityId },
     });
     renderStudentPayload(data);
     showStudentMessage("选择已由服务器确认", "success");
@@ -250,4 +259,3 @@ document.querySelector("#success-logout").addEventListener("click", studentLogou
 
 loadPublicInfo();
 loadStudentSession();
-

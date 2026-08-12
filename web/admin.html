@@ -204,8 +204,24 @@
 
       <section id="view-settings" class="admin-view is-hidden">
         <div class="page-heading">
-          <div><p class="eyebrow">SYSTEM SETTINGS</p><h2>活动与版权信息</h2><p>页脚同时保留学校、学院和制作人信息。</p></div>
+          <div><p class="eyebrow">SYSTEM SETTINGS</p><h2>活动与版权信息</h2><p>每次抢选独立归档，可继续建立下一届或下一轮活动。</p></div>
         </div>
+        <section class="content-card activity-manager">
+          <div class="content-card__heading">
+            <div><h3>活动管理</h3><p>当前活动关闭后，可归档全部结果并创建新活动；历史不会被覆盖。</p></div>
+            <span id="activity-count-label" class="count-chip">1 场</span>
+          </div>
+          <div class="activity-manager__layout">
+            <div id="activity-list" class="activity-list"></div>
+            <form id="new-activity-form" class="new-activity-form">
+              <label class="field"><span>新活动名称</span><input name="title" maxlength="120" required placeholder="例如：2027级教学组线上抢选"></label>
+              <label class="field"><span>活动编号（可选）</span><input name="code" maxlength="48" pattern="[A-Za-z0-9_-]+" placeholder="例如：2027-fall"></label>
+              <label class="check-field"><input name="copy_structure" type="checkbox" checked><span>复制当前专业、教学组和配额</span></label>
+              <p class="field-help">创建时会先把当前名单、全部选择历史、结构与审计日志封存为带 SHA-256 校验的只读归档，然后清空本场学生数据。</p>
+              <button class="button button--primary" type="submit">归档当前活动并新建</button>
+            </form>
+          </div>
+        </section>
         <div class="settings-grid">
           <form id="settings-form" class="content-card settings-form">
             <h3>基础设置</h3>
@@ -250,4 +266,3 @@
   <script src="/assets/admin.js" defer></script>
 </body>
 </html>
-

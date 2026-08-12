@@ -19,7 +19,14 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from .config import Config, PROJECT_ROOT
-from .database import audit, connect, initialize_database, utc_now
+from .database import (
+    SCHEMA_VERSION,
+    activity_snapshot,
+    audit,
+    connect,
+    initialize_database,
+    utc_now,
+)
 from .security import (
     activation_code_hash,
     hash_password,
@@ -98,6 +105,18 @@ class SettingsUpdate(StrictModel):
         if value and not value.startswith(("http://", "https://")):
             raise ValueError("访问地址必须以 http:// 或 https:// 开头")
         return value
+
+
+class ActivityCreate(StrictModel):
+    title: str = Field(min_length=2, max_length=120)
+    code: str | None = Field(default=None, min_length=2, max_length=48, pattern=r"^[A-Za-z0-9_-]+$")
+    copy_structure: bool = True
+    previous_activity_id: int = Field(gt=0)
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        return clean_text(value)
 
 
 class MajorCreate(StrictModel):
@@ -235,6 +254,17 @@ def create_app(config: Config | None = None) -> FastAPI:
             detail = "数据约束校验失败"
         return JSONResponse(status_code=409, content={"detail": detail})
 
+    @app.exception_handler(sqlite3.OperationalError)
+    async def sqlite_operational_error(_: Request, exc: sqlite3.OperationalError):
+        message = str(exc).lower()
+        if "locked" in message or "busy" in message:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "当前提交人数较多，请稍候重试"},
+                headers={"Retry-After": "1"},
+            )
+        raise exc
+
     def client_key(request: Request, namespace: str) -> str:
         host = resolve_client_host(request, config.trusted_proxy_ips)
         return f"{namespace}:{host}"
@@ -276,46 +306,38 @@ def create_app(config: Config | None = None) -> FastAPI:
             token_hash=token_hash,
         )
 
-    def create_session(
-        response: Response,
+    def persist_session(
+        connection: sqlite3.Connection,
         *,
         role: Literal["student", "admin"],
         subject_id: int,
-    ) -> str:
-        token = new_session_token()
-        csrf_token = new_csrf_token()
-        now_dt = datetime.now(UTC)
+        token: str,
+        csrf_token: str,
+        now_dt: datetime,
+    ) -> None:
         expires = now_dt + timedelta(hours=config.session_hours)
-        connection = connect(config.database_path)
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (utc_now(),))
-            connection.execute(
-                "DELETE FROM sessions WHERE role = ? AND subject_id = ?",
-                (role, subject_id),
-            )
-            connection.execute(
-                """
-                INSERT INTO sessions
-                    (token_hash, role, subject_id, csrf_token, created_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_token_hash(token),
-                    role,
-                    subject_id,
-                    csrf_token,
-                    now_dt.isoformat(timespec="seconds"),
-                    expires.isoformat(timespec="seconds"),
-                ),
-            )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+        connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (utc_now(),))
+        connection.execute(
+            "DELETE FROM sessions WHERE role = ? AND subject_id = ?",
+            (role, subject_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO sessions
+                (token_hash, role, subject_id, csrf_token, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_token_hash(token),
+                role,
+                subject_id,
+                csrf_token,
+                now_dt.isoformat(timespec="seconds"),
+                expires.isoformat(timespec="seconds"),
+            ),
+        )
 
+    def set_session_cookie(response: Response, role: Literal["student", "admin"], token: str) -> None:
         cookie_name = ADMIN_COOKIE if role == "admin" else STUDENT_COOKIE
         response.set_cookie(
             cookie_name,
@@ -326,114 +348,198 @@ def create_app(config: Config | None = None) -> FastAPI:
             samesite="strict",
             path="/",
         )
-        return csrf_token
+
+    def current_activity(connection: sqlite3.Connection) -> sqlite3.Row:
+        activity = connection.execute(
+            """
+            SELECT a.* FROM activities a
+            JOIN settings s ON s.current_activity_id = a.id
+            WHERE s.id = 1
+            """
+        ).fetchone()
+        if not activity:
+            raise RuntimeError("当前活动不存在")
+        return activity
 
     def ensure_closed(connection: sqlite3.Connection) -> None:
-        status = connection.execute("SELECT status FROM settings WHERE id = 1").fetchone()[
-            "status"
-        ]
+        status = current_activity(connection)["status"]
         if status != "closed":
             raise HTTPException(status_code=409, detail="请先关闭抢选再修改结构或配额")
 
+    def require_expected_activity(
+        request: Request, connection: sqlite3.Connection
+    ) -> sqlite3.Row:
+        supplied = request.headers.get("X-Activity-ID", "").strip()
+        if not supplied:
+            raise HTTPException(status_code=428, detail="缺少活动版本，请刷新页面后重试")
+        try:
+            expected_id = int(supplied)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="活动版本格式不正确") from exc
+        activity = current_activity(connection)
+        if int(activity["id"]) != expected_id:
+            raise HTTPException(status_code=409, detail="当前活动已经变化，请刷新页面后重试")
+        return activity
+
     def setting_dict(connection: sqlite3.Connection) -> dict[str, Any]:
-        row = connection.execute("SELECT * FROM settings WHERE id = 1").fetchone()
+        row = connection.execute(
+            """
+            SELECT s.*, a.id AS activity_id, a.code AS activity_code,
+                   a.title AS current_activity_title, a.status AS activity_status,
+                   a.created_at AS activity_created_at
+            FROM settings s JOIN activities a ON a.id = s.current_activity_id
+            WHERE s.id = 1
+            """
+        ).fetchone()
         return {
-            "activity_title": row["activity_title"],
+            "activity_id": row["activity_id"],
+            "activity_code": row["activity_code"],
+            "activity_title": row["current_activity_title"],
+            "activity_created_at": row["activity_created_at"],
             "organization_name": row["organization_name"],
             "owner_name": row["owner_name"],
-            "status": row["status"],
+            "status": row["activity_status"],
             "public_base_url": row["public_base_url"],
             "updated_at": row["updated_at"],
+        }
+
+    def activity_list(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+        settings = connection.execute(
+            "SELECT current_activity_id FROM settings WHERE id = 1"
+        ).fetchone()
+        current_id = int(settings["current_activity_id"])
+        result: list[dict[str, Any]] = []
+        for row in connection.execute(
+            """
+            SELECT id, code, title, status, created_at, opened_at, closed_at,
+                   archived_at, summary_json, snapshot_sha256
+            FROM activities ORDER BY id DESC
+            """
+        ).fetchall():
+            summary = json.loads(row["summary_json"]) if row["summary_json"] else None
+            if row["id"] == current_id:
+                totals = connection.execute(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM students WHERE active = 1) AS students,
+                        (SELECT COUNT(*) FROM selections se JOIN students s ON s.id = se.student_id
+                         WHERE se.revoked_at IS NULL AND s.active = 1) AS selected
+                    """
+                ).fetchone()
+                summary = {
+                    "students": int(totals["students"]),
+                    "selected": int(totals["selected"]),
+                    "unselected": int(totals["students"] - totals["selected"]),
+                }
+            result.append(
+                {
+                    "id": row["id"],
+                    "code": row["code"],
+                    "title": row["title"],
+                    "status": row["status"],
+                    "current": row["id"] == current_id,
+                    "created_at": row["created_at"],
+                    "opened_at": row["opened_at"],
+                    "closed_at": row["closed_at"],
+                    "archived_at": row["archived_at"],
+                    "summary": summary,
+                    "snapshot_sha256": row["snapshot_sha256"],
+                }
+            )
+        return result
+
+    def student_payload_from_connection(
+        connection: sqlite3.Connection, student_id: int
+    ) -> dict[str, Any]:
+        student = connection.execute(
+            """
+            SELECT s.id, s.student_no, s.name, s.active, s.major_id,
+                   m.name AS major_name, m.active AS major_active
+            FROM students s JOIN majors m ON m.id = s.major_id
+            WHERE s.id = ?
+            """,
+            (student_id,),
+        ).fetchone()
+        if not student or not student["active"]:
+            raise HTTPException(status_code=403, detail="学生账号已停用")
+        selection = connection.execute(
+            """
+            SELECT se.group_id, se.selected_at, g.name AS group_name
+            FROM selections se
+            JOIN teaching_groups g ON g.id = se.group_id
+            WHERE se.student_id = ? AND se.revoked_at IS NULL
+            """,
+            (student_id,),
+        ).fetchone()
+        groups = connection.execute(
+            """
+            SELECT g.id, g.name, g.total_capacity,
+                   q.capacity,
+                   (SELECT COUNT(*) FROM selections sx
+                    JOIN students stx ON stx.id = sx.student_id
+                    WHERE sx.group_id = g.id AND stx.major_id = ?
+                      AND sx.revoked_at IS NULL) AS major_selected,
+                   (SELECT COUNT(*) FROM selections sx
+                    WHERE sx.group_id = g.id AND sx.revoked_at IS NULL) AS total_selected
+            FROM teaching_groups g
+            JOIN quotas q ON q.group_id = g.id AND q.major_id = ?
+            WHERE g.active = 1
+            ORDER BY g.sort_order, g.id
+            """,
+            (student["major_id"], student["major_id"]),
+        ).fetchall()
+        settings = setting_dict(connection)
+        return {
+            "student": {
+                "id": student["id"],
+                "student_no": student["student_no"],
+                "name": student["name"],
+                "major_id": student["major_id"],
+                "major_name": student["major_name"],
+            },
+            "selection": dict(selection) if selection else None,
+            "groups": [
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "capacity": row["capacity"],
+                    "selected": row["major_selected"],
+                    "remaining": max(
+                        0,
+                        min(
+                            row["capacity"] - row["major_selected"],
+                            row["total_capacity"] - row["total_selected"],
+                        ),
+                    ),
+                    "full": row["major_selected"] >= row["capacity"]
+                    or row["total_selected"] >= row["total_capacity"],
+                }
+                for row in groups
+            ],
+            "settings": settings,
         }
 
     def current_student_payload(student_id: int) -> dict[str, Any]:
         connection = connect(config.database_path)
         try:
-            student = connection.execute(
-                """
-                SELECT s.id, s.student_no, s.name, s.active, s.major_id,
-                       m.name AS major_name, m.active AS major_active
-                FROM students s JOIN majors m ON m.id = s.major_id
-                WHERE s.id = ?
-                """,
-                (student_id,),
-            ).fetchone()
-            if not student or not student["active"]:
-                raise HTTPException(status_code=403, detail="学生账号已停用")
-            selection = connection.execute(
-                """
-                SELECT se.group_id, se.selected_at, g.name AS group_name
-                FROM selections se
-                JOIN teaching_groups g ON g.id = se.group_id
-                WHERE se.student_id = ? AND se.revoked_at IS NULL
-                """,
-                (student_id,),
-            ).fetchone()
-            groups = connection.execute(
-                """
-                SELECT g.id, g.name, g.total_capacity,
-                       q.capacity,
-                       (SELECT COUNT(*) FROM selections sx
-                        JOIN students stx ON stx.id = sx.student_id
-                        WHERE sx.group_id = g.id AND stx.major_id = ?
-                          AND sx.revoked_at IS NULL) AS major_selected,
-                       (SELECT COUNT(*) FROM selections sx
-                        WHERE sx.group_id = g.id AND sx.revoked_at IS NULL) AS total_selected
-                FROM teaching_groups g
-                JOIN quotas q ON q.group_id = g.id AND q.major_id = ?
-                WHERE g.active = 1
-                ORDER BY g.sort_order, g.id
-                """,
-                (student["major_id"], student["major_id"]),
-            ).fetchall()
-            settings = setting_dict(connection)
-            return {
-                "student": {
-                    "id": student["id"],
-                    "student_no": student["student_no"],
-                    "name": student["name"],
-                    "major_id": student["major_id"],
-                    "major_name": student["major_name"],
-                },
-                "selection": dict(selection) if selection else None,
-                "groups": [
-                    {
-                        "id": row["id"],
-                        "name": row["name"],
-                        "capacity": row["capacity"],
-                        "selected": row["major_selected"],
-                        "remaining": max(
-                            0,
-                            min(
-                                row["capacity"] - row["major_selected"],
-                                row["total_capacity"] - row["total_selected"],
-                            ),
-                        ),
-                        "full": row["major_selected"] >= row["capacity"]
-                        or row["total_selected"] >= row["total_capacity"],
-                    }
-                    for row in groups
-                ],
-                "settings": settings,
-            }
+            return student_payload_from_connection(connection, student_id)
         finally:
             connection.close()
 
     def choose_group(
         *,
+        request: Request,
         student_id: int,
         group_id: int,
         source: Literal["student", "admin"],
         operator: str,
         require_open: bool,
-    ) -> None:
+    ) -> dict[str, Any]:
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            settings = connection.execute(
-                "SELECT status FROM settings WHERE id = 1"
-            ).fetchone()
-            if require_open and settings["status"] != "open":
+            activity = require_expected_activity(request, connection)
+            if require_open and activity["status"] != "open":
                 raise HTTPException(status_code=409, detail="抢选尚未开放或已经结束")
             student = connection.execute(
                 """
@@ -498,7 +604,9 @@ def create_app(config: Config | None = None) -> FastAPI:
                 entity_id=selection.lastrowid,
                 details={"student_id": student_id, "group_id": group_id},
             )
+            payload = student_payload_from_connection(connection, student_id)
             connection.commit()
+            return payload
         except Exception:
             connection.rollback()
             raise
@@ -509,7 +617,21 @@ def create_app(config: Config | None = None) -> FastAPI:
     def health() -> dict[str, str]:
         connection = connect(config.database_path)
         try:
-            connection.execute("SELECT 1").fetchone()
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            tables = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if version != SCHEMA_VERSION or not {
+                "settings",
+                "activities",
+                "students",
+                "selections",
+            } <= tables:
+                raise RuntimeError("数据库结构未就绪")
+            current_activity(connection)
         finally:
             connection.close()
         return {"status": "ok"}
@@ -534,7 +656,11 @@ def create_app(config: Config | None = None) -> FastAPI:
         key = client_key(request, "student-login")
         limiter.check(key, limit=20, window_seconds=300)
         connection = connect(config.database_path)
+        token = new_session_token()
+        csrf_token = new_csrf_token()
+        now_dt = datetime.now(UTC)
         try:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
                 SELECT id, name, activation_hash, active
@@ -553,11 +679,24 @@ def create_app(config: Config | None = None) -> FastAPI:
             if not valid:
                 raise HTTPException(status_code=401, detail="学号、姓名或激活码不正确")
             student_id = int(row["id"])
+            student_data = student_payload_from_connection(connection, student_id)
+            persist_session(
+                connection,
+                role="student",
+                subject_id=student_id,
+                token=token,
+                csrf_token=csrf_token,
+                now_dt=now_dt,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
         limiter.clear(key)
-        csrf_token = create_session(response, role="student", subject_id=student_id)
-        return {"csrf_token": csrf_token, **current_student_payload(student_id)}
+        set_session_cookie(response, "student", token)
+        return {"csrf_token": csrf_token, **student_data}
 
     @app.get("/api/student/me")
     def student_me(request: Request):
@@ -567,14 +706,15 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/api/student/select")
     def student_select(payload: StudentSelect, request: Request):
         identity = require_session(request, "student", csrf=True)
-        choose_group(
+        result = choose_group(
+            request=request,
             student_id=identity.subject_id,
             group_id=payload.group_id,
             source="student",
             operator=str(identity.subject_id),
             require_open=True,
         )
-        return {"ok": True, **current_student_payload(identity.subject_id)}
+        return {"ok": True, **result}
 
     @app.post("/api/student/logout")
     def student_logout(request: Request, response: Response):
@@ -591,20 +731,50 @@ def create_app(config: Config | None = None) -> FastAPI:
     def admin_login(payload: AdminLogin, request: Request, response: Response):
         key = client_key(request, "admin-login")
         limiter.check(key, limit=10, window_seconds=300)
+        username = payload.username.strip()
+        read_connection = connect(config.database_path)
+        try:
+            candidate = read_connection.execute(
+                "SELECT id, password_hash FROM admin_users WHERE username = ?",
+                (username,),
+            ).fetchone()
+        finally:
+            read_connection.close()
+        if not candidate or not verify_password(payload.password, candidate["password_hash"]):
+            raise HTTPException(status_code=401, detail="管理员账号或密码不正确")
+
+        token = new_session_token()
+        csrf_token = new_csrf_token()
+        now_dt = datetime.now(UTC)
         connection = connect(config.database_path)
         try:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT id, password_hash FROM admin_users WHERE username = ?",
-                (payload.username.strip(),),
+                (username,),
             ).fetchone()
-            if not row or not verify_password(payload.password, row["password_hash"]):
+            if not row or not secrets.compare_digest(
+                str(row["password_hash"]), str(candidate["password_hash"])
+            ):
                 raise HTTPException(status_code=401, detail="管理员账号或密码不正确")
             admin_id = int(row["id"])
+            persist_session(
+                connection,
+                role="admin",
+                subject_id=admin_id,
+                token=token,
+                csrf_token=csrf_token,
+                now_dt=now_dt,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
         limiter.clear(key)
-        csrf_token = create_session(response, role="admin", subject_id=admin_id)
-        return {"csrf_token": csrf_token, "username": payload.username.strip()}
+        set_session_cookie(response, "admin", token)
+        return {"csrf_token": csrf_token, "username": username}
 
     @app.get("/api/admin/me")
     def admin_me(request: Request):
@@ -634,6 +804,20 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/api/admin/password")
     def change_admin_password(payload: PasswordChange, request: Request):
         identity = require_session(request, "admin", csrf=True)
+        read_connection = connect(config.database_path)
+        try:
+            candidate = read_connection.execute(
+                "SELECT username, password_hash FROM admin_users WHERE id = ?",
+                (identity.subject_id,),
+            ).fetchone()
+        finally:
+            read_connection.close()
+        if not candidate or not verify_password(
+            payload.current_password, candidate["password_hash"]
+        ):
+            raise HTTPException(status_code=401, detail="当前密码不正确")
+        replacement_hash = hash_password(payload.new_password)
+
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -641,11 +825,13 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "SELECT username, password_hash FROM admin_users WHERE id = ?",
                 (identity.subject_id,),
             ).fetchone()
-            if not row or not verify_password(payload.current_password, row["password_hash"]):
-                raise HTTPException(status_code=401, detail="当前密码不正确")
+            if not row or not secrets.compare_digest(
+                str(row["password_hash"]), str(candidate["password_hash"])
+            ):
+                raise HTTPException(status_code=409, detail="密码已变化，请重新登录后重试")
             connection.execute(
                 "UPDATE admin_users SET password_hash = ?, updated_at = ? WHERE id = ?",
-                (hash_password(payload.new_password), utc_now(), identity.subject_id),
+                (replacement_hash, utc_now(), identity.subject_id),
             )
             connection.execute(
                 "DELETE FROM sessions WHERE role = 'admin' AND token_hash <> ?",
@@ -745,6 +931,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "quotas": [dict(row) for row in quotas],
                 "unselected_students": [dict(row) for row in unselected],
                 "recent_selections": [dict(row) for row in recent],
+                "activities": activity_list(connection),
             }
         finally:
             connection.close()
@@ -758,12 +945,28 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
+            require_expected_activity(request, connection)
             before = setting_dict(connection)
-            assignments = ", ".join(f"{column} = ?" for column in values)
-            connection.execute(
-                f"UPDATE settings SET {assignments}, updated_at = ? WHERE id = 1",
-                (*values.values(), utc_now()),
-            )
+            title = values.pop("activity_title", None)
+            if title is not None:
+                connection.execute(
+                    "UPDATE activities SET title = ? WHERE id = ?",
+                    (title, before["activity_id"]),
+                )
+                connection.execute(
+                    "UPDATE settings SET activity_title = ? WHERE id = 1",
+                    (title,),
+                )
+            if values:
+                assignments = ", ".join(f"{column} = ?" for column in values)
+                connection.execute(
+                    f"UPDATE settings SET {assignments}, updated_at = ? WHERE id = 1",
+                    (*values.values(), utc_now()),
+                )
+            else:
+                connection.execute(
+                    "UPDATE settings SET updated_at = ? WHERE id = 1", (utc_now(),)
+                )
             audit(
                 connection,
                 actor_type="admin",
@@ -771,7 +974,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 action="settings.update",
                 entity_type="settings",
                 entity_id=1,
-                details={"before": before, "changed": values},
+                details={"before": before, "changed": payload.model_dump(exclude_none=True)},
             )
             connection.commit()
             return setting_dict(connection)
@@ -787,9 +990,17 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            old = connection.execute("SELECT status FROM settings WHERE id = 1").fetchone()[
-                "status"
-            ]
+            activity = require_expected_activity(request, connection)
+            old = activity["status"]
+            connection.execute(
+                """
+                UPDATE activities SET status = ?,
+                    opened_at = CASE WHEN ? = 'open' THEN COALESCE(opened_at, ?) ELSE opened_at END,
+                    closed_at = CASE WHEN ? = 'closed' THEN ? ELSE closed_at END
+                WHERE id = ?
+                """,
+                (payload.status, payload.status, utc_now(), payload.status, utc_now(), activity["id"]),
+            )
             connection.execute(
                 "UPDATE settings SET status = ?, updated_at = ? WHERE id = 1",
                 (payload.status, utc_now()),
@@ -811,12 +1022,189 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.close()
         return {"status": payload.status}
 
+    @app.get("/api/admin/activities")
+    def list_activities(request: Request):
+        require_session(request, "admin")
+        connection = connect(config.database_path)
+        try:
+            return activity_list(connection)
+        finally:
+            connection.close()
+
+    @app.post("/api/admin/activities")
+    def create_activity(payload: ActivityCreate, request: Request):
+        identity = require_session(request, "admin", csrf=True)
+        connection = connect(config.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = current_activity(connection)
+            require_expected_activity(request, connection)
+            if int(previous["id"]) != payload.previous_activity_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="当前活动已经变化，请刷新管理端后重试",
+                )
+            if previous["status"] == "open":
+                raise HTTPException(status_code=409, detail="请先关闭当前抢选再新建活动")
+
+            snapshot, snapshot_hash = activity_snapshot(connection, int(previous["id"]))
+            snapshot_json = json.dumps(
+                snapshot,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            totals = {
+                "students": len(snapshot["students"]),
+                "selected": sum(1 for row in snapshot["selections"] if row["revoked_at"] is None),
+            }
+            totals["unselected"] = totals["students"] - totals["selected"]
+            now = utc_now()
+            connection.execute(
+                """
+                UPDATE activities
+                SET status = 'archived', archived_at = ?, summary_json = ?,
+                    snapshot_json = ?, snapshot_sha256 = ?
+                WHERE id = ?
+                """,
+                (
+                    now,
+                    json.dumps(totals, ensure_ascii=False, separators=(",", ":")),
+                    snapshot_json,
+                    snapshot_hash,
+                    previous["id"],
+                ),
+            )
+
+            code = payload.code or (
+                f"activity-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(2)}"
+            )
+            cursor = connection.execute(
+                """
+                INSERT INTO activities (code, title, status, created_at, closed_at)
+                VALUES (?, ?, 'closed', ?, ?)
+                """,
+                (code, payload.title, now, now),
+            )
+            activity_id = int(cursor.lastrowid)
+
+            previous_majors = connection.execute(
+                "SELECT * FROM majors ORDER BY sort_order, id"
+            ).fetchall()
+            previous_groups = connection.execute(
+                "SELECT * FROM teaching_groups ORDER BY sort_order, id"
+            ).fetchall()
+            previous_quotas = connection.execute("SELECT * FROM quotas").fetchall()
+
+            connection.execute("DELETE FROM sessions WHERE role = 'student'")
+            connection.execute("DELETE FROM selections")
+            connection.execute("DELETE FROM students")
+            connection.execute("DELETE FROM quotas")
+            connection.execute("DELETE FROM teaching_groups")
+            connection.execute("DELETE FROM majors")
+
+            if payload.copy_structure:
+                major_ids: dict[int, int] = {}
+                for row in previous_majors:
+                    created = connection.execute(
+                        """
+                        INSERT INTO majors (code, name, active, sort_order, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (row["code"], row["name"], row["active"], row["sort_order"], now, now),
+                    )
+                    major_ids[int(row["id"])] = int(created.lastrowid)
+                group_ids: dict[int, int] = {}
+                for row in previous_groups:
+                    created = connection.execute(
+                        """
+                        INSERT INTO teaching_groups
+                            (code, name, total_capacity, active, sort_order, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["code"], row["name"], row["total_capacity"], row["active"],
+                            row["sort_order"], now, now,
+                        ),
+                    )
+                    group_ids[int(row["id"])] = int(created.lastrowid)
+                for row in previous_quotas:
+                    connection.execute(
+                        """
+                        INSERT INTO quotas (major_id, group_id, capacity, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            major_ids[int(row["major_id"])],
+                            group_ids[int(row["group_id"])],
+                            row["capacity"],
+                            now,
+                        ),
+                    )
+
+            connection.execute(
+                """
+                UPDATE settings SET current_activity_id = ?, activity_title = ?,
+                    status = 'closed', updated_at = ? WHERE id = 1
+                """,
+                (activity_id, payload.title, now),
+            )
+            audit(
+                connection,
+                actor_type="admin",
+                actor_id=identity.subject_id,
+                action="activity.create",
+                entity_type="activity",
+                entity_id=activity_id,
+                details={
+                    "code": code,
+                    "title": payload.title,
+                    "copy_structure": payload.copy_structure,
+                    "archived_activity_id": previous["id"],
+                    "archived_snapshot_sha256": snapshot_hash,
+                },
+                activity_id=activity_id,
+            )
+            connection.commit()
+            return setting_dict(connection)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @app.get("/api/admin/activities/{activity_id}/archive.json")
+    def export_activity_archive(activity_id: int, request: Request):
+        require_session(request, "admin")
+        connection = connect(config.database_path)
+        try:
+            row = connection.execute(
+                "SELECT code, status, snapshot_json, snapshot_sha256 FROM activities WHERE id = ?",
+                (activity_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="活动不存在")
+            if row["status"] != "archived" or not row["snapshot_json"]:
+                raise HTTPException(status_code=409, detail="当前活动尚未归档")
+            return Response(
+                content=row["snapshot_json"].encode("utf-8"),
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{row["code"]}-archive.json"',
+                    "X-Archive-SHA256": row["snapshot_sha256"],
+                    "Cache-Control": "no-store",
+                },
+            )
+        finally:
+            connection.close()
+
     @app.post("/api/admin/majors")
     def create_major(payload: MajorCreate, request: Request):
         identity = require_session(request, "admin", csrf=True)
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
+            require_expected_activity(request, connection)
             ensure_closed(connection)
             max_sort = connection.execute(
                 "SELECT COALESCE(MAX(sort_order), 0) AS value FROM majors"
@@ -865,6 +1253,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
+            require_expected_activity(request, connection)
             ensure_closed(connection)
             before = connection.execute("SELECT * FROM majors WHERE id = ?", (major_id,)).fetchone()
             if not before:
@@ -897,6 +1286,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
+            require_expected_activity(request, connection)
             ensure_closed(connection)
             row = connection.execute("SELECT name FROM majors WHERE id = ?", (major_id,)).fetchone()
             if not row:
@@ -930,6 +1320,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
+            require_expected_activity(request, connection)
             ensure_closed(connection)
             max_sort = connection.execute(
                 "SELECT COALESCE(MAX(sort_order), 0) AS value FROM teaching_groups"
@@ -986,6 +1377,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
+            require_expected_activity(request, connection)
             ensure_closed(connection)
             before = connection.execute(
                 "SELECT * FROM teaching_groups WHERE id = ?", (group_id,)
@@ -1035,6 +1427,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
+            require_expected_activity(request, connection)
             ensure_closed(connection)
             row = connection.execute(
                 "SELECT name FROM teaching_groups WHERE id = ?", (group_id,)
@@ -1070,6 +1463,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
+            require_expected_activity(request, connection)
             ensure_closed(connection)
             current = connection.execute(
                 "SELECT capacity FROM quotas WHERE major_id = ? AND group_id = ?",
@@ -1168,6 +1562,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         updated = 0
         try:
             connection.execute("BEGIN IMMEDIATE")
+            require_expected_activity(request, connection)
             ensure_closed(connection)
             major_map = {
                 row["name"]: int(row["id"])
@@ -1278,6 +1673,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     def admin_assign(payload: AdminAssign, request: Request):
         identity = require_session(request, "admin", csrf=True)
         choose_group(
+            request=request,
             student_id=payload.student_id,
             group_id=payload.group_id,
             source="admin",
@@ -1292,6 +1688,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
+            require_expected_activity(request, connection)
             selection = connection.execute(
                 """
                 SELECT id, group_id FROM selections
@@ -1396,7 +1793,9 @@ def create_app(config: Config | None = None) -> FastAPI:
                 """
                 SELECT id, occurred_at, actor_type, actor_id, action,
                        entity_type, entity_id, details_json
-                FROM audit_logs ORDER BY id DESC LIMIT ?
+                FROM audit_logs
+                WHERE activity_id = (SELECT current_activity_id FROM settings WHERE id = 1)
+                ORDER BY id DESC LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
