@@ -110,6 +110,7 @@ def check_database(database_path: Path) -> str:
         raise RuntimeError(f"数据库不存在或为空：{database_path}")
     connection = sqlite3.connect(str(database_path), timeout=15)
     try:
+        connection.execute("BEGIN")
         required = {
             "settings",
             "activities",
@@ -145,6 +146,9 @@ def check_database(database_path: Path) -> str:
         required_triggers = {
             "selection_capacity_guard",
             "selection_capacity_guard_update",
+            "quota_group_capacity_guard_insert",
+            "quota_group_capacity_guard_update",
+            "group_total_capacity_guard_update",
             "sync_activity_title_to_settings",
             "sync_activity_status_to_settings",
             "sync_settings_title_to_activity",
@@ -165,17 +169,23 @@ def check_database(database_path: Path) -> str:
             raise RuntimeError("系统设置指向的当前活动不正确")
         for row in connection.execute(
             """
-            SELECT id, summary_json, snapshot_json, snapshot_sha256
+            SELECT id, code, title, created_at, opened_at, closed_at, archived_at,
+                   summary_json, snapshot_json, snapshot_sha256
             FROM activities WHERE status = 'archived'
             """
         ).fetchall():
-            if not row[1] or not row[2] or not row[3]:
+            if not row[6] or not row[7] or not row[8] or not row[9]:
                 raise RuntimeError(f"归档活动 {row[0]} 缺少快照或校验值")
             try:
-                summary = json.loads(row[1])
-                snapshot = json.loads(row[2])
-            except json.JSONDecodeError as exc:
+                archived_at = datetime.fromisoformat(str(row[6]))
+                summary = json.loads(row[7])
+                snapshot = json.loads(row[8])
+            except (json.JSONDecodeError, ValueError) as exc:
                 raise RuntimeError(f"归档活动 {row[0]} JSON 无法解析") from exc
+            if not isinstance(summary, dict) or not isinstance(snapshot, dict):
+                raise RuntimeError(f"归档活动 {row[0]} JSON 结构不正确")
+            if archived_at.utcoffset() is None or snapshot.get("archived_at") != row[6]:
+                raise RuntimeError(f"归档活动 {row[0]} 归档时间不正确")
             if not {"students", "selected", "unselected"} <= summary.keys():
                 raise RuntimeError(f"归档活动 {row[0]} 汇总字段不完整")
             required_snapshot_keys = {
@@ -189,8 +199,41 @@ def check_database(database_path: Path) -> str:
             }
             if not required_snapshot_keys <= snapshot.keys():
                 raise RuntimeError(f"归档活动 {row[0]} 快照字段不完整")
-            digest = hashlib.sha256(str(row[2]).encode("utf-8")).hexdigest()
-            if not hmac.compare_digest(digest, str(row[3])):
+            archived_activity = snapshot.get("activity")
+            expected_activity = {
+                "id": row[0],
+                "code": row[1],
+                "title": row[2],
+                "created_at": row[3],
+                "opened_at": row[4],
+                "closed_at": row[5],
+            }
+            if not isinstance(archived_activity, dict) or any(
+                archived_activity.get(key) != value
+                for key, value in expected_activity.items()
+            ):
+                raise RuntimeError(f"归档活动 {row[0]} 快照归属不正确")
+            active_student_ids = {
+                int(student["id"])
+                for student in snapshot["students"]
+                if student.get("active")
+            }
+            expected_summary = {
+                "students": len(active_student_ids),
+                "selected": sum(
+                    1
+                    for selection in snapshot["selections"]
+                    if selection.get("revoked_at") is None
+                    and int(selection["student_id"]) in active_student_ids
+                ),
+            }
+            expected_summary["unselected"] = (
+                expected_summary["students"] - expected_summary["selected"]
+            )
+            if summary != expected_summary:
+                raise RuntimeError(f"归档活动 {row[0]} 汇总与快照不一致")
+            digest = hashlib.sha256(str(row[8]).encode("utf-8")).hexdigest()
+            if not hmac.compare_digest(digest, str(row[9])):
                 raise RuntimeError(f"归档活动 {row[0]} SHA-256 校验失败")
         total_overages = connection.execute(
             """
@@ -210,6 +253,16 @@ def check_database(database_path: Path) -> str:
         ).fetchall()
         if total_overages or major_overages:
             raise RuntimeError("数据库存在超过当前容量的有效选择")
+        invalid_quota_totals = connection.execute(
+            """
+            SELECT g.id FROM teaching_groups g
+            LEFT JOIN quotas q ON q.group_id = g.id
+            GROUP BY g.id, g.total_capacity
+            HAVING COALESCE(SUM(q.capacity), 0) > g.total_capacity
+            """
+        ).fetchall()
+        if invalid_quota_totals:
+            raise RuntimeError("数据库存在配额合计超过教学组总容量的配置")
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
         if foreign_key_errors:
             raise RuntimeError(f"数据库外键检查失败：{foreign_key_errors[:3]}")

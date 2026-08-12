@@ -61,6 +61,9 @@ uvicorn server.main:create_app --factory --host 127.0.0.1 --port 8765
 python -m pytest --basetemp "$env:LOCALAPPDATA\Codex\teaching-choice-tests\manual-run"
 ```
 
+批量验收可使用 [180 人虚构学生名单](examples/fictional-students-180.csv)；数据边界见
+[示例数据说明](examples/README.md)。该名单不含激活码，导入后由系统随机生成并一次性展示给管理员下载。
+
 独立虚拟机部署见 [docs/deployment.md](docs/deployment.md)。
 并发、Redis 取舍和多活动归档设计见 [docs/architecture.md](docs/architecture.md)。
 
