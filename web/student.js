@@ -30,6 +30,55 @@ const studentEls = {
   footerOwner: document.querySelector("#student-footer-owner"),
 };
 
+const studentFieldLabels = {
+  student_no: "学号",
+  name: "姓名",
+  activation_code: "个人激活码",
+};
+
+function validationField(issue) {
+  const locations = Array.isArray(issue?.loc) ? issue.loc : [];
+  for (let index = locations.length - 1; index >= 0; index -= 1) {
+    if (studentFieldLabels[locations[index]]) return locations[index];
+  }
+  return null;
+}
+
+function translateValidationIssue(issue) {
+  const field = validationField(issue);
+  const label = studentFieldLabels[field] || "提交内容";
+  const type = String(issue?.type || "");
+  if (type === "missing") return `请填写${label}`;
+  if (type === "string_too_short") {
+    const minimum = Number(issue?.ctx?.min_length);
+    return Number.isFinite(minimum) ? `${label}至少需要 ${minimum} 个字符` : `${label}长度太短`;
+  }
+  if (type === "string_too_long") {
+    const maximum = Number(issue?.ctx?.max_length);
+    return Number.isFinite(maximum) ? `${label}不能超过 ${maximum} 个字符` : `${label}长度超过限制`;
+  }
+  if (["string_type", "int_type", "int_parsing"].includes(type)) return `${label}格式不正确`;
+  if (type === "extra_forbidden") return "提交内容包含无效字段，请刷新页面后重试";
+  if (type === "json_invalid") return "提交内容无法识别，请刷新页面后重试";
+  if (type.startsWith("value_error")) return `${label}内容不符合要求`;
+  return `${label}填写不正确`;
+}
+
+function apiErrorDetails(data, status) {
+  const detail = data?.detail;
+  if (status === 422 && Array.isArray(detail)) {
+    const messages = [...new Set(detail.map(translateValidationIssue))];
+    return {
+      message: messages.join("；") || "请检查填写内容",
+      field: detail.map(validationField).find(Boolean) || null,
+    };
+  }
+  return {
+    message: typeof detail === "string" ? detail : `请求失败（${status}）`,
+    field: null,
+  };
+}
+
 async function studentApi(path, options = {}) {
   const headers = new Headers(options.headers || {});
   if (options.body && !(options.body instanceof FormData)) {
@@ -49,8 +98,10 @@ async function studentApi(path, options = {}) {
   const type = response.headers.get("content-type") || "";
   const data = type.includes("application/json") ? await response.json() : null;
   if (!response.ok) {
-    const error = new Error(data?.detail || `请求失败（${response.status}）`);
+    const details = apiErrorDetails(data, response.status);
+    const error = new Error(details.message);
     error.status = response.status;
+    error.field = details.field;
     throw error;
   }
   return data;
@@ -206,10 +257,22 @@ studentEls.loginForm.addEventListener("submit", async (event) => {
     showStudentMessage("身份核验成功", "success");
   } catch (error) {
     showStudentMessage(error.message, "error");
+    if (error.status === 422 && error.field) {
+      const field = studentEls.loginForm.elements.namedItem(error.field);
+      if (field instanceof HTMLElement) {
+        field.setAttribute("aria-invalid", "true");
+        field.focus();
+        if (typeof field.select === "function") field.select();
+      }
+    }
   } finally {
     submit.disabled = false;
     submit.innerHTML = "核验并进入 <span aria-hidden=\"true\">→</span>";
   }
+});
+
+studentEls.loginForm.addEventListener("input", (event) => {
+  if (event.target instanceof HTMLElement) event.target.removeAttribute("aria-invalid");
 });
 
 studentEls.submitChoice.addEventListener("click", () => {
