@@ -17,6 +17,8 @@ from server.config import Config
 from server.database import initialize_database
 from server.maintenance import check_database
 
+from .conftest import fictional_activation_code, fictional_document_number
+
 
 def import_students(
     client: TestClient,
@@ -26,6 +28,30 @@ def import_students(
     mode: str = "merge",
     regenerate_existing: bool = False,
 ):
+    source = io.StringIO(csv_text)
+    parsed_rows = list(csv.reader(source))
+    assert parsed_rows
+    header = parsed_rows[0]
+    lowered = [value.casefold() for value in header]
+    activation_index = next(
+        (index for index, value in enumerate(lowered) if value in {"activation_code", "激活码"}),
+        None,
+    )
+    if activation_index is not None:
+        header[activation_index] = "document_number"
+        document_index = activation_index
+    else:
+        header.append("document_number")
+        document_index = len(header) - 1
+    student_index = next(
+        index for index, value in enumerate(lowered) if value in {"student_no", "学号"}
+    )
+    for row in parsed_rows[1:]:
+        while len(row) <= document_index:
+            row.append("")
+        row[document_index] = fictional_document_number(row[student_index])
+    rendered = io.StringIO()
+    csv.writer(rendered, lineterminator="\n").writerows(parsed_rows)
     return client.post(
         "/api/admin/students/import",
         headers=headers,
@@ -33,14 +59,18 @@ def import_students(
             "mode": mode,
             "regenerate_existing": str(regenerate_existing).lower(),
         },
-        files={"file": ("students.csv", csv_text.encode("utf-8"), "text/csv")},
+        files={"file": ("students.csv", rendered.getvalue().encode("utf-8"), "text/csv")},
     )
 
 
 def login_student(client: TestClient, *, student_no: str, name: str, code: str):
     return client.post(
         "/api/student/login",
-        json={"student_no": student_no, "name": name, "activation_code": code},
+        json={
+            "student_no": student_no,
+            "name": name,
+            "activation_code": fictional_activation_code(student_no),
+        },
     )
 
 
@@ -86,7 +116,7 @@ def test_sixty_students_behind_one_ip_can_all_log_in(
     assert not failures
 
 
-def test_activation_code_rotation_invalidates_old_session_and_old_code(
+def test_random_activation_code_reset_is_rejected_without_revoking_session(
     app, client: TestClient, admin_headers: dict[str, str]
 ):
     dashboard = client.get("/api/admin/dashboard").json()
@@ -114,48 +144,17 @@ def test_activation_code_rotation_invalidates_old_session_and_old_code(
             f"/api/admin/students/{student_id}/activation-code",
             headers=admin_headers,
         )
-        assert reset.status_code == 200, reset.text
-        assert reset.json().keys() == {"credential"}
-        credential = reset.json()["credential"]
-        assert credential.keys() == {"student_no", "name", "major", "activation_code"}
-        assert credential["student_no"] == "20320001"
-        assert credential["name"] == "轮换学生"
-        assert credential["major"] == major_name
-        assert credential["activation_code"] != "OLD20001"
-
-        assert student.get("/api/student/me").status_code == 401
-        old_code_client = TestClient(app)
-        try:
-            old_code_login = login_student(
-                old_code_client,
-                student_no="20320001",
-                name="轮换学生",
-                code="OLD20001",
-            )
-            assert old_code_login.status_code == 401
-        finally:
-            old_code_client.close()
-
-        replacement = TestClient(app)
-        try:
-            new_code_login = login_student(
-                replacement,
-                student_no="20320001",
-                name="轮换学生",
-                code=credential["activation_code"],
-            )
-            assert new_code_login.status_code == 200, new_code_login.text
-        finally:
-            replacement.close()
+        assert reset.status_code == 409, reset.text
+        assert "重新导入" in reset.json()["detail"]
+        assert student.get("/api/student/me").status_code == 200
     finally:
         student.close()
 
 
-def test_activation_rotation_linearizes_before_stale_selection(
+def test_forbidden_activation_reset_does_not_block_valid_selection(
     app,
     client: TestClient,
     admin_headers: dict[str, str],
-    monkeypatch,
 ):
     dashboard = client.get("/api/admin/dashboard").json()
     activity_id = int(dashboard["settings"]["activity_id"])
@@ -182,67 +181,27 @@ def test_activation_rotation_linearizes_before_stale_selection(
         )
         assert login.status_code == 200, login.text
         student_id = int(login.json()["student"]["id"])
-        csrf = login.json()["csrf_token"]
-        target_group = int(login.json()["groups"][0]["id"])
-
-        original_connect = main_module.connect
-        selection_waiting = threading.Event()
-        allow_selection = threading.Event()
-        pause_lock = threading.Lock()
-        paused_once = False
-
-        class ConnectionProxy:
-            def __init__(self, connection):
-                self._connection = connection
-
-            def execute(self, sql, parameters=()):
-                nonlocal paused_once
-                should_pause = False
-                if sql.strip().upper() == "BEGIN IMMEDIATE":
-                    with pause_lock:
-                        if not paused_once:
-                            paused_once = True
-                            should_pause = True
-                if should_pause:
-                    selection_waiting.set()
-                    assert allow_selection.wait(timeout=10)
-                return self._connection.execute(sql, parameters)
-
-            def __getattr__(self, name):
-                return getattr(self._connection, name)
-
-        monkeypatch.setattr(
-            main_module,
-            "connect",
-            lambda path: ConnectionProxy(original_connect(path)),
+        reset = client.post(
+            f"/api/admin/students/{student_id}/activation-code",
+            headers=admin_headers,
         )
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            stale_future = pool.submit(
-                student.post,
-                "/api/student/select",
-                headers={
-                    "X-CSRF-Token": csrf,
-                    "X-Activity-ID": str(activity_id),
-                },
-                json={"group_id": target_group},
-            )
-            assert selection_waiting.wait(timeout=10)
-            reset = client.post(
-                f"/api/admin/students/{student_id}/activation-code",
-                headers=admin_headers,
-            )
-            assert reset.status_code == 200, reset.text
-            allow_selection.set()
-            stale = stale_future.result(timeout=10)
-        assert stale.status_code == 401, stale.text
+        assert reset.status_code == 409, reset.text
+        selected = student.post(
+            "/api/student/select",
+            headers={
+                "X-CSRF-Token": login.json()["csrf_token"],
+                "X-Activity-ID": str(activity_id),
+            },
+            json={"group_id": int(login.json()["groups"][0]["id"])},
+        )
+        assert selected.status_code == 200, selected.text
         after = client.get("/api/admin/dashboard").json()
-        assert after["totals"]["selected"] == 0
+        assert after["totals"]["selected"] == 1
     finally:
         student.close()
 
 
-def test_regenerate_existing_import_invalidates_session_and_returns_new_credential(
+def test_legacy_regenerate_flag_cannot_randomize_existing_credential(
     app, client: TestClient, admin_headers: dict[str, str]
 ):
     dashboard = client.get("/api/admin/dashboard").json()
@@ -273,21 +232,10 @@ def test_regenerate_existing_import_invalidates_session_and_returns_new_credenti
             regenerate_existing=True,
         )
         assert rotated.status_code == 200, rotated.text
-        assert rotated.json()["updated"] == 1
-        assert len(rotated.json()["credentials"]) == 1
-        new_code = rotated.json()["credentials"][0]["activation_code"]
-        assert new_code and new_code != "OLD20002"
-        assert student.get("/api/student/me").status_code == 401
-        old_code_client = TestClient(app)
-        try:
-            assert login_student(
-                old_code_client,
-                student_no="20320002",
-                name="批量轮换",
-                code="OLD20002",
-            ).status_code == 401
-        finally:
-            old_code_client.close()
+        assert rotated.json()["rotated"] == 0
+        assert "credentials" not in rotated.json()
+        assert '"activation_code":' not in rotated.text
+        assert student.get("/api/student/me").status_code == 200
     finally:
         student.close()
 
@@ -544,19 +492,27 @@ def test_dashboard_remains_one_snapshot_while_activity_changes(
     assert after["groups"] == []
 
 
-def test_import_rejects_unusable_activation_code_atomically(
+def test_import_rejects_unrecognized_document_number_atomically(
     client: TestClient, admin_headers: dict[str, str]
 ):
     dashboard = client.get("/api/admin/dashboard").json()
     major_name = dashboard["majors"][0]["name"]
-    rejected = import_students(
-        client,
-        admin_headers,
-        "student_no,name,major,activation_code\n"
-        f"20360001,短码学生,{major_name},ABC\n",
+    rejected = client.post(
+        "/api/admin/students/import",
+        headers=admin_headers,
+        files={
+            "file": (
+                "students.csv",
+                (
+                    "student_no,name,major,document_number\n"
+                    f"20360001,无效证件学生,{major_name},ABC\n"
+                ).encode("utf-8"),
+                "text/csv",
+            )
+        },
     )
     assert rejected.status_code == 400
-    assert "8–64" in rejected.json()["detail"]
+    assert "证件号格式无法识别" in rejected.json()["detail"]
     assert client.get("/api/admin/dashboard").json()["students"] == []
 
 
@@ -845,7 +801,8 @@ def test_profile_change_invalidates_existing_student_session(
             f"student_no,name,major\n20400001,新姓名,{major_name}\n",
         )
         assert changed.status_code == 200, changed.text
-        assert changed.json()["credentials"] == []
+        assert "credentials" not in changed.json()
+        assert '"activation_code":' not in changed.text
         assert student.get("/api/student/me").status_code == 401
         assert login_student(
             student, student_no="20400001", name="新姓名", code="PROFILE1"

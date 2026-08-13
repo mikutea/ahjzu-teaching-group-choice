@@ -90,25 +90,18 @@
             <button id="board-exit-fullscreen" class="button board-exit-fullscreen" type="button">退出全屏</button>
           </header>
           <section class="board-panel board-panel--stats" aria-labelledby="stats-title">
-            <div class="panel-kicker">CURRENT STATUS</div>
-            <h2 id="stats-title">当前抢选进度</h2>
-            <div class="stat-pair">
-              <article class="metric-card metric-card--selected">
-                <span>已选</span><strong id="metric-selected">0</strong><small>人</small>
-              </article>
-              <article class="metric-card">
-                <span>未选</span><strong id="metric-unselected">0</strong><small>人</small>
-              </article>
-            </div>
-            <div class="overall-progress">
-              <div class="progress-label"><span>总体完成率</span><strong id="metric-rate">0%</strong></div>
-              <div class="progress-track"><span id="metric-rate-bar"></span></div>
-            </div>
+            <div class="panel-kicker">GROUP STATUS</div>
+            <h2 id="stats-title">各教学组进度</h2>
             <div class="board-subheading">
-              <h3>各教学组进度</h3>
+              <h3>名额使用情况</h3>
               <span id="group-progress-page" class="board-page-indicator" aria-live="polite"></span>
             </div>
             <div id="group-progress" class="group-progress"></div>
+            <div class="board-subheading board-subheading--feed">
+              <h3>实时选择流水</h3>
+              <span class="board-page-indicator">最新动态</span>
+            </div>
+            <div id="live-selection-feed" class="live-selection-feed" aria-live="polite"></div>
           </section>
 
           <section class="board-panel board-panel--qr" aria-labelledby="qr-title">
@@ -134,10 +127,24 @@
               <p id="board-stage-detail">学生扫码核验后将在手机端等待</p>
               <button id="board-start-countdown" class="button button--primary button--wide" type="button">开始 10 秒倒计时</button>
             </div>
-            <div class="qr-notice"><span class="status-dot"></span><strong id="board-status-text">候场数据实时更新</strong><small id="board-live-note">每秒自动同步，无需手动刷新</small></div>
+            <div class="qr-notice"><span class="status-dot"></span><strong id="board-status-text">候场数据实时更新</strong><small id="board-live-note">扫码入口持续开放，页面自动同步</small></div>
           </section>
 
           <section class="board-panel board-panel--unselected" aria-labelledby="unselected-title">
+            <div class="panel-kicker">LIVE METRICS</div>
+            <h2>当前抢选进度</h2>
+            <div class="stat-pair">
+              <article class="metric-card metric-card--selected">
+                <span>已选</span><strong id="metric-selected">0</strong><small>人</small>
+              </article>
+              <article class="metric-card">
+                <span>未选</span><strong id="metric-unselected">0</strong><small>人</small>
+              </article>
+            </div>
+            <div class="overall-progress">
+              <div class="progress-label"><span>总体完成率</span><strong id="metric-rate">0%</strong></div>
+              <div class="progress-track"><span id="metric-rate-bar"></span></div>
+            </div>
             <div class="stat-pair stat-pair--presence" aria-label="候场情况">
               <article class="metric-card metric-card--online">
                 <span>已进入候场</span><strong id="metric-online">0</strong><small>人</small>
@@ -153,7 +160,7 @@
               </div>
               <div class="board-list-meta">
                 <span id="unselected-count" class="count-chip">0 人</span>
-                <span id="unselected-page" class="board-page-indicator" aria-live="polite"></span>
+                <span id="unselected-page" class="board-page-indicator" aria-live="polite">实时更新</span>
               </div>
             </div>
             <label class="compact-search">
@@ -169,7 +176,10 @@
         <section class="content-card recent-card">
           <div class="content-card__heading">
             <div><p class="eyebrow">RECENT ACTIVITY</p><h2>最近选择记录</h2></div>
-            <a id="export-selections" class="button button--outline" href="/api/admin/export/selections.csv">导出全部结果</a>
+            <div class="content-card__actions">
+              <a id="export-selections" class="button button--outline" href="/api/admin/export/selections.csv">导出选择记录</a>
+              <a id="export-complete-results" class="button button--primary" href="/api/admin/export/results.csv">导出本场完整结果</a>
+            </div>
           </div>
           <div class="table-scroll">
             <table class="data-table">
@@ -220,13 +230,13 @@
         <div class="student-admin-grid">
           <section class="content-card import-card">
             <h3>导入学生名单</h3>
-            <p>CSV 默认只需 <code>学号,姓名,专业</code> 三列，新学生的个人激活码由系统自动生成。</p>
+            <p>支持批量选择 CSV / XLS / XLSX；表格包含学号、姓名、专业、证件号。个人激活码固定为证件号后 6 位，系统不会随机生成或批量重置。</p>
             <form id="student-import-form" class="upload-form">
               <label class="file-drop">
                 <span class="file-drop__icon">⇧</span>
-                <strong>选择 CSV 文件</strong>
-                <small id="import-file-name">UTF-8 或 GB18030，最大 1 MB</small>
-                <input id="student-csv" type="file" name="file" accept=".csv,text/csv" required>
+                <strong>批量选择名单文件</strong>
+                <small id="import-file-name">CSV / XLS / XLSX，可一次选择多个文件</small>
+                <input id="student-csv" type="file" name="files" accept=".csv,.xls,.xlsx,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple required>
               </label>
               <label class="import-option">
                 <span>名单处理方式</span>
@@ -236,14 +246,13 @@
                 </select>
                 <small>同步模式适合用完整名单覆盖本场活动，遗漏学生会被停用。</small>
               </label>
-              <label class="risk-check">
-                <input id="regenerate-existing" name="regenerate_existing" type="checkbox">
-                <span><strong>同时重置已有学生的个人激活码</strong><small>高风险：旧码和现有登录会立即失效，必须重新下发新码。</small></span>
-              </label>
-              <button class="button button--primary button--wide" type="submit">导入学生名单</button>
+              <div class="import-code-notice" role="note">
+                <strong>激活码规则</strong>
+                <span>统一使用证件号后 6 位；导入不会随机生成、重置或下载个人凭据。</span>
+              </div>
+              <button class="button button--primary button--wide" type="submit">批量导入学生名单</button>
             </form>
             <button id="download-template" class="button button--quiet button--wide" type="button">下载 CSV 模板</button>
-            <button id="download-last-credentials" class="button button--secondary button--wide is-hidden" type="button">再次下载本页生成的个人激活码</button>
             <div id="import-result" class="import-result"></div>
           </section>
           <section class="content-card">
@@ -258,7 +267,7 @@
         </div>
         <section class="content-card roster-card">
           <div class="content-card__heading roster-card__heading">
-            <div><h3>本场完整学生名单</h3><p>激活码默认掩码保护，可按需显示并在 60 秒后自动隐藏；重置会使旧码及该生现有登录立即失效。</p></div>
+            <div><h3>本场完整学生名单</h3><p>激活码默认掩码保护，可按需显示并在 60 秒后自动隐藏；如历史名单缺少证件号，请在关闭抢选后重新导入该生名单。</p></div>
             <span id="student-roster-count" class="count-chip">0 人</span>
           </div>
           <label class="compact-search roster-search">

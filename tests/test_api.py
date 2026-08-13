@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from .conftest import admin_login
+from .conftest import (
+    admin_login,
+    fictional_activation_code,
+    fictional_document_number,
+)
 from server.database import SCHEMA_VERSION, connect, initialize_database
 from server.maintenance import (
     check_database,
@@ -78,7 +82,10 @@ def test_structure_is_locked_while_open(client: TestClient, admin_headers: dict[
         files={
             "file": (
                 "student.csv",
-                f"学号,姓名,专业\n20260000,结构锁测试,{major_name}\n".encode("utf-8"),
+                (
+                    "学号,姓名,专业,证件号\n"
+                    f"20260000,结构锁测试,{major_name},{fictional_document_number('20260000')}\n"
+                ).encode("utf-8"),
                 "text/csv",
             )
         },
@@ -118,7 +125,10 @@ def test_new_activity_archives_history_and_resets_roster(
     first_activity = dashboard["settings"]["activity_id"]
     major = dashboard["majors"][0]
     group = dashboard["groups"][0]
-    csv_text = f"学号,姓名,专业,激活码\n20260099,归档测试,{major['name']},ARCH1234\n"
+    csv_text = (
+        "学号,姓名,专业,证件号\n"
+        f"20260099,归档测试,{major['name']},{fictional_document_number('20260099')}\n"
+    )
     imported = client.post(
         "/api/admin/students/import",
         headers=admin_headers,
@@ -128,7 +138,11 @@ def test_new_activity_archives_history_and_resets_roster(
     old_student_client = TestClient(client.app)
     old_login = old_student_client.post(
         "/api/student/login",
-        json={"student_no": "20260099", "name": "归档测试", "activation_code": "ARCH1234"},
+        json={
+            "student_no": "20260099",
+            "name": "归档测试",
+            "activation_code": fictional_activation_code("20260099"),
+        },
     )
     assert old_login.status_code == 200, old_login.text
     student = client.get("/api/admin/dashboard").json()["unselected_students"][0]
@@ -177,7 +191,10 @@ def test_new_activity_archives_history_and_resets_roster(
         files={
             "file": (
                 "students.csv",
-                f"学号,姓名,专业,激活码\n20260099,新活动同学,{major['name']},NEXT1234\n".encode("utf-8"),
+                (
+                    "学号,姓名,专业,证件号\n"
+                    f"20260099,新活动同学,{major['name']},{fictional_document_number('next-20260099')}\n"
+                ).encode("utf-8"),
                 "text/csv",
             )
         },
@@ -208,9 +225,11 @@ def test_new_activity_requires_current_activity_closed(client: TestClient, admin
         files={
             "file": (
                 "student.csv",
-                f"学号,姓名,专业\n20260000,活动状态测试,{dashboard['majors'][0]['name']}\n".encode(
-                    "utf-8"
-                ),
+                (
+                    "学号,姓名,专业,证件号\n"
+                    f"20260000,活动状态测试,{dashboard['majors'][0]['name']},"
+                    f"{fictional_document_number('activity-20260000')}\n"
+                ).encode("utf-8"),
                 "text/csv",
             )
         },
@@ -528,9 +547,9 @@ def test_two_students_competing_for_last_seat_yields_one_success(app):
         assert quota.status_code == 200, quota.text
 
         csv_text = (
-            "学号,姓名,专业,激活码\n"
-            f"20260001,测试甲,{major['name']},AAAA1111\n"
-            f"20260002,测试乙,{major['name']},BBBB2222\n"
+            "学号,姓名,专业,证件号\n"
+            f"20260001,测试甲,{major['name']},{fictional_document_number('20260001')}\n"
+            f"20260002,测试乙,{major['name']},{fictional_document_number('20260002')}\n"
         )
         imported = admin_client.post(
             "/api/admin/students/import",
@@ -547,11 +566,19 @@ def test_two_students_competing_for_last_seat_yields_one_success(app):
         second = TestClient(app)
         first_login = first.post(
             "/api/student/login",
-            json={"student_no": "20260001", "name": "测试甲", "activation_code": "AAAA1111"},
+            json={
+                "student_no": "20260001",
+                "name": "测试甲",
+                "activation_code": fictional_activation_code("20260001"),
+            },
         )
         second_login = second.post(
             "/api/student/login",
-            json={"student_no": "20260002", "name": "测试乙", "activation_code": "BBBB2222"},
+            json={
+                "student_no": "20260002",
+                "name": "测试乙",
+                "activation_code": fictional_activation_code("20260002"),
+            },
         )
         assert first_login.status_code == second_login.status_code == 200
         first_csrf = first_login.json()["csrf_token"]
@@ -595,7 +622,10 @@ def test_database_trigger_blocks_direct_capacity_bypass(
         headers=admin_headers,
         json={"capacity": 0},
     ).status_code == 200
-    csv_text = f"学号,姓名,专业,激活码\n20269999,约束测试,{major['name']},GUARD999\n"
+    csv_text = (
+        "学号,姓名,专业,证件号\n"
+        f"20269999,约束测试,{major['name']},{fictional_document_number('20269999')}\n"
+    )
     imported = client.post(
         "/api/admin/students/import",
         headers=admin_headers,
@@ -666,9 +696,13 @@ def test_one_hundred_fifty_students_competing_for_thirty_seats_never_oversells(a
                 headers=admin_headers,
                 json={"capacity": 30},
             ).status_code == 200
-        rows = ["学号,姓名,专业,激活码"]
+        rows = ["学号,姓名,专业,证件号"]
         for index in range(150):
-            rows.append(f"2027{index:04d},并发{index:03d},{major['name']},LOAD{index:04d}")
+            student_no = f"2027{index:04d}"
+            rows.append(
+                f"{student_no},并发{index:03d},{major['name']},"
+                f"{fictional_document_number(student_no)}"
+            )
         imported = admin_client.post(
             "/api/admin/students/import",
             headers=admin_headers,
@@ -688,7 +722,7 @@ def test_one_hundred_fifty_students_competing_for_thirty_seats_never_oversells(a
                 json={
                     "student_no": f"2027{index:04d}",
                     "name": f"并发{index:03d}",
-                    "activation_code": f"LOAD{index:04d}",
+                    "activation_code": fictional_activation_code(f"2027{index:04d}"),
                 },
             )
             assert login.status_code == 200, login.text

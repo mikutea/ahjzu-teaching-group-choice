@@ -7,16 +7,21 @@ const adminState = {
   pollTimer: null,
   messageTimer: null,
   loading: false,
-  generatedCredentials: [],
-  credentialActivityId: null,
   boardPageTimer: null,
   boardPages: { groups: 0, students: 0 },
+  rosterScrollFrame: null,
+  rosterScrollLastTime: 0,
+  rosterFingerprint: "",
+  rosterLoopSetupFrame: null,
+  liveFeedFingerprint: "",
   revealedActivationCodes: new Map(),
   activationHideTimers: new Map(),
   phaseActionPending: false,
   serverClockOffset: 0,
   recentRenderedAt: 0,
   lastActivityId: null,
+  connectionInterrupted: false,
+  lastBackgroundErrorAt: 0,
 };
 
 const adminEls = {
@@ -40,6 +45,7 @@ const adminEls = {
   rateBar: document.querySelector("#metric-rate-bar"),
   groupProgress: document.querySelector("#group-progress"),
   groupProgressPage: document.querySelector("#group-progress-page"),
+  liveSelectionFeed: document.querySelector("#live-selection-feed"),
   qr: document.querySelector("#student-qr"),
   qrPlaceholder: document.querySelector("#qr-placeholder"),
   publicUrl: document.querySelector("#public-url-label"),
@@ -80,10 +86,9 @@ const adminEls = {
   importFile: document.querySelector("#student-csv"),
   importFileName: document.querySelector("#import-file-name"),
   importMode: document.querySelector("#student-import-mode"),
-  regenerateExisting: document.querySelector("#regenerate-existing"),
   importResult: document.querySelector("#import-result"),
-  downloadCredentials: document.querySelector("#download-last-credentials"),
   exportSelections: document.querySelector("#export-selections"),
+  exportCompleteResults: document.querySelector("#export-complete-results"),
   exportUnselected: document.querySelector("#export-unselected"),
   toast: document.querySelector("#admin-toast"),
   dangerDialog: document.querySelector("#danger-dialog"),
@@ -104,15 +109,44 @@ async function adminApi(path, options = {}) {
     headers.set("X-Activity-ID", String(activityId));
   }
   const { activityId: _activityId, ...fetchOptions } = options;
-  const response = await fetch(path, { ...fetchOptions, headers, credentials: "same-origin" });
+  let response;
+  try {
+    response = await fetch(path, { ...fetchOptions, headers, credentials: "same-origin" });
+  } catch (_) {
+    const error = new Error("网络连接失败，请检查网络后重试");
+    error.status = 0;
+    throw error;
+  }
   const type = response.headers.get("content-type") || "";
-  const data = type.includes("application/json") ? await response.json() : null;
+  let data = null;
+  if (type.includes("application/json")) {
+    try { data = await response.json(); } catch (_) { data = null; }
+  }
   if (!response.ok) {
-    const error = new Error(data?.detail || `请求失败（${response.status}）`);
+    const error = new Error(adminErrorMessage(data, response.status));
     error.status = response.status;
     throw error;
   }
   return data;
+}
+
+function adminErrorMessage(data, status) {
+  const detail = data?.detail;
+  if (typeof detail === "string" && detail.trim()) return detail;
+  const messages = {
+    400: "提交内容格式不正确，请检查后重试",
+    401: "管理员会话已失效，请重新登录",
+    403: "当前账号无权执行此操作，请刷新页面后重试",
+    404: "目标数据不存在或已被更新",
+    409: "操作与当前活动状态冲突，请刷新后重试",
+    413: "上传文件过大，请拆分后重试",
+    422: "提交内容未通过校验，请检查必填项和文件格式",
+    428: "活动版本已经变化，请刷新页面后重试",
+    429: "操作过于频繁，请稍后再试",
+    500: "服务暂时异常，请稍后重试",
+    503: "当前访问人数较多，请稍后重试",
+  };
+  return messages[status] || `请求未完成（${status}），请稍后重试`;
 }
 
 function showAdminToast(text, kind = "info") {
@@ -136,12 +170,30 @@ function createCell(text, className = "") {
 }
 
 function confirmDanger(title, message) {
+  const originalParent = adminEls.dangerDialog.parentElement;
+  const fullscreenHost = document.fullscreenElement;
+  if (fullscreenHost && !fullscreenHost.contains(adminEls.dangerDialog)) {
+    fullscreenHost.append(adminEls.dangerDialog);
+  }
   document.querySelector("#danger-dialog-title").textContent = title;
   document.querySelector("#danger-dialog-message").textContent = message;
   adminEls.dangerDialog.returnValue = "";
-  adminEls.dangerDialog.showModal();
+  try {
+    adminEls.dangerDialog.showModal();
+  } catch (error) {
+    if (originalParent && adminEls.dangerDialog.parentElement !== originalParent) {
+      originalParent.append(adminEls.dangerDialog);
+    }
+    throw error;
+  }
   return new Promise((resolve) => {
-    adminEls.dangerDialog.addEventListener("close", () => resolve(adminEls.dangerDialog.returnValue === "confirm"), { once: true });
+    adminEls.dangerDialog.addEventListener("close", () => {
+      const confirmed = adminEls.dangerDialog.returnValue === "confirm";
+      if (originalParent && adminEls.dangerDialog.parentElement !== originalParent) {
+        originalParent.append(adminEls.dangerDialog);
+      }
+      resolve(confirmed);
+    }, { once: true });
   });
 }
 
@@ -159,9 +211,7 @@ function showAdminLogin() {
   adminState.activationHideTimers.clear();
   adminState.revealedActivationCodes.clear();
   scrubRevealedActivationCodeDom();
-  adminState.generatedCredentials = [];
-  adminState.credentialActivityId = null;
-  updateCredentialDownloadButton();
+  stopRosterAutoScroll();
 }
 
 function dashboardField(data, key) {
@@ -254,12 +304,20 @@ async function loadDashboard({ quiet = false } = {}) {
     adminState.dashboard = dashboard;
     renderDashboard(dashboard);
     adminEls.lastRefresh.textContent = `刷新于 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
+    if (adminState.connectionInterrupted) {
+      adminState.connectionInterrupted = false;
+      showAdminToast("管理端实时连接已恢复", "success");
+    }
   } catch (error) {
     if (error.status === 401) {
       showAdminLogin();
-      if (!quiet) showAdminToast("登录已失效，请重新登录", "error");
+      adminEls.loginError.textContent = "登录已失效，请重新登录";
     } else if (!quiet) {
       showAdminToast(error.message, "error");
+    } else if (!adminState.connectionInterrupted || Date.now() - adminState.lastBackgroundErrorAt >= 10_000) {
+      adminState.connectionInterrupted = true;
+      adminState.lastBackgroundErrorAt = Date.now();
+      showAdminToast(error.status === 0 ? "实时数据网络同步中断，系统会自动重试" : `${error.message}；系统会自动重试`, "error");
     }
   } finally {
     adminState.loading = false;
@@ -276,9 +334,7 @@ function startAdminPolling() {
     adminEls.boardClock.textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
     if (adminState.currentView !== "overview" || document.hidden || !adminState.dashboard) return;
     adminState.boardPages.groups += 1;
-    adminState.boardPages.students += 1;
     renderGroupProgress(adminState.dashboard.groups || []);
-    renderUnselectedList();
   }, 5000);
   adminEls.boardClock.textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
 }
@@ -296,18 +352,6 @@ function renderDashboard(data) {
     scrubRevealedActivationCodeDom();
   }
   adminState.lastActivityId = activityId;
-  if (
-    adminState.credentialActivityId !== null
-    && adminState.credentialActivityId !== Number(data.settings.activity_id)
-  ) {
-    for (const timer of adminState.activationHideTimers.values()) clearTimeout(timer);
-    adminState.activationHideTimers.clear();
-    adminState.revealedActivationCodes.clear();
-    scrubRevealedActivationCodeDom();
-    adminState.generatedCredentials = [];
-    adminState.credentialActivityId = null;
-    updateCredentialDownloadButton();
-  }
   const rate = data.totals.students ? Math.round((data.totals.selected / data.totals.students) * 100) : 0;
   adminEls.title.textContent = data.settings.activity_title;
   adminEls.boardActivityTitle.textContent = data.settings.activity_title;
@@ -328,9 +372,11 @@ function renderDashboard(data) {
 
   const activityQuery = `activity_id=${encodeURIComponent(data.settings.activity_id)}`;
   adminEls.exportSelections.href = `/api/admin/export/selections.csv?${activityQuery}`;
+  adminEls.exportCompleteResults.href = `/api/admin/export/results.csv?${activityQuery}`;
   adminEls.exportUnselected.href = `/api/admin/export/unselected.csv?${activityQuery}`;
   if (adminState.currentView === "overview") {
     renderGroupProgress(data.groups);
+    renderLiveSelectionFeed(data.recent_selections || []);
     renderQr(data.settings.public_base_url);
     renderUnselectedList();
     if (Date.now() - adminState.recentRenderedAt >= 5000) {
@@ -378,8 +424,8 @@ function renderBoardStage(data, phase, presence) {
     adminEls.boardStageLabel.textContent = "抢选进行中";
     adminEls.boardCountdown.textContent = "LIVE";
     adminEls.boardStageDetail.textContent = `已完成 ${data.totals.selected} / ${total} 人，名额与名单每秒自动同步`;
-    adminEls.boardStatus.textContent = "抢选正在进行";
-    adminEls.boardLiveNote.textContent = "名额由服务器原子判定";
+    adminEls.boardStatus.textContent = "抢选正在进行，扫码仍可登录";
+    adminEls.boardLiveNote.textContent = "扫码仍可登录 · 名额与名单实时更新";
     adminEls.statusButton.textContent = "关闭抢选";
     adminEls.statusButton.className = "button button--secondary";
     adminEls.boardStart.textContent = "关闭抢选";
@@ -392,7 +438,7 @@ function renderBoardStage(data, phase, presence) {
   adminEls.boardCountdown.textContent = "READY";
   adminEls.boardStageDetail.textContent = `已进入候场 ${presence.online} / ${total} 人，尚未进入 ${presence.absent} 人`;
   adminEls.boardStatus.textContent = isClosed ? "当前不可提交，可再次发起统一倒计时" : "候场数据实时更新";
-  adminEls.boardLiveNote.textContent = "每秒自动同步，无需手动刷新";
+  adminEls.boardLiveNote.textContent = "扫码入口持续开放，页面自动同步";
   adminEls.statusButton.textContent = "开始 10 秒倒计时";
   adminEls.statusButton.className = "button button--primary";
   adminEls.boardStart.textContent = readiness.ready ? "开始 10 秒倒计时" : "就绪检查未通过";
@@ -478,7 +524,7 @@ function renderActivities(activities) {
 function renderGroupProgress(groups) {
   const activeGroups = groups.filter((group) => group.active);
   const page = boardPage(activeGroups, "groups");
-  adminEls.groupProgressPage.textContent = page.pages > 1 ? `第 ${page.index + 1} / ${page.pages} 页 · 自动轮播` : activeGroups.length ? "实时更新" : "";
+  adminEls.groupProgressPage.textContent = page.pages > 1 ? `第 ${page.index + 1} / ${page.pages} 页` : activeGroups.length ? "实时更新" : "";
   if (!activeGroups.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
@@ -505,6 +551,35 @@ function renderGroupProgress(groups) {
     return wrapper;
   });
   adminEls.groupProgress.replaceChildren(...elements);
+}
+
+function renderLiveSelectionFeed(rows) {
+  const recentRows = rows.slice(0, 4);
+  const fingerprint = JSON.stringify(recentRows.map((record) => [record.student_id, record.name, record.group_name, record.selected_at]));
+  if (adminState.liveFeedFingerprint === fingerprint) return;
+  adminState.liveFeedFingerprint = fingerprint;
+  const items = recentRows.map((record) => {
+    const item = document.createElement("article");
+    item.className = "selection-feed-item";
+    const marker = document.createElement("span");
+    marker.className = "selection-feed-item__marker";
+    marker.textContent = "✓";
+    const detail = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = `${record.name} → ${record.group_name}`;
+    const meta = document.createElement("small");
+    meta.textContent = `${record.major_name} · ${formatAdminTime(record.selected_at)}`;
+    detail.append(title, meta);
+    item.append(marker, detail);
+    return item;
+  });
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "selection-feed-empty";
+    empty.textContent = "等待第一条选择记录";
+    items.push(empty);
+  }
+  adminEls.liveSelectionFeed.replaceChildren(...items);
 }
 
 function renderQr(publicUrl) {
@@ -540,16 +615,111 @@ function boardStudentListData() {
   return adminState.dashboard?.unselected_students || [];
 }
 
-function renderUnselectedList() {
+function captureRosterScrollRatio() {
+  const list = adminEls.unselectedList;
+  const loopHeight = Number(list.dataset.loopHeight || 0);
+  if (loopHeight > 0) return (list.scrollTop % loopHeight) / loopHeight;
+  const max = Math.max(0, list.scrollHeight - list.clientHeight);
+  return max > 0 ? list.scrollTop / max : 0;
+}
+
+function restoreRosterScrollRatio(ratio) {
+  const list = adminEls.unselectedList;
+  const loopHeight = Number(list.dataset.loopHeight || 0);
+  if (loopHeight > 0) {
+    list.scrollTop = Math.min(loopHeight - 1, Math.max(0, ratio * loopHeight));
+    return;
+  }
+  const max = Math.max(0, list.scrollHeight - list.clientHeight);
+  list.scrollTop = Math.min(max, Math.max(0, ratio * max));
+}
+
+function stopRosterAutoScroll() {
+  if (adminState.rosterScrollFrame) cancelAnimationFrame(adminState.rosterScrollFrame);
+  if (adminState.rosterLoopSetupFrame) cancelAnimationFrame(adminState.rosterLoopSetupFrame);
+  adminState.rosterScrollFrame = null;
+  adminState.rosterLoopSetupFrame = null;
+  adminState.rosterScrollLastTime = 0;
+}
+
+function startRosterAutoScroll() {
+  if (adminState.rosterScrollFrame) cancelAnimationFrame(adminState.rosterScrollFrame);
+  adminState.rosterScrollFrame = null;
+  adminState.rosterScrollLastTime = 0;
+  if (reducedMotionPreference.matches) return;
+  const loopHeight = Number(adminEls.unselectedList.dataset.loopHeight || 0);
+  if (loopHeight <= 0) return;
+  const tick = (now) => {
+    if (document.hidden || adminState.currentView !== "overview") {
+      stopRosterAutoScroll();
+      return;
+    }
+    const list = adminEls.unselectedList;
+    const cycleHeight = Number(list.dataset.loopHeight || 0);
+    if (cycleHeight > 0) {
+      const elapsed = adminState.rosterScrollLastTime ? Math.min(80, now - adminState.rosterScrollLastTime) : 0;
+      const next = list.scrollTop + elapsed * 0.018;
+      list.scrollTop = next >= cycleHeight ? next - cycleHeight : next;
+    }
+    adminState.rosterScrollLastTime = now;
+    adminState.rosterScrollFrame = requestAnimationFrame(tick);
+  };
+  adminState.rosterScrollFrame = requestAnimationFrame(tick);
+}
+
+function setupRosterLoop(previousScrollRatio) {
+  if (adminState.rosterLoopSetupFrame) cancelAnimationFrame(adminState.rosterLoopSetupFrame);
+  adminState.rosterLoopSetupFrame = requestAnimationFrame(() => {
+    adminState.rosterLoopSetupFrame = null;
+    const list = adminEls.unselectedList;
+    list.querySelectorAll("[data-roster-clone]").forEach((clone) => clone.remove());
+    delete list.dataset.loopHeight;
+    list.scrollTop = 0;
+    const originals = [...list.children];
+    const canLoop = originals.length > 1 && list.scrollHeight > list.clientHeight + 4;
+    adminEls.unselectedPage.textContent = canLoop && !reducedMotionPreference.matches
+      ? "连续滚动"
+      : originals.length ? "实时更新" : "";
+    if (!canLoop || reducedMotionPreference.matches) {
+      restoreRosterScrollRatio(previousScrollRatio);
+      stopRosterAutoScroll();
+      return;
+    }
+    const firstTop = originals[0].offsetTop;
+    const clones = originals.map((item) => {
+      const clone = item.cloneNode(true);
+      clone.dataset.rosterClone = "true";
+      clone.setAttribute("aria-hidden", "true");
+      return clone;
+    });
+    list.append(...clones);
+    const loopHeight = clones[0].offsetTop - firstTop;
+    if (loopHeight <= 0) return;
+    list.dataset.loopHeight = String(loopHeight);
+    restoreRosterScrollRatio(previousScrollRatio);
+    startRosterAutoScroll();
+  });
+}
+
+function renderUnselectedList({ force = false } = {}) {
   const phase = dashboardPhase();
   const isCheckIn = ["waiting", "countdown"].includes(phase);
   const all = boardStudentListData();
   const filtered = filteredUnselectedStudents();
-  const page = boardPage(filtered, "students");
+  const previousScrollRatio = captureRosterScrollRatio();
+  const visibleStudents = filtered;
   adminEls.studentListKicker.textContent = isCheckIn ? "CHECK-IN LIST" : "WAITING LIST";
   adminEls.unselectedTitle.textContent = isCheckIn ? "尚未进入候场" : "当前未选学生";
   adminEls.unselectedCount.textContent = `${all.length} 人`;
-  adminEls.unselectedPage.textContent = page.pages > 1 ? `第 ${page.index + 1} / ${page.pages} 页 · 自动轮播` : filtered.length ? "实时更新" : "";
+  adminEls.unselectedPage.textContent = visibleStudents.length ? "实时更新" : "";
+  const fingerprint = JSON.stringify([
+    phase,
+    adminEls.unselectedSearch.value.trim().toLowerCase(),
+    ...visibleStudents.map((student) => [student.id, student.name, student.major_name]),
+  ]);
+  if (!force && adminState.rosterFingerprint === fingerprint) return;
+  adminState.rosterFingerprint = fingerprint;
+  stopRosterAutoScroll();
   if (!filtered.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
@@ -559,27 +729,26 @@ function renderUnselectedList() {
         ? "全部学生均已进入候场"
         : "所有学生都已完成选择";
     adminEls.unselectedList.replaceChildren(empty);
+    stopRosterAutoScroll();
     return;
   }
-  const items = page.items.map((student, index) => {
+  const items = visibleStudents.map((student, index) => {
     const item = document.createElement("article");
     item.className = "student-list-item";
     const ordinal = document.createElement("span");
     ordinal.className = "student-list-item__index";
-    ordinal.textContent = String(page.index * boardPageSize("students") + index + 1);
+    ordinal.textContent = String(index + 1);
     const info = document.createElement("div");
     const name = document.createElement("strong");
     name.textContent = student.name;
     const major = document.createElement("small");
     major.textContent = student.major_name;
     info.append(name, major);
-    const number = document.createElement("span");
-    number.className = "student-list-item__no";
-    number.textContent = student.student_no;
-    item.append(ordinal, info, number);
+    item.append(ordinal, info);
     return item;
   });
   adminEls.unselectedList.replaceChildren(...items);
+  setupRosterLoop(previousScrollRatio);
 }
 
 function renderRecentSelections(rows) {
@@ -938,19 +1107,8 @@ function renderStudentRoster(data = adminState.dashboard) {
     reveal.disabled = !revealable;
     reveal.title = revealable
       ? revealedCode ? "立即从页面隐藏" : "仅本页显示，60 秒后自动隐藏"
-      : "该历史激活码无法恢复，请重置后再下发";
-    const reset = document.createElement("button");
-    reset.type = "button";
-    reset.className = "button button--quiet";
-    reset.dataset.action = "reset-activation-code";
-    reset.dataset.studentName = student.name;
-    reset.dataset.studentNo = student.student_no;
-    reset.textContent = "重置码";
-    reset.disabled = !student.active;
-    reset.title = student.active
-      ? `为 ${student.name} 生成新的个人激活码`
-      : "该学生已停用；新码需在重新启用后才能登录";
-    credentialControl.append(value, reveal, reset);
+      : "请在关闭抢选后，重新导入包含证件号的该生名单";
+    credentialControl.append(value, reveal);
     credentialCell.append(credentialControl);
     row.append(statusCell, selectionCell, credentialCell);
     return row;
@@ -970,7 +1128,12 @@ function switchAdminView(viewName) {
   document.querySelectorAll(".admin-nav__item").forEach((button) => button.classList.toggle("is-active", button.dataset.view === viewName));
   document.querySelectorAll(".admin-view").forEach((view) => view.classList.add("is-hidden"));
   document.querySelector(`#view-${viewName}`).classList.remove("is-hidden");
-  if (viewName !== "overview") loadDashboard({ quiet: true });
+  if (viewName !== "overview") {
+    stopRosterAutoScroll();
+    loadDashboard({ quiet: true });
+  } else {
+    renderUnselectedList({ force: true });
+  }
 }
 
 document.querySelectorAll(".admin-nav__item").forEach((button) => button.addEventListener("click", () => switchAdminView(button.dataset.view)));
@@ -1058,17 +1221,23 @@ adminEls.rosterSearch.addEventListener("input", () => renderStudentRoster());
 
 const liveBoard = document.querySelector("#live-board");
 const fullscreenButton = document.querySelector("#fullscreen-board");
+const reducedMotionPreference = window.matchMedia("(prefers-reduced-motion: reduce)");
+reducedMotionPreference.addEventListener?.("change", () => {
+  if (adminState.dashboard && adminState.currentView === "overview") renderUnselectedList({ force: true });
+});
 
 function leavePresentationMode() {
   liveBoard.classList.remove("is-presentation");
   document.body.classList.remove("is-presentation");
+  stopRosterAutoScroll();
 }
 
 function updateFullscreenButton() {
   fullscreenButton.textContent = document.fullscreenElement || liveBoard.classList.contains("is-presentation") ? "退出全屏" : "⛶ 全屏展示";
   if (adminState.dashboard) {
     renderGroupProgress(adminState.dashboard.groups || []);
-    renderUnselectedList();
+    renderLiveSelectionFeed(adminState.dashboard.recent_selections || []);
+    renderUnselectedList({ force: true });
   }
 }
 
@@ -1302,52 +1471,50 @@ adminEls.importFile.addEventListener("change", () => {
   if (!adminEls.importForm.dataset.activityId && adminState.dashboard?.settings.activity_id) {
     adminEls.importForm.dataset.activityId = String(adminState.dashboard.settings.activity_id);
   }
-  adminEls.importFileName.textContent = adminEls.importFile.files[0]?.name || "UTF-8 或 GB18030，最大 1 MB";
+  const files = [...adminEls.importFile.files];
+  adminEls.importFileName.textContent = files.length
+    ? `${files.length} 个文件：${files.map((file) => file.name).join("、")}`
+    : "可多选 CSV / XLS / XLSX";
 });
 
 adminEls.importForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!adminEls.importFile.files[0]) return;
+  const files = [...adminEls.importFile.files];
+  if (!files.length) {
+    showAdminToast("请先选择至少一个 CSV、XLS 或 XLSX 名单文件", "error");
+    return;
+  }
   const mode = adminEls.importMode.value === "sync" ? "sync" : "merge";
-  const regenerateExisting = adminEls.regenerateExisting.checked;
-  const riskMessages = [];
-  if (mode === "sync") riskMessages.push("同步名单会停用所有未出现在本次 CSV 中的学生");
-  if (regenerateExisting) riskMessages.push("批量重置会让文件中已有学生的旧码及现有登录立即失效");
-  if (riskMessages.length) {
+  if (mode === "sync") {
     const confirmed = await confirmDanger(
-      "确认高风险名单操作",
-      `${riskMessages.join("；")}。操作完成后，请立即下载并重新下发本次生成的个人激活码。`,
+      "确认同步完整名单",
+      "同步模式会停用所有未出现在本次全部文件中的学生；个人激活码仍固定为证件号后 6 位，不会随机生成或批量重置。",
     );
     if (!confirmed) return;
   }
   const body = new FormData();
-  body.append("file", adminEls.importFile.files[0]);
+  for (const file of files) body.append("files", file, file.name);
   const activityId = Number(adminEls.importForm.dataset.activityId || adminState.dashboard.settings.activity_id);
-  const query = new URLSearchParams({
-    mode,
-    regenerate_existing: String(regenerateExisting),
-  });
+  const query = new URLSearchParams({ mode });
   const submit = adminEls.importForm.querySelector('button[type="submit"]');
   submit.disabled = true;
-  submit.textContent = "正在导入…";
+  submit.textContent = `正在导入 ${files.length} 个文件…`;
   try {
-    const result = await adminApi(`/api/admin/students/import?${query}`, { method: "POST", body, activityId });
-    const credentials = Array.isArray(result.credentials) ? result.credentials : [];
-    rememberCredentials(credentials);
+    const result = (await adminApi(`/api/admin/students/import?${query}`, { method: "POST", body, activityId })) || {};
     adminEls.importResult.className = "import-result is-success";
-    adminEls.importResult.textContent = `导入完成：新增 ${result.created || 0} 人，更新 ${result.updated || 0} 人，停用 ${result.deactivated || 0} 人，重置 ${result.rotated || 0} 个个人激活码；本次生成 ${credentials.length} 条凭据。${credentials.length ? "已自动下载，也可在本页再次下载。" : "本次没有生成新凭据。"}`;
+    adminEls.importResult.textContent = `已完成 ${files.length} 个文件：新增 ${result.created || 0} 人，更新 ${result.updated || 0} 人，停用 ${result.deactivated || 0} 人。个人激活码使用证件号后 6 位，未生成或下载随机凭据。`;
     adminEls.importForm.reset();
     delete adminEls.importForm.dataset.activityId;
-    adminEls.importFileName.textContent = "UTF-8 或 GB18030，最大 1 MB";
-    if (credentials.length) downloadCredentials(credentials);
+    adminEls.importFileName.textContent = "可多选 CSV / XLS / XLSX";
+    showAdminToast("学生名单导入成功", "success");
     await loadDashboard();
   } catch (error) {
-    adminEls.importResult.className = "import-result";
-    adminEls.importResult.textContent = "";
+    adminEls.importResult.className = "import-result is-error";
+    adminEls.importResult.textContent = `导入失败：${error.message}`;
     showAdminToast(error.message, "error");
   } finally {
     submit.disabled = false;
-    submit.textContent = "导入学生名单";
+    submit.textContent = "批量导入学生名单";
   }
 });
 
@@ -1363,43 +1530,79 @@ function downloadText(filename, content) {
   URL.revokeObjectURL(url);
 }
 
+function exportFilename(response, fallback) {
+  const disposition = response.headers.get("content-disposition") || "";
+  const utf8Name = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (utf8Name) {
+    try { return decodeURIComponent(utf8Name); } catch (_) { /* use fallback below */ }
+  }
+  return disposition.match(/filename="?([^";]+)"?/i)?.[1] || fallback;
+}
+
+async function downloadAdminExport(anchor, fallbackName, successMessage) {
+  if (anchor.dataset.downloading === "true") return;
+  anchor.dataset.downloading = "true";
+  anchor.setAttribute("aria-busy", "true");
+  anchor.classList.add("is-downloading");
+  try {
+    let response;
+    try {
+      response = await fetch(anchor.href, { credentials: "same-origin" });
+    } catch (_) {
+      throw Object.assign(new Error("网络连接失败，导出未完成"), { status: 0 });
+    }
+    if (!response.ok) {
+      let data = null;
+      if ((response.headers.get("content-type") || "").includes("application/json")) {
+        try { data = await response.json(); } catch (_) { data = null; }
+      }
+      throw Object.assign(new Error(adminErrorMessage(data, response.status)), { status: response.status });
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const download = document.createElement("a");
+    download.href = url;
+    download.download = exportFilename(response, fallbackName);
+    document.body.append(download);
+    download.click();
+    download.remove();
+    URL.revokeObjectURL(url);
+    showAdminToast(successMessage, "success");
+  } catch (error) {
+    if (error.status === 401) {
+      showAdminLogin();
+      adminEls.loginError.textContent = "登录已失效，请重新登录后导出";
+    } else {
+      showAdminToast(`导出失败：${error.message}`, "error");
+    }
+  } finally {
+    delete anchor.dataset.downloading;
+    anchor.removeAttribute("aria-busy");
+    anchor.classList.remove("is-downloading");
+  }
+}
+
 function csvEscape(value) {
   let text = String(value ?? "");
   if (/^[\t\r]/.test(text) || /^\s*[=+\-@]/.test(text)) text = `'${text}`;
   return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
-function downloadCredentials(credentials) {
-  const rows = [["学号", "姓名", "专业", "个人激活码"], ...credentials.map((row) => [row.student_no, row.name, row.major ?? row.major_name ?? "", row.activation_code])];
-  downloadText("学生个人激活码-请妥善保管.csv", rows.map((row) => row.map(csvEscape).join(",")).join("\n"));
-}
-
-function rememberCredentials(credentials) {
-  const activityId = Number(adminState.dashboard?.settings.activity_id);
-  if (adminState.credentialActivityId !== null && adminState.credentialActivityId !== activityId) {
-    adminState.generatedCredentials = [];
-  }
-  adminState.credentialActivityId = activityId;
-  const credentialMap = new Map(adminState.generatedCredentials.map((row) => [String(row.student_no), row]));
-  for (const credential of credentials) credentialMap.set(String(credential.student_no), credential);
-  adminState.generatedCredentials = [...credentialMap.values()];
-  updateCredentialDownloadButton();
-}
-
-function updateCredentialDownloadButton() {
-  const count = adminState.generatedCredentials.length;
-  adminEls.downloadCredentials.classList.toggle("is-hidden", count === 0);
-  adminEls.downloadCredentials.textContent = `再次下载本页生成的个人激活码（${count} 条）`;
-}
-
 document.querySelector("#download-template").addEventListener("click", () => {
-  const rows = [["学号", "姓名", "专业"], ["20260001", "示例学生", "建筑学"]];
+  const rows = [["学号", "姓名", "专业名称", "证件号"]];
   downloadText("学生名单模板.csv", rows.map((row) => row.map(csvEscape).join(",")).join("\n"));
 });
 
-adminEls.downloadCredentials.addEventListener("click", () => {
-  if (adminState.generatedCredentials.length) downloadCredentials(adminState.generatedCredentials);
-});
+for (const [anchor, filename, message] of [
+  [adminEls.exportSelections, "选择记录.csv", "选择记录已导出"],
+  [adminEls.exportCompleteResults, "本场完整结果.csv", "本场完整结果已导出"],
+  [adminEls.exportUnselected, "未选学生名单.csv", "未选学生名单已导出"],
+]) {
+  anchor.addEventListener("click", (event) => {
+    event.preventDefault();
+    downloadAdminExport(anchor, filename, message);
+  });
+}
 
 adminEls.assignmentBody.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-action=assign-student]");
@@ -1441,45 +1644,18 @@ adminEls.rosterBody.addEventListener("click", async (event) => {
         activityId,
       });
       const activationCode = activationCodeFromResponse(result);
-      if (!activationCode) throw new Error("该历史激活码无法显示，请重置后重新下发");
+      if (!activationCode) throw new Error("该历史激活码无法显示；请在关闭抢选后，重新导入包含证件号的该生名单");
       rememberRevealedActivationCode(studentId, activationCode);
       renderStudentRoster();
       showAdminToast("激活码明文已显示，60 秒后自动隐藏", "success");
     } catch (error) {
       button.disabled = false;
       button.textContent = "显示明文";
-      showAdminToast(`${error.message}；可使用“重置码”生成新码`, "error");
+      showAdminToast(error.message, "error");
     }
     return;
   }
 
-  if (button.dataset.action !== "reset-activation-code") return;
-  const confirmed = await confirmDanger(
-    "重置个人激活码",
-    `确认重置 ${button.dataset.studentName}（${button.dataset.studentNo}）的个人激活码？旧码及该生现有登录会立即失效，新码只会在本次页面中提供下载。`,
-  );
-  if (!confirmed) return;
-  button.disabled = true;
-  button.textContent = "生成中…";
-  try {
-    const result = await adminApi(`/api/admin/students/${studentId}/activation-code`, {
-      method: "POST",
-      body: JSON.stringify({}),
-      activityId,
-    });
-    if (!result?.credential?.activation_code) throw new Error("服务未返回新的个人激活码，请勿关闭页面并联系管理员");
-    rememberRevealedActivationCode(studentId, result.credential.activation_code);
-    rememberCredentials([result.credential]);
-    downloadCredentials([result.credential]);
-    adminEls.importResult.className = "import-result is-success";
-    adminEls.importResult.textContent = `已为 ${button.dataset.studentName} 生成新凭据并自动下载；本页凭据可重复下载，刷新后将清除。`;
-    showAdminToast("新个人激活码已生成并下载", "success");
-    await loadDashboard();
-  } catch (error) {
-    button.disabled = false;
-    button.textContent = "重置码";
-    showAdminToast(error.message, "error");
-  }
 });
 
 adminEls.recentBody.addEventListener("click", async (event) => {

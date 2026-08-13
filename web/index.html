@@ -45,7 +45,8 @@
         </label>
         <label class="field">
           <span>个人激活码</span>
-          <input id="activation-code" name="activation_code" autocomplete="one-time-code" maxlength="64" required placeholder="请输入个人激活码">
+          <input id="activation-code" name="activation_code" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" minlength="6" maxlength="6" required placeholder="请输入证件号后 6 位" aria-describedby="activation-code-help">
+          <small id="activation-code-help" class="field-help">个人激活码固定为证件号后 6 位，不会随机生成</small>
         </label>
         <button class="button button--primary button--wide" type="submit">
           核验并进入 <span aria-hidden="true">→</span>

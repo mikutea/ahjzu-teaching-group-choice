@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 import server.main as main_module
 from server.database import connect
 
+from .conftest import fictional_activation_code, fictional_document_number
+
 
 FIXED_ORGANIZATION = "安徽建筑大学 · 建筑与空间规划学院"
 FIXED_OWNER = "Mikutea"
@@ -21,10 +23,10 @@ def import_roster(
     major_name: str,
     rows: list[tuple[str, str, str]],
 ):
-    csv_rows = ["student_no,name,major,activation_code"]
+    csv_rows = ["student_no,name,major,document_number"]
     csv_rows.extend(
-        f"{student_no},{name},{major_name},{activation_code}"
-        for student_no, name, activation_code in rows
+        f"{student_no},{name},{major_name},{document_number}"
+        for student_no, name, document_number in rows
     )
     return client.post(
         "/api/admin/students/import",
@@ -66,7 +68,7 @@ def student_headers(payload: dict, activity_id: int) -> dict[str, str]:
     }
 
 
-def test_activation_code_is_encrypted_revealable_rotatable_and_audited(
+def test_activation_code_is_encrypted_revealable_and_random_reset_is_forbidden(
     app,
     client: TestClient,
     admin_headers: dict[str, str],
@@ -74,12 +76,13 @@ def test_activation_code_is_encrypted_revealable_rotatable_and_audited(
 ):
     dashboard = client.get("/api/admin/dashboard").json()
     major_name = dashboard["majors"][0]["name"]
-    activation_code = "VISIBLE9"
+    document_number = fictional_document_number("VISIBLE9")
+    activation_code = document_number[-6:]
     imported = import_roster(
         client,
         admin_headers,
         major_name,
-        [("20500001", "Activation Student", activation_code)],
+        [("20500001", "Activation Student", document_number)],
     )
     assert imported.status_code == 200, imported.text
 
@@ -134,41 +137,30 @@ def test_activation_code_is_encrypted_revealable_rotatable_and_audited(
         f"/api/admin/students/{student_id}/activation-code",
         headers=admin_headers,
     )
-    assert reset.status_code == 200, reset.text
-    replacement = reset.json()["credential"]["activation_code"]
-    assert replacement != activation_code
+    assert reset.status_code == 409, reset.text
+    assert "重新导入" in reset.json()["detail"]
     revealed_again = client.post(
         f"/api/admin/students/{student_id}/activation-code/reveal",
         headers=admin_headers,
     )
     assert revealed_again.status_code == 200, revealed_again.text
-    assert revealed_again.json()["credential"]["activation_code"] == replacement
+    assert revealed_again.json()["credential"]["activation_code"] == activation_code
 
-    old_code = TestClient(app)
-    new_code = TestClient(app)
+    same_code = TestClient(app)
     try:
-        assert old_code.post(
+        assert same_code.post(
             "/api/student/login",
             json={
                 "student_no": "20500001",
                 "name": "Activation Student",
                 "activation_code": activation_code,
             },
-        ).status_code == 401
-        assert new_code.post(
-            "/api/student/login",
-            json={
-                "student_no": "20500001",
-                "name": "Activation Student",
-                "activation_code": replacement,
-            },
         ).status_code == 200
     finally:
-        old_code.close()
-        new_code.close()
+        same_code.close()
 
 
-def test_legacy_hash_only_activation_code_requires_reset_before_reveal(
+def test_legacy_hash_only_activation_code_requires_reimport_before_reveal(
     client: TestClient,
     admin_headers: dict[str, str],
     app_config,
@@ -179,7 +171,7 @@ def test_legacy_hash_only_activation_code_requires_reset_before_reveal(
         client,
         admin_headers,
         major_name,
-        [("20500002", "Legacy Student", "LEGACY99")],
+        [("20500002", "Legacy Student", fictional_document_number("LEGACY99"))],
     )
     assert imported.status_code == 200, imported.text
     student_id = next(
@@ -202,12 +194,19 @@ def test_legacy_hash_only_activation_code_requires_reset_before_reveal(
         headers=admin_headers,
     )
     assert unavailable.status_code == 409
-    assert "重置" in unavailable.json()["detail"]
+    assert "重新导入" in unavailable.json()["detail"]
     reset = client.post(
         f"/api/admin/students/{student_id}/activation-code",
         headers=admin_headers,
     )
-    assert reset.status_code == 200, reset.text
+    assert reset.status_code == 409, reset.text
+    repaired = import_roster(
+        client,
+        admin_headers,
+        major_name,
+        [("20500002", "Legacy Student", fictional_document_number("LEGACY99"))],
+    )
+    assert repaired.status_code == 200, repaired.text
     revealed = client.post(
         f"/api/admin/students/{student_id}/activation-code/reveal",
         headers=admin_headers,
@@ -215,7 +214,7 @@ def test_legacy_hash_only_activation_code_requires_reset_before_reveal(
     assert revealed.status_code == 200, revealed.text
     assert (
         revealed.json()["credential"]["activation_code"]
-        == reset.json()["credential"]["activation_code"]
+        == fictional_activation_code("LEGACY99")
     )
 
 
@@ -261,7 +260,7 @@ def test_major_and_group_can_only_be_disabled_when_safe(
         client,
         admin_headers,
         occupied_major["name"],
-        [("20510001", "Assigned Student", "ASSIGNED1")],
+        [("20510001", "Assigned Student", fictional_document_number("ASSIGNED1"))],
     )
     assert imported.status_code == 200, imported.text
     student_id = next(
@@ -341,9 +340,9 @@ def test_waiting_room_presence_heartbeat_and_absent_roster(
         admin_headers,
         major_name,
         [
-            ("20520001", "Entered Student", "ENTERED1"),
-            ("20520002", "Absent Student", "ABSENT22"),
-            ("20520003", "Also Absent", "ABSENT33"),
+            ("20520001", "Entered Student", fictional_document_number("ENTERED1")),
+            ("20520002", "Absent Student", fictional_document_number("ABSENT22")),
+            ("20520003", "Also Absent", fictional_document_number("ABSENT33")),
         ],
     )
     assert imported.status_code == 200, imported.text
@@ -352,7 +351,7 @@ def test_waiting_room_presence_heartbeat_and_absent_roster(
         app,
         student_no="20520001",
         name="Entered Student",
-        activation_code="ENTERED1",
+        activation_code=fictional_activation_code("ENTERED1"),
     )
     try:
         waiting = client.get("/api/admin/dashboard").json()
@@ -427,14 +426,14 @@ def test_countdown_uses_server_clock_and_opens_atomically_without_sleeping(
         client,
         admin_headers,
         major_name,
-        [("20530001", "Countdown Student", "COUNTDWN")],
+        [("20530001", "Countdown Student", fictional_document_number("COUNTDWN"))],
     )
     assert imported.status_code == 200, imported.text
     student, login = login_student(
         app,
         student_no="20530001",
         name="Countdown Student",
-        activation_code="COUNTDWN",
+        activation_code=fictional_activation_code("COUNTDWN"),
     )
     try:
         assert login["phase"] == "waiting"
@@ -492,7 +491,7 @@ def test_cancelling_countdown_returns_to_waiting_and_clears_schedule(
         client,
         admin_headers,
         dashboard["majors"][0]["name"],
-        [("20530002", "Cancelled Countdown", "CANCEL10")],
+        [("20530002", "Cancelled Countdown", fictional_document_number("CANCEL10"))],
     )
     assert imported.status_code == 200, imported.text
     started = client.post("/api/admin/start-countdown", headers=admin_headers)
@@ -522,14 +521,14 @@ def test_activity_rollover_clears_countdown_and_revokes_old_student_session(
         client,
         admin_headers,
         major_name,
-        [("20540001", "Rollover Student", "ROLLOVER")],
+        [("20540001", "Rollover Student", fictional_document_number("ROLLOVER"))],
     )
     assert imported.status_code == 200, imported.text
     student, _ = login_student(
         app,
         student_no="20540001",
         name="Rollover Student",
-        activation_code="ROLLOVER",
+        activation_code=fictional_activation_code("ROLLOVER"),
     )
     try:
         started = client.post("/api/admin/start-countdown", headers=admin_headers)
@@ -605,7 +604,11 @@ def test_one_hundred_fifty_students_after_countdown_never_oversell(
             ).status_code == 200
 
     rows = [
-        (f"2055{index:04d}", f"Countdown Load {index:03d}", f"FLOW{index:04d}")
+        (
+            f"2055{index:04d}",
+            f"Countdown Load {index:03d}",
+            fictional_document_number(f"FLOW{index:04d}"),
+        )
         for index in range(150)
     ]
     imported = import_roster(client, admin_headers, major["name"], rows)
@@ -614,12 +617,12 @@ def test_one_hundred_fifty_students_after_countdown_never_oversell(
     clients: list[TestClient] = []
     payloads: list[dict] = []
     try:
-        for student_no, name, code in rows:
+        for student_no, name, document_number in rows:
             student, payload = login_student(
                 app,
                 student_no=student_no,
                 name=name,
-                activation_code=code,
+                activation_code=document_number[-6:],
             )
             clients.append(student)
             payloads.append(payload)
@@ -683,11 +686,8 @@ def test_one_hundred_fifty_students_after_countdown_never_oversell(
             student.close()
 
 
-def test_activation_reset_cannot_race_heartbeat_into_reviving_old_session(
-    app,
-    client: TestClient,
-    admin_headers: dict[str, str],
-    monkeypatch,
+def test_forbidden_random_reset_does_not_revoke_existing_student_session(
+    app, client: TestClient, admin_headers: dict[str, str]
 ):
     dashboard = client.get("/api/admin/dashboard").json()
     activity_id = int(dashboard["settings"]["activity_id"])
@@ -695,84 +695,29 @@ def test_activation_reset_cannot_race_heartbeat_into_reviving_old_session(
         client,
         admin_headers,
         dashboard["majors"][0]["name"],
-        [("20560001", "Heartbeat Reset Race", "HEARTRST")],
+        [("20560001", "Heartbeat Reset Race", fictional_document_number("HEARTRST"))],
     )
     assert imported.status_code == 200, imported.text
     student, login = login_student(
         app,
         student_no="20560001",
         name="Heartbeat Reset Race",
-        activation_code="HEARTRST",
+        activation_code=fictional_activation_code("HEARTRST"),
     )
     student_id = int(login["student"]["id"])
-    original_connect = main_module.connect
-    connection = original_connect(client.app.state.config.database_path)
     try:
-        connection.execute(
-            """
-            UPDATE sessions SET last_seen_at = '2000-01-01T00:00:00+00:00'
-            WHERE role = 'student' AND subject_id = ?
-            """,
-            (student_id,),
+        reset = client.post(
+            f"/api/admin/students/{student_id}/activation-code",
+            headers=admin_headers,
         )
+        assert reset.status_code == 409, reset.text
+        heartbeat = student.post(
+            "/api/student/heartbeat",
+            headers=student_headers(login, activity_id),
+        )
+        assert heartbeat.status_code == 200, heartbeat.text
+        assert student.get("/api/student/me").status_code == 200
     finally:
-        connection.close()
-    heartbeat_waiting = threading.Event()
-    allow_heartbeat = threading.Event()
-    pause_lock = threading.Lock()
-    paused_once = False
-
-    class ConnectionProxy:
-        def __init__(self, connection):
-            self._connection = connection
-
-        def execute(self, sql, parameters=()):
-            nonlocal paused_once
-            should_pause = False
-            if sql.strip().upper() == "BEGIN IMMEDIATE":
-                with pause_lock:
-                    if not paused_once:
-                        paused_once = True
-                        should_pause = True
-            if should_pause:
-                heartbeat_waiting.set()
-                assert allow_heartbeat.wait(timeout=10)
-            return self._connection.execute(sql, parameters)
-
-        def __getattr__(self, name):
-            return getattr(self._connection, name)
-
-    monkeypatch.setattr(
-        main_module,
-        "connect",
-        lambda path: ConnectionProxy(original_connect(path)),
-    )
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            heartbeat_future = pool.submit(
-                student.post,
-                "/api/student/heartbeat",
-                headers=student_headers(login, activity_id),
-            )
-            assert heartbeat_waiting.wait(timeout=10)
-            reset = client.post(
-                f"/api/admin/students/{student_id}/activation-code",
-                headers=admin_headers,
-            )
-            assert reset.status_code == 200, reset.text
-            allow_heartbeat.set()
-            stale = heartbeat_future.result(timeout=10)
-        assert stale.status_code == 401, stale.text
-        connection = original_connect(client.app.state.config.database_path)
-        try:
-            assert connection.execute(
-                "SELECT COUNT(*) FROM sessions WHERE role = 'student' AND subject_id = ?",
-                (student_id,),
-            ).fetchone()[0] == 0
-        finally:
-            connection.close()
-    finally:
-        allow_heartbeat.set()
         student.close()
 
 
@@ -788,14 +733,14 @@ def test_activity_rollover_cannot_race_heartbeat_into_old_activity(
         client,
         admin_headers,
         dashboard["majors"][0]["name"],
-        [("20560002", "Heartbeat Rollover Race", "HEARTROL")],
+        [("20560002", "Heartbeat Rollover Race", fictional_document_number("HEARTROL"))],
     )
     assert imported.status_code == 200, imported.text
     student, login = login_student(
         app,
         student_no="20560002",
         name="Heartbeat Rollover Race",
-        activation_code="HEARTROL",
+        activation_code=fictional_activation_code("HEARTROL"),
     )
     student_id = int(login["student"]["id"])
     original_connect = main_module.connect

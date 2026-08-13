@@ -12,6 +12,9 @@ const studentState = {
   heartbeatInFlight: false,
   boundaryRefreshPending: false,
   serverClockOffset: 0,
+  connectionInterrupted: false,
+  lastBackgroundErrorAt: 0,
+  sessionReloadTimer: null,
 };
 
 const studentEls = {
@@ -85,10 +88,23 @@ function apiErrorDetails(data, status) {
       field: detail.map(validationField).find(Boolean) || null,
     };
   }
-  return {
-    message: typeof detail === "string" ? detail : `请求失败（${status}）`,
-    field: null,
+  if (typeof detail === "string" && detail.trim()) return { message: detail, field: null };
+  const messages = {
+    400: "提交内容格式不正确，请检查后重试",
+    401: "登录会话已失效，请重新核验身份",
+    403: "本场活动当前不可提交，可能尚未开放或已经关闭",
+    404: "当前活动或学生信息不存在，请联系老师核对名单",
+    409: "该选择已提交，或名额刚刚发生变化，请刷新后确认",
+    410: "本场活动已经结束，无法继续提交",
+    413: "提交内容过大，请刷新页面后重试",
+    422: "填写内容未通过校验，请检查学号、姓名和激活码",
+    423: "本场抢选已关闭或暂停，请等待老师通知",
+    428: "活动状态已经变化，页面将重新同步，请稍后再试",
+    429: "操作过于频繁，请稍后再试",
+    500: "服务暂时异常，请稍后重试",
+    503: "当前访问人数较多，请稍后重试",
   };
+  return { message: messages[status] || `请求未完成（${status}），请稍后重试`, field: null };
 }
 
 async function studentApi(path, options = {}) {
@@ -109,9 +125,19 @@ async function studentApi(path, options = {}) {
   ) {
     headers.set("X-Activity-ID", String(studentState.payload.settings.activity_id));
   }
-  const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
+  let response;
+  try {
+    response = await fetch(path, { ...options, headers, credentials: "same-origin" });
+  } catch (_) {
+    const error = new Error("网络连接失败，请检查网络后重试");
+    error.status = 0;
+    throw error;
+  }
   const type = response.headers.get("content-type") || "";
-  const data = type.includes("application/json") ? await response.json() : null;
+  let data = null;
+  if (type.includes("application/json")) {
+    try { data = await response.json(); } catch (_) { data = null; }
+  }
   if (!response.ok) {
     const details = apiErrorDetails(data, response.status);
     const error = new Error(details.message);
@@ -129,6 +155,29 @@ function showStudentMessage(text, kind = "info") {
   studentState.messageTimer = setTimeout(() => {
     studentEls.message.classList.remove("is-visible");
   }, 3300);
+}
+
+function reportStudentConnectionIssue(error) {
+  const now = Date.now();
+  if (studentState.connectionInterrupted && now - studentState.lastBackgroundErrorAt < 10_000) return;
+  studentState.connectionInterrupted = true;
+  studentState.lastBackgroundErrorAt = now;
+  showStudentMessage(error.status === 0 ? "网络连接中断，页面会自动重试" : `${error.message}；页面会自动重试`, "error");
+}
+
+function markStudentConnectionHealthy() {
+  if (!studentState.connectionInterrupted) return;
+  studentState.connectionInterrupted = false;
+  showStudentMessage("连接已恢复，名额和活动状态已同步", "success");
+}
+
+function handleStudentSessionExpired() {
+  if (studentState.sessionReloadTimer) return;
+  clearInterval(studentState.pollTimer);
+  clearInterval(studentState.heartbeatTimer);
+  studentState.csrf = "";
+  showStudentMessage("登录会话已失效，即将返回身份核验页", "error");
+  studentState.sessionReloadTimer = setTimeout(() => window.location.reload(), 1200);
 }
 
 function studentField(payload, key) {
@@ -310,15 +359,14 @@ function startStudentPolling() {
     studentState.pollInFlight = true;
     try {
       const data = await studentApi("/api/student/me");
+      markStudentConnectionHealthy();
       const selectedStillAvailable = data.groups.some((group) => group.id === studentState.selectedGroupId && !group.full);
       if (!selectedStillAvailable) studentState.selectedGroupId = null;
       renderStudentPayload(data);
     } catch (error) {
       if (error.status === 401) {
-        clearInterval(studentState.pollTimer);
-        clearInterval(studentState.heartbeatTimer);
-        window.location.reload();
-      }
+        handleStudentSessionExpired();
+      } else reportStudentConnectionIssue(error);
     } finally {
       studentState.pollInFlight = false;
     }
@@ -328,8 +376,10 @@ function startStudentPolling() {
     studentState.heartbeatInFlight = true;
     try {
       await studentApi("/api/student/heartbeat", { method: "POST", body: JSON.stringify({}) });
+      markStudentConnectionHealthy();
     } catch (error) {
-      if (error.status === 401) window.location.reload();
+      if (error.status === 401) handleStudentSessionExpired();
+      else reportStudentConnectionIssue(error);
     } finally {
       studentState.heartbeatInFlight = false;
     }
@@ -364,9 +414,11 @@ studentEls.loginForm.addEventListener("submit", async (event) => {
   submit.textContent = "正在核验…";
   try {
     const form = new FormData(studentEls.loginForm);
+    const loginPayload = Object.fromEntries(form.entries());
+    loginPayload.activation_code = String(loginPayload.activation_code || "").trim().toUpperCase();
     const data = await studentApi("/api/student/login", {
       method: "POST",
-      body: JSON.stringify(Object.fromEntries(form.entries())),
+      body: JSON.stringify(loginPayload),
     });
     studentState.csrf = data.csrf_token;
     studentState.selectedGroupId = null;
@@ -417,6 +469,10 @@ studentEls.confirmDialog.addEventListener("close", async () => {
   } catch (error) {
     studentState.selectedGroupId = null;
     showStudentMessage(error.message, "error");
+    if (error.status === 401) {
+      handleStudentSessionExpired();
+      return;
+    }
     try {
       const latest = await studentApi("/api/student/me");
       renderStudentPayload(latest);
@@ -429,12 +485,16 @@ studentEls.confirmDialog.addEventListener("close", async () => {
 async function studentLogout() {
   clearInterval(studentState.pollTimer);
   clearInterval(studentState.heartbeatTimer);
+  let reloadDelay = 0;
   try {
     await studentApi("/api/student/logout", { method: "POST", body: JSON.stringify({}) });
-  } catch (_) {
-    // A stale session can still be cleared by reloading.
+  } catch (error) {
+    if (error.status !== 401) {
+      reloadDelay = 900;
+      showStudentMessage(`${error.message}；本机页面仍将退出`, "error");
+    }
   }
-  window.location.reload();
+  setTimeout(() => window.location.reload(), reloadDelay);
 }
 
 document.querySelector("#student-logout").addEventListener("click", studentLogout);
