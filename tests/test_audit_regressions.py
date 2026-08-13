@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 import server.main as main_module
 from server.config import Config
-from server.database import initialize_database
+from server.database import connect, initialize_database
 from server.maintenance import check_database
 
 from .conftest import fictional_activation_code, fictional_document_number
@@ -298,23 +298,52 @@ def test_csv_exports_neutralize_formula_cells(
     formula_name = "=HYPERLINK(\"https://example.invalid\",\"打开\")"
     rows = [
         ["student_no", "name", "major", "activation_code"],
-        ["+20330001", formula_name, major_name, "FORMULA1"],
-        ["-20330002", "@SUM(1,1)", major_name, "FORMULA2"],
+        ["20330001", formula_name, major_name, "FORMULA1"],
+        ["20330002", "@SUM(1,1)", major_name, "FORMULA2"],
     ]
     buffer = io.StringIO()
     csv.writer(buffer, lineterminator="\n").writerows(rows)
     imported = import_students(client, admin_headers, buffer.getvalue())
-    assert imported.status_code == 200, imported.text
+    assert imported.status_code == 400, imported.text
+    assert "姓名包含不支持的字符" in imported.json()["detail"]
+    assert client.get("/api/admin/dashboard").json()["students"] == []
 
-    imported_students = {
-        row["student_no"]: row for row in client.get("/api/admin/dashboard").json()["unselected_students"]
-    }
-    assigned = client.post(
-        "/api/admin/selections",
-        headers=admin_headers,
-        json={"student_id": imported_students["+20330001"]["id"], "group_id": group_id},
-    )
-    assert assigned.status_code == 200, assigned.text
+
+def test_csv_exports_neutralize_legacy_formula_cells(
+    client: TestClient, admin_headers: dict[str, str], app_config
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    major_id = dashboard["majors"][0]["id"]
+    group_id = dashboard["groups"][0]["id"]
+    formula_name = "=HYPERLINK(\"https://example.invalid\",\"打开\")"
+    connection = connect(app_config.database_path)
+    try:
+        now = "2026-08-13T00:00:00+00:00"
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            INSERT INTO students
+                (student_no, name, major_id, activation_hash, activation_ciphertext,
+                 active, created_at, updated_at)
+            VALUES ('+20330001', ?, ?, 'legacy', NULL, 1, ?, ?),
+                   ('-20330002', '@SUM(1,1)', ?, 'legacy', NULL, 1, ?, ?)
+            """,
+            (formula_name, major_id, now, now, major_id, now, now),
+        )
+        selected_id = connection.execute(
+            "SELECT id FROM students WHERE student_no = '+20330001'"
+        ).fetchone()["id"]
+        connection.execute(
+            """
+            INSERT INTO selections
+                (student_id, group_id, selected_at, source, operator)
+            VALUES (?, ?, ?, 'admin', 'legacy-test')
+            """,
+            (selected_id, group_id, now),
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
     activity_params = {"activity_id": dashboard["settings"]["activity_id"]}
     selection_rows = decode_csv(

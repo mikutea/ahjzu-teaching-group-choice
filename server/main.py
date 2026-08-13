@@ -6,7 +6,6 @@ import hashlib
 import hmac
 import io
 import json
-import re
 import secrets
 import sqlite3
 import threading
@@ -24,7 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.table import Table, TableStyleInfo
-from pydantic import BaseModel, Field, ValidationInfo, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Config, PROJECT_ROOT
@@ -48,6 +47,17 @@ from .security import (
     verify_activation_code,
     verify_password,
 )
+from .student_identity import (
+    ACTIVATION_CODE_LENGTH,
+    STUDENT_NAME_MAX_LENGTH,
+    STUDENT_NAME_MIN_LENGTH,
+    STUDENT_NUMBER_MAX_LENGTH,
+    STUDENT_NUMBER_MIN_LENGTH,
+    StudentIdentityError,
+    normalize_activation_code,
+    normalize_student_name,
+    normalize_student_number,
+)
 
 
 WEB_ROOT = PROJECT_ROOT / "web"
@@ -66,15 +76,6 @@ COUNTDOWN_SECONDS = 10
 PRESENCE_FRESH_SECONDS = 35
 HEARTBEAT_WRITE_INTERVAL_SECONDS = 15
 MAX_ADMIN_SESSIONS_PER_USER = 8
-
-STUDENT_NUMBER_PATTERN = re.compile(r"^[A-Za-z0-9_-]{4,32}$")
-STUDENT_NAME_PATTERN = re.compile(
-    r"^[A-Za-z0-9\u00C0-\u024F\u1E00-\u1EFF"
-    r"\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF"
-    r"\U00020000-\U0002FA1F ·•・'’\-‐‑]+$"
-)
-ACTIVATION_CODE_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
-
 
 def session_utc_now() -> str:
     """Wall clock for credential expiry, intentionally separate from event test clocks."""
@@ -221,44 +222,64 @@ class AdminLogin(StrictModel):
 
 
 class StudentLogin(StrictModel):
-    student_no: str = Field(min_length=4, max_length=32)
-    name: str = Field(min_length=1, max_length=80)
-    activation_code: str = Field(min_length=6, max_length=6)
+    student_no: str = Field(
+        min_length=STUDENT_NUMBER_MIN_LENGTH,
+        max_length=STUDENT_NUMBER_MAX_LENGTH,
+    )
+    name: str = Field(
+        min_length=STUDENT_NAME_MIN_LENGTH,
+        max_length=STUDENT_NAME_MAX_LENGTH,
+    )
+    activation_code: str = Field(
+        min_length=ACTIVATION_CODE_LENGTH,
+        max_length=ACTIVATION_CODE_LENGTH,
+    )
 
-    @field_validator("student_no", "name", mode="before")
+    @field_validator("student_no", mode="before")
     @classmethod
-    def strip_values(cls, value: Any, info: ValidationInfo) -> Any:
-        if not isinstance(value, str):
-            return value
-        if any(unicodedata.category(character).startswith("C") for character in value):
-            raise ValueError(f"{info.field_name} 不能包含控制字符")
-        return clean_text(value)
+    def normalize_student_number_field(cls, value: Any) -> str:
+        return normalize_student_number(value)
 
-    @field_validator("student_no")
+    @field_validator("name", mode="before")
     @classmethod
-    def validate_student_number(cls, value: str) -> str:
-        if not STUDENT_NUMBER_PATTERN.fullmatch(value):
-            raise ValueError("学号只能包含英文字母、数字、下划线或连字符")
-        return value
-
-    @field_validator("name")
-    @classmethod
-    def validate_student_name(cls, value: str) -> str:
-        if not STUDENT_NAME_PATTERN.fullmatch(value):
-            raise ValueError("姓名包含不支持的字符")
-        return value
+    def normalize_student_name_field(cls, value: Any) -> str:
+        return normalize_student_name(value)
 
     @field_validator("activation_code", mode="before")
     @classmethod
     def normalize_activation_code(cls, value: Any) -> Any:
+        return normalize_activation_code(value)
+
+
+class StudentLoginRequest(StrictModel):
+    """Safe historical envelope; the endpoint applies the strict shared contract.
+
+    Releases before the shared contract admitted student numbers up to 40
+    characters and arbitrary names up to 80 characters.  Keeping this narrow
+    envelope lets an exact, already-stored legacy identity authenticate without
+    rewriting the student number that binds its encrypted activation code.
+    """
+
+    student_no: str = Field(min_length=1, max_length=40)
+    name: str = Field(min_length=1, max_length=STUDENT_NAME_MAX_LENGTH)
+    activation_code: str = Field(
+        min_length=ACTIVATION_CODE_LENGTH,
+        max_length=ACTIVATION_CODE_LENGTH,
+    )
+
+    @field_validator("student_no", "name", mode="before")
+    @classmethod
+    def normalize_legacy_identity_text(cls, value: Any) -> Any:
         if not isinstance(value, str):
             return value
-        normalized = "".join(
-            unicodedata.normalize("NFKC", value).strip().upper().split()
-        )
-        if not ACTIVATION_CODE_PATTERN.fullmatch(normalized):
-            raise ValueError("个人激活码必须是 6 位英文字母或数字")
-        return normalized
+        if any(unicodedata.category(character).startswith("C") for character in value):
+            raise ValueError("身份信息不能包含控制字符")
+        return clean_text(value)
+
+    @field_validator("activation_code", mode="before")
+    @classmethod
+    def normalize_request_activation_code(cls, value: Any) -> str:
+        return normalize_activation_code(value)
 
 
 class StatusUpdate(StrictModel):
@@ -1178,9 +1199,20 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.close()
 
     @app.post("/api/student/login")
-    def student_login(payload: StudentLogin, request: Request, response: Response):
+    def student_login(
+        payload: StudentLoginRequest, request: Request, response: Response
+    ):
+        strict_payload: StudentLogin | None = None
+        try:
+            strict_payload = StudentLogin.model_validate(payload.model_dump())
+        except ValidationError:
+            strict_payload = None
+
         ip_key = client_key(request, "student-login-ip")
-        account_key = principal_key("student-login-account", payload.student_no)
+        account_key = principal_key(
+            "student-login-account",
+            strict_payload.student_no if strict_payload else payload.student_no,
+        )
         limiter.check(ip_key, limit=500, window_seconds=300)
         limiter.check(account_key, limit=10, window_seconds=300)
         connection = connect(config.database_path)
@@ -1189,22 +1221,78 @@ def create_app(config: Config | None = None) -> FastAPI:
         now_dt = datetime.now(UTC)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
+            exact_candidate = connection.execute(
                 """
-                SELECT id, name, activation_hash, active
+                SELECT id, student_no, name, activation_hash, active
                 FROM students WHERE student_no = ?
                 """,
                 (payload.student_no,),
             ).fetchone()
-            valid = (
-                row
-                and row["active"]
-                and clean_text(row["name"]) == payload.name
-                and verify_activation_code(
-                    config.app_secret, payload.activation_code, row["activation_hash"]
+
+            row = None
+            if exact_candidate is not None:
+                try:
+                    stored_identity_is_current = (
+                        normalize_student_number(exact_candidate["student_no"])
+                        == exact_candidate["student_no"]
+                        and normalize_student_name(exact_candidate["name"])
+                        == exact_candidate["name"]
+                    )
+                except StudentIdentityError:
+                    stored_identity_is_current = False
+                current_identity_match = bool(
+                    stored_identity_is_current
+                    and strict_payload
+                    and exact_candidate["name"] == strict_payload.name
                 )
-            )
-            if not valid:
+                legacy_identity_match = bool(
+                    not stored_identity_is_current
+                    and exact_candidate["name"] == payload.name
+                )
+                if (
+                    exact_candidate["active"]
+                    and (current_identity_match or legacy_identity_match)
+                    and verify_activation_code(
+                        config.app_secret,
+                        payload.activation_code,
+                        exact_candidate["activation_hash"],
+                    )
+                ):
+                    row = exact_candidate
+            elif (
+                strict_payload is not None
+                and strict_payload.student_no != payload.student_no
+            ):
+                canonical_candidate = connection.execute(
+                    """
+                    SELECT id, student_no, name, activation_hash, active
+                    FROM students WHERE student_no = ?
+                    """,
+                    (strict_payload.student_no,),
+                ).fetchone()
+                if canonical_candidate is not None:
+                    try:
+                        canonical_record_is_current = (
+                            normalize_student_number(canonical_candidate["student_no"])
+                            == canonical_candidate["student_no"]
+                            and normalize_student_name(canonical_candidate["name"])
+                            == canonical_candidate["name"]
+                        )
+                    except StudentIdentityError:
+                        canonical_record_is_current = False
+                    if (
+                        canonical_record_is_current
+                        and canonical_candidate["active"]
+                        and canonical_candidate["name"] == strict_payload.name
+                        and verify_activation_code(
+                            config.app_secret,
+                            payload.activation_code,
+                            canonical_candidate["activation_hash"],
+                        )
+                    ):
+                        row = canonical_candidate
+
+            if row is None:
                 raise HTTPException(status_code=401, detail="学号、姓名或激活码不正确")
             student_id = int(row["id"])
             student_data = student_payload_from_connection(connection, student_id)
@@ -2522,11 +2610,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                     ),
                 )
             seen_numbers.add(row.student_no)
-            if (
-                len(row.student_no) > 40
-                or len(row.name) > 80
-                or len(row.major_name) > 80
-            ):
+            if len(row.major_name) > 80:
                 raise HTTPException(
                     status_code=400,
                     detail=f"第 {row.file_index} 个文件第 {row.line_number} 行字段长度超限",

@@ -13,6 +13,12 @@ from typing import Any, Iterable
 import xlrd
 from openpyxl import load_workbook
 
+from .student_identity import (
+    StudentIdentityError,
+    normalize_student_name,
+    normalize_student_number,
+)
+
 
 MAX_XLSX_MEMBERS = 512
 MAX_XLSX_UNCOMPRESSED_BYTES = 16 * 1024 * 1024
@@ -93,6 +99,20 @@ def _cell_text(value: Any) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return _clean_text(str(value))
+
+
+def _identity_cell_text(value: Any) -> str:
+    """Preserve raw text so the shared identity validator sees control chars."""
+
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
 
 
 def _document_cell_text(value: Any) -> str:
@@ -254,25 +274,30 @@ def parse_roster_file(
         values: dict[str, str] = {}
         for key, index in header_indexes.items():
             cell = raw_row[index] if index < len(raw_row) else None
-            values[key] = (
-                _document_cell_text(cell) if key == "document_number" else _cell_text(cell)
-            )
+            if key == "document_number":
+                values[key] = _document_cell_text(cell)
+            elif key in {"student_no", "name"}:
+                values[key] = _identity_cell_text(cell)
+            else:
+                values[key] = _cell_text(cell)
         if not values["student_no"] or not values["name"] or not values["major"]:
             raise RosterParseError(f"第 {row_index} 行必须填写学号、姓名和专业")
         if not values["document_number"]:
             raise RosterParseError(f"第 {row_index} 行必须填写证件号")
         try:
+            student_no = normalize_student_number(values["student_no"])
+            name = normalize_student_name(values["name"])
             activation_code = activation_code_from_document_number(
                 values["document_number"]
             )
-        except RosterParseError as exc:
+        except (RosterParseError, StudentIdentityError) as exc:
             raise RosterParseError(f"第 {row_index} 行{exc}") from exc
         parsed_rows.append(
             ParsedRosterRow(
                 file_index=file_index,
                 line_number=row_index,
-                student_no=values["student_no"],
-                name=values["name"],
+                student_no=student_no,
+                name=name,
                 major_name=values["major"],
                 activation_code=activation_code,
             )

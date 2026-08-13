@@ -1,18 +1,27 @@
 "use strict";
 
-const STUDENT_NO_PATTERN = /^[A-Za-z0-9_-]{4,32}$/;
-const STUDENT_NAME_PATTERN = /^[\p{Script=Han}\p{Script=Latin} ·•・'’\-‐‑]{1,80}$/u;
+const STUDENT_NO_MAX_INPUT_LENGTH = 40;
+const STUDENT_NAME_MAX_INPUT_LENGTH = 80;
+const CONTROL_CHARACTER_PATTERN = /\p{C}/u;
 const ACTIVATION_CODE_PATTERN = /^[A-Z0-9]{6}$/;
 
 function normalizeCompatibilityText(value) {
   return String(value ?? "").normalize("NFKC");
 }
 
+function trimUnicodeSeparators(value) {
+  return String(value ?? "").replace(/^\p{Z}+|\p{Z}+$/gu, "");
+}
+
 function normalizeStudentLoginPayload(values) {
   return {
-    student_no: normalizeCompatibilityText(values.student_no).trim(),
-    name: normalizeCompatibilityText(values.name).trim().replace(/\s+/gu, " "),
-    activation_code: normalizeCompatibilityText(values.activation_code).trim().toUpperCase(),
+    // Preserve identity characters for an exact legacy-record fallback. The
+    // server applies NFKC before matching every current-contract identity.
+    student_no: trimUnicodeSeparators(values.student_no),
+    name: trimUnicodeSeparators(values.name).replace(/\p{Z}+/gu, " "),
+    activation_code: trimUnicodeSeparators(normalizeCompatibilityText(values.activation_code))
+      .replace(/\p{Z}+/gu, "")
+      .toUpperCase(),
   };
 }
 
@@ -20,16 +29,22 @@ function validateStudentLoginPayload(payload) {
   const errors = {};
   if (!payload.student_no) {
     errors.student_no = "请输入学号";
-  } else if (!STUDENT_NO_PATTERN.test(payload.student_no)) {
-    errors.student_no = "学号须为 4–32 位字母、数字、短横线或下划线";
+  } else if (CONTROL_CHARACTER_PATTERN.test(payload.student_no)) {
+    errors.student_no = "学号不能包含换行或其他控制字符";
+  } else if (Array.from(payload.student_no).length > STUDENT_NO_MAX_INPUT_LENGTH) {
+    errors.student_no = `学号不能超过 ${STUDENT_NO_MAX_INPUT_LENGTH} 个字符`;
   }
   if (!payload.name) {
     errors.name = "请输入姓名";
-  } else if (!STUDENT_NAME_PATTERN.test(payload.name)) {
-    errors.name = "姓名只能包含中文、拉丁字母、空格、间隔点、撇号或连字符";
+  } else if (CONTROL_CHARACTER_PATTERN.test(payload.name)) {
+    errors.name = "姓名不能包含换行或其他控制字符";
+  } else if (Array.from(payload.name).length > STUDENT_NAME_MAX_INPUT_LENGTH) {
+    errors.name = `姓名不能超过 ${STUDENT_NAME_MAX_INPUT_LENGTH} 个字符`;
   }
   if (!payload.activation_code) {
     errors.activation_code = "请输入个人激活码";
+  } else if (CONTROL_CHARACTER_PATTERN.test(payload.activation_code)) {
+    errors.activation_code = "个人激活码不能包含控制字符";
   } else if (!ACTIVATION_CODE_PATTERN.test(payload.activation_code)) {
     errors.activation_code = "个人激活码须为证件号后 6 位字母或数字";
   }
@@ -111,6 +126,14 @@ const studentLoginFields = {
   },
 };
 
+// The HTML keeps a strict progressive-enhancement hint, while the running app
+// accepts the bounded historical envelope and lets the server decide whether
+// an unusual identity is an exact legacy record or an invalid new request.
+studentLoginFields.student_no.input.minLength = 1;
+studentLoginFields.student_no.input.maxLength = STUDENT_NO_MAX_INPUT_LENGTH;
+studentLoginFields.student_no.input.removeAttribute("pattern");
+studentLoginFields.name.input.removeAttribute("pattern");
+
 const studentFieldLabels = {
   student_no: "学号",
   name: "姓名",
@@ -164,8 +187,8 @@ function translateValidationIssue(issue) {
   if (type === "json_invalid") return "提交内容无法识别，请刷新页面后重试";
   if (type.startsWith("value_error")) {
     const fieldMessages = {
-      student_no: "学号须为 4–32 位字母、数字、短横线或下划线",
-      name: "姓名只能包含中文、拉丁字母、空格、间隔点、撇号或连字符",
+      student_no: "学号格式不符合要求，请核对名单中的原始学号",
+      name: "姓名格式不符合要求，请核对名单中的原始姓名",
       activation_code: "个人激活码须为证件号后 6 位字母或数字",
     };
     return fieldMessages[field] || `${label}内容不符合要求`;
