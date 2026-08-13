@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,17 @@ from server.main import create_app
 
 
 TEST_ADMIN_PASSWORD = "Local-Test-Only-Password!"
+
+
+def fictional_document_number(seed: str) -> str:
+    """Return a deterministic, obviously synthetic H+17 registry identifier."""
+
+    digits = str(int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16))
+    return "H" + digits[-17:].zfill(17)
+
+
+def fictional_activation_code(seed: str) -> str:
+    return fictional_document_number(seed)[-6:]
 
 
 @pytest.fixture()

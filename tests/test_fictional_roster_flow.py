@@ -12,6 +12,8 @@ from fastapi.testclient import TestClient
 from server.database import connect
 from server.maintenance import check_database
 
+from .conftest import fictional_document_number
+
 
 ROSTER_PATH = (
     Path(__file__).resolve().parents[1]
@@ -39,7 +41,20 @@ def load_fictional_roster() -> tuple[bytes, list[dict[str, str]]]:
         "城乡规划": 60,
         "风景园林": 60,
     }
-    return content, rows
+    # The checked-in fixture intentionally carries no identity number.  Add only
+    # deterministic H-prefixed synthetic values in memory for API validation.
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=["学号", "姓名", "专业", "证件号"])
+    writer.writeheader()
+    enriched_rows: list[dict[str, str]] = []
+    for row in rows:
+        enriched = {
+            **row,
+            "证件号": fictional_document_number(row["学号"]),
+        }
+        enriched_rows.append(enriched)
+        writer.writerow(enriched)
+    return output.getvalue().encode("utf-8-sig"), enriched_rows
 
 
 def assert_all_ok(label: str, responses) -> None:
@@ -117,7 +132,7 @@ def test_fictional_roster_full_concurrent_multi_activity_flow(
     imported = client.post(
         "/api/admin/students/import",
         headers=admin_headers,
-        params={"mode": "merge", "regenerate_existing": "false"},
+        params={"mode": "merge"},
         files={
             "file": (
                 ROSTER_PATH.name,
@@ -131,19 +146,14 @@ def test_fictional_roster_full_concurrent_multi_activity_flow(
     assert result["created"] == 180
     assert result["updated"] == 0
     assert result["deactivated"] == 0
-    assert len(result["credentials"]) == 180
+    assert "credentials" not in result
+    assert '"activation_code":' not in imported.text
+    assert not any(row["证件号"] in imported.text for row in roster)
 
-    credentials = {
-        credential["student_no"]: credential
-        for credential in result["credentials"]
-    }
-    assert set(credentials) == {row["学号"] for row in roster}
-    codes = {
-        credential["activation_code"]
-        for credential in result["credentials"]
-    }
+    codes = {row["证件号"][-6:] for row in roster}
     assert len(codes) == 180
-    assert all(re.fullmatch(r"[23456789A-HJ-NP-Z]{8}", code) for code in codes)
+    assert codes == {row["证件号"][-6:] for row in roster}
+    assert all(re.fullmatch(r"\d{6}", code) for code in codes)
     assert_activation_codes_are_not_plaintext(app_config.database_path, codes)
 
     ready_dashboard = client.get("/api/admin/dashboard").json()
@@ -173,7 +183,7 @@ def test_fictional_roster_full_concurrent_multi_activity_flow(
                 json={
                     "student_no": row["学号"],
                     "name": row["姓名"],
-                    "activation_code": credentials[row["学号"]]["activation_code"],
+                    "activation_code": row["证件号"][-6:],
                 },
             )
 

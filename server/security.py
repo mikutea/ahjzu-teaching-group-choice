@@ -63,11 +63,6 @@ def verify_activation_code(app_secret: str, code: str, expected: str) -> bool:
     return hmac.compare_digest(activation_code_hash(app_secret, code), expected)
 
 
-def new_activation_code() -> str:
-    alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
-    return "".join(secrets.choice(alphabet) for _ in range(8))
-
-
 def _activation_encryption_key(app_secret: str) -> bytes:
     return hashlib.sha256(
         b"teaching-choice/activation-code/aes-gcm/v1\0" + app_secret.encode("utf-8")
