@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 from fastapi.testclient import TestClient
 
+from server import main as main_module
 from server.database import connect, utc_now
-from server.main import StudentLogin
+from server.main import RateLimiter, StudentLogin
 from server.roster import parse_roster_file
 from server.security import (
     activation_code_hash,
@@ -27,7 +30,13 @@ def roster_csv(rows: list[tuple[str, str, str, str]]) -> bytes:
 
 
 def insert_login_identity(
-    *, app_config, client: TestClient, student_no: str, name: str, code: str
+    *,
+    app_config,
+    client: TestClient,
+    student_no: str,
+    name: str,
+    code: str,
+    active: bool = True,
 ) -> None:
     major_id = client.get("/api/admin/dashboard").json()["majors"][0]["id"]
     connection = connect(app_config.database_path)
@@ -38,7 +47,7 @@ def insert_login_identity(
             INSERT INTO students
                 (student_no, name, major_id, activation_hash,
                  activation_ciphertext, active, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 student_no,
@@ -46,6 +55,7 @@ def insert_login_identity(
                 major_id,
                 activation_code_hash(app_config.app_secret, code),
                 encrypt_activation_code(app_config.app_secret, student_no, code),
+                int(active),
                 now,
                 now,
             ),
@@ -53,6 +63,14 @@ def insert_login_identity(
         connection.commit()
     finally:
         connection.close()
+
+
+def endpoint_closure_value(app, path: str, name: str):
+    endpoint = next(route.endpoint for route in app.routes if route.path == path)
+    closure = dict(
+        zip(endpoint.__code__.co_freevars, endpoint.__closure__ or (), strict=True)
+    )
+    return closure[name].cell_contents
 
 
 @pytest.mark.parametrize(
@@ -774,12 +792,22 @@ def test_colliding_raw_and_canonical_students_have_independent_login_limits(
         )
         assert tenth_legacy_attempt.status_code == 401, tenth_legacy_attempt.text
 
-        still_limited = student_client.post(
+        blocked_legacy_login = student_client.post(
             "/api/student/login",
             json={
                 "student_no": legacy_number,
                 "name": name,
                 "activation_code": legacy_code,
+            },
+        )
+        assert blocked_legacy_login.status_code == 429, blocked_legacy_login.text
+
+        still_limited = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": legacy_number,
+                "name": name,
+                "activation_code": "Q1W2E3",
             },
         )
         assert still_limited.status_code == 429, still_limited.text
@@ -830,10 +858,667 @@ def test_unresolved_nfkc_aliases_cannot_reveal_account_existence_via_rate_limit(
             json={
                 "student_no": probe_number,
                 "name": name,
-                "activation_code": correct_code,
+                "activation_code": "R4T5Y6",
             },
         )
         assert nfkc_probe.status_code == 429, nfkc_probe.text
+
+
+def test_failure_recording_is_atomic_at_the_tenth_eleventh_boundary():
+    limiter = RateLimiter()
+    family_key = "student-family"
+
+    def record_attempt() -> bool:
+        return limiter.record_failure(
+            family_key, limit=10, window_seconds=300
+        )
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        prior_limit_states = list(executor.map(lambda _: record_attempt(), range(20)))
+
+    assert prior_limit_states.count(False) == 10
+    assert prior_limit_states.count(True) == 10
+
+
+def test_saturated_family_still_records_a_fresh_identity_failure():
+    family_limiter = RateLimiter()
+    identity_limiter = RateLimiter(max_keys=4_096, evict_oldest=False)
+    family_key = "student-family"
+    id_key = "student-id"
+    for _ in range(10):
+        family_limiter.record_failure(
+            family_key, limit=10, window_seconds=300
+        )
+
+    family_was_limited = family_limiter.record_failure(
+        family_key, limit=10, window_seconds=300
+    )
+    id_was_limited = identity_limiter.record_failure(
+        id_key, limit=10, window_seconds=300
+    )
+    assert family_was_limited is True
+    assert id_was_limited is False
+    assert identity_limiter.is_limited(id_key, limit=1, window_seconds=300)
+
+
+def test_global_capacity_eviction_cannot_remove_a_student_identity_lock():
+    identity_limiter = RateLimiter(max_keys=2, evict_oldest=False)
+    id_key = "student-id"
+    for _ in range(10):
+        identity_limiter.record_failure(
+            id_key, limit=10, window_seconds=300
+        )
+
+    for index in range(20):
+        identity_limiter.record_failure(
+            f"other-student-{index}", limit=10, window_seconds=300
+        )
+
+    assert identity_limiter.is_limited(id_key, limit=10, window_seconds=300)
+
+
+def test_no_evict_capacity_fails_closed_without_removing_an_existing_lock():
+    limiter = RateLimiter(max_keys=1, evict_oldest=False)
+    protected_key = "protected"
+    assert limiter.record_failure(
+        protected_key, limit=1, window_seconds=300
+    ) is False
+
+    assert limiter.record_failure(
+        "new-key", limit=10, window_seconds=300
+    ) is True
+    assert limiter.is_limited(protected_key, limit=1, window_seconds=300)
+    assert limiter.is_limited("new-key", limit=10, window_seconds=300)
+
+
+def test_no_evict_capacity_recovers_after_the_failure_window(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    now = [1_000.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: now[0])
+    limiter = RateLimiter(max_keys=1, evict_oldest=False)
+    assert limiter.record_failure("expired", limit=10, window_seconds=300) is False
+    assert limiter.record_failure("blocked", limit=10, window_seconds=300) is True
+
+    now[0] += 301
+
+    assert limiter.record_failure("fresh", limit=10, window_seconds=300) is False
+
+
+def test_capacity_pressure_has_the_same_observable_effect_for_missing_and_resolved():
+    def remaining_sentinels(*, resolved: bool) -> int:
+        family_limiter = RateLimiter(max_keys=3)
+        identity_limiter = RateLimiter(max_keys=3, evict_oldest=False)
+        sentinels = tuple(f"sentinel-{index}" for index in range(3))
+        for sentinel in sentinels:
+            family_limiter.record_failure(
+                sentinel, limit=1, window_seconds=300
+            )
+        family_limiter.record_failure(
+            "candidate-family", limit=10, window_seconds=300
+        )
+        if resolved:
+            identity_limiter.record_failure(
+                "candidate-id", limit=10, window_seconds=300
+            )
+        return sum(
+            family_limiter.is_limited(
+                sentinel, limit=1, window_seconds=300
+            )
+            for sentinel in sentinels
+        )
+
+    assert remaining_sentinels(resolved=False) == remaining_sentinels(resolved=True) == 2
+
+
+def test_rate_limit_namespaces_do_not_evict_or_block_each_other():
+    student_ip = RateLimiter(max_keys=1)
+    admin_ip = RateLimiter(max_keys=1)
+    admin_account = RateLimiter(max_keys=1)
+    activation_reveal = RateLimiter(max_keys=1)
+    protected = (
+        (admin_ip, "admin-ip"),
+        (admin_account, "admin-account"),
+        (activation_reveal, "admin-id"),
+    )
+    for limiter, key in protected:
+        assert limiter.record_failure(key, limit=1, window_seconds=300) is False
+
+    assert student_ip.record_failure(
+        "student-ip-one", limit=1, window_seconds=300
+    ) is False
+    assert student_ip.record_failure(
+        "student-ip-two", limit=1, window_seconds=300
+    ) is False
+
+    for limiter, key in protected:
+        assert limiter.is_limited(key, limit=1, window_seconds=300)
+
+
+@pytest.mark.parametrize(
+    "limiter_name",
+    ["student_ip", "admin_ip", "admin_account", "activation_reveal"],
+)
+def test_external_key_capacity_uses_isolated_lru_without_global_login_dos(
+    limiter_name: str,
+):
+    limiters = {
+        "student_ip": RateLimiter(max_keys=1),
+        "admin_ip": RateLimiter(max_keys=1),
+        "admin_account": RateLimiter(max_keys=1),
+        "activation_reveal": RateLimiter(max_keys=1),
+    }
+    target = limiters[limiter_name]
+    assert target.record_failure("attacker-key", limit=10, window_seconds=300) is False
+    assert target.record_failure("legitimate-new-key", limit=10, window_seconds=300) is False
+
+    for other_name, other in limiters.items():
+        if other_name != limiter_name:
+            assert other.record_failure(
+                "legitimate-new-key", limit=10, window_seconds=300
+            ) is False
+
+
+def test_family_lru_eviction_cannot_bypass_a_saturated_identity_lock(
+    app,
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    student_no = "LRULOCK2026"
+    name = "家庭桶逐出保护学生"
+    correct_code = "A1B2C3"
+    insert_login_identity(
+        app_config=app_config,
+        client=client,
+        student_no=student_no,
+        name=name,
+        code=correct_code,
+    )
+    connection = connect(app_config.database_path)
+    try:
+        student_id = connection.execute(
+            "SELECT id FROM students WHERE student_no = ?", (student_no,)
+        ).fetchone()["id"]
+    finally:
+        connection.close()
+
+    family_limiter = endpoint_closure_value(
+        app, "/api/student/login", "student_family_limiter"
+    )
+    identity_limiter = endpoint_closure_value(
+        app, "/api/student/login", "student_id_limiter"
+    )
+    principal_key = endpoint_closure_value(
+        app, "/api/student/login", "student_login_principal_key"
+    )
+    family_key = principal_key("student-login-account-family", student_no)
+    id_key = principal_key("student-login-account-id", str(student_id))
+    for _ in range(10):
+        family_limiter.record_failure(
+            family_key, limit=10, window_seconds=300
+        )
+        identity_limiter.record_failure(id_key, limit=10, window_seconds=300)
+    for index in range(10_000):
+        family_limiter.record_failure(
+            f"other-family-{index}", limit=10, window_seconds=300
+        )
+    assert not family_limiter.is_limited(
+        family_key, limit=10, window_seconds=300
+    )
+    assert identity_limiter.is_limited(id_key, limit=10, window_seconds=300)
+
+    monkeypatch.setattr(
+        main_module,
+        "verify_activation_code",
+        lambda *_args, **_kwargs: pytest.fail("locked identity reached credential check"),
+    )
+    response = client.post(
+        "/api/student/login",
+        json={
+            "student_no": student_no,
+            "name": name,
+            "activation_code": correct_code,
+        },
+    )
+    assert response.status_code == 401, response.text
+
+
+def test_identity_capacity_skips_verification_without_evicting_existing_locks(
+    app,
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    student_no = "CAPLOCK2026"
+    name = "身份桶容量保护学生"
+    correct_code = "A1B2C3"
+    insert_login_identity(
+        app_config=app_config,
+        client=client,
+        student_no=student_no,
+        name=name,
+        code=correct_code,
+    )
+    identity_limiter = endpoint_closure_value(
+        app, "/api/student/login", "student_id_limiter"
+    )
+    protected_key = "protected-student-id"
+    for _ in range(10):
+        identity_limiter.record_failure(
+            protected_key, limit=10, window_seconds=300
+        )
+    for index in range(4_095):
+        assert identity_limiter.record_failure(
+            f"other-student-id-{index}", limit=10, window_seconds=300
+        ) is False
+
+    monkeypatch.setattr(
+        main_module,
+        "verify_activation_code",
+        lambda *_args, **_kwargs: pytest.fail("capacity lock reached credential check"),
+    )
+    response = client.post(
+        "/api/student/login",
+        json={
+            "student_no": student_no,
+            "name": name,
+            "activation_code": correct_code,
+        },
+    )
+    assert response.status_code == 401, response.text
+    assert identity_limiter.is_limited(
+        protected_key, limit=10, window_seconds=300
+    )
+
+
+@pytest.mark.parametrize("reverse_direction", [False, True])
+@pytest.mark.parametrize("account_exists", [False, True])
+def test_only_pre_nfkc_legacy_account_and_missing_account_share_alias_limits(
+    app,
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    account_exists: bool,
+    reverse_direction: bool,
+):
+    canonical_number = "LEGACY2026"
+    legacy_number = "ＬＥＧＡＣＹ２０２６"
+    name = "旧格式枚举保护学生"
+    correct_code = "A1B2C3"
+    if account_exists:
+        insert_login_identity(
+            app_config=app_config,
+            client=client,
+            student_no=legacy_number,
+            name=name,
+            code=correct_code,
+        )
+    first_number, probe_number = (
+        (legacy_number, canonical_number)
+        if reverse_direction
+        else (canonical_number, legacy_number)
+    )
+
+    with TestClient(app) as student_client:
+        for _ in range(10):
+            rejected = student_client.post(
+                "/api/student/login",
+                json={
+                    "student_no": first_number,
+                    "name": name,
+                    "activation_code": "Q1W2E3",
+                },
+            )
+            assert rejected.status_code == 401, rejected.text
+
+        probe = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": probe_number,
+                "name": name,
+                "activation_code": "R4T5Y6",
+            },
+        )
+        assert probe.status_code == 429, probe.text
+
+
+def test_success_does_not_count_or_clear_pre_nfkc_family_failures(
+    app,
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+):
+    canonical_number = "SUCCESS2026"
+    legacy_number = "ＳＵＣＣＥＳＳ２０２６"
+    name = "成功路径保护学生"
+    correct_code = "A1B2C3"
+    insert_login_identity(
+        app_config=app_config,
+        client=client,
+        student_no=legacy_number,
+        name=name,
+        code=correct_code,
+    )
+
+    with TestClient(app) as student_client:
+        for _ in range(9):
+            rejected = student_client.post(
+                "/api/student/login",
+                json={
+                    "student_no": canonical_number,
+                    "name": name,
+                    "activation_code": "Q1W2E3",
+                },
+            )
+            assert rejected.status_code == 401, rejected.text
+
+        successful_login = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": legacy_number,
+                "name": name,
+                "activation_code": correct_code,
+            },
+        )
+        assert successful_login.status_code == 200, successful_login.text
+
+        tenth_failure = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": canonical_number,
+                "name": name,
+                "activation_code": "Q1W2E3",
+            },
+        )
+        assert tenth_failure.status_code == 401, tenth_failure.text
+
+        successful_after_limit = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": legacy_number,
+                "name": name,
+                "activation_code": correct_code,
+            },
+        )
+        assert successful_after_limit.status_code == 200, successful_after_limit.text
+
+        still_limited_failure = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": legacy_number,
+                "name": name,
+                "activation_code": "Q1W2E3",
+            },
+        )
+        assert still_limited_failure.status_code == 429, still_limited_failure.text
+
+
+def test_family_only_limit_does_not_block_valid_sibling_credentials(
+    app,
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+):
+    canonical_number = "SIBLING2026"
+    legacy_number = "ＳＩＢＬＩＮＧ２０２６"
+    name = "别名兄弟账号保护学生"
+    canonical_code = "A1B2C3"
+    legacy_code = "Z9Y8X7"
+    insert_login_identity(
+        app_config=app_config,
+        client=client,
+        student_no=canonical_number,
+        name=name,
+        code=canonical_code,
+    )
+    insert_login_identity(
+        app_config=app_config,
+        client=client,
+        student_no=legacy_number,
+        name=name,
+        code=legacy_code,
+    )
+
+    with TestClient(app) as student_client:
+        for _ in range(10):
+            rejected = student_client.post(
+                "/api/student/login",
+                json={
+                    "student_no": canonical_number,
+                    "name": name,
+                    "activation_code": "Q1W2E3",
+                },
+            )
+            assert rejected.status_code == 401, rejected.text
+
+        sibling_login = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": legacy_number,
+                "name": name,
+                "activation_code": legacy_code,
+            },
+        )
+        assert sibling_login.status_code == 200, sibling_login.text
+
+        family_failure_remains_limited = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": legacy_number,
+                "name": name,
+                "activation_code": "Q1W2E3",
+            },
+        )
+        assert family_failure_remains_limited.status_code == 429
+
+
+@pytest.mark.parametrize("failure_kind", ["wrong_code", "wrong_name", "inactive"])
+def test_resolved_legacy_authentication_failures_fill_the_nfkc_family_limit(
+    app,
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    failure_kind: str,
+):
+    canonical_number = "FAILURE2026"
+    legacy_number = "ＦＡＩＬＵＲＥ２０２６"
+    name = "失败路径保护学生"
+    correct_code = "A1B2C3"
+    insert_login_identity(
+        app_config=app_config,
+        client=client,
+        student_no=legacy_number,
+        name=name,
+        code=correct_code,
+        active=failure_kind != "inactive",
+    )
+    attempted_name = "=Wrong Legacy Name" if failure_kind == "wrong_name" else name
+    attempted_code = "Q1W2E3" if failure_kind == "wrong_code" else correct_code
+
+    with TestClient(app) as student_client:
+        for _ in range(10):
+            rejected = student_client.post(
+                "/api/student/login",
+                json={
+                    "student_no": legacy_number,
+                    "name": attempted_name,
+                    "activation_code": attempted_code,
+                },
+            )
+            assert rejected.status_code == 401, rejected.text
+
+        canonical_probe = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": canonical_number,
+                "name": name,
+                "activation_code": correct_code,
+            },
+        )
+        assert canonical_probe.status_code == 429, canonical_probe.text
+
+
+def test_non_strict_legacy_success_preserves_raw_family_failures(
+    app,
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+):
+    student_no = "LEGACY.RAW.2026"
+    case_distinct_number = "legacy.raw.2026"
+    name = "=Legacy Student"
+    correct_code = "A1B2C3"
+    insert_login_identity(
+        app_config=app_config,
+        client=client,
+        student_no=student_no,
+        name=name,
+        code=correct_code,
+    )
+
+    with TestClient(app) as student_client:
+        for _ in range(9):
+            rejected = student_client.post(
+                "/api/student/login",
+                json={
+                    "student_no": student_no,
+                    "name": name,
+                    "activation_code": "Q1W2E3",
+                },
+            )
+            assert rejected.status_code == 401, rejected.text
+
+        successful_login = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": student_no,
+                "name": name,
+                "activation_code": correct_code,
+            },
+        )
+        assert successful_login.status_code == 200, successful_login.text
+
+        distinct_raw_probe = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": case_distinct_number,
+                "name": name,
+                "activation_code": correct_code,
+            },
+        )
+        assert distinct_raw_probe.status_code == 401, distinct_raw_probe.text
+
+        tenth_failure = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": student_no,
+                "name": name,
+                "activation_code": "Q1W2E3",
+            },
+        )
+        assert tenth_failure.status_code == 401, tenth_failure.text
+
+        successful_after_limit = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": student_no,
+                "name": name,
+                "activation_code": correct_code,
+            },
+        )
+        assert successful_after_limit.status_code == 200, successful_after_limit.text
+
+        still_limited_failure = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": student_no,
+                "name": name,
+                "activation_code": "Q1W2E3",
+            },
+        )
+        assert still_limited_failure.status_code == 429, still_limited_failure.text
+
+
+def test_failed_session_commit_does_not_clear_the_identity_limit(
+    app,
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    student_no = "COMMIT2026"
+    name = "提交失败保护学生"
+    correct_code = "A1B2C3"
+    insert_login_identity(
+        app_config=app_config,
+        client=client,
+        student_no=student_no,
+        name=name,
+        code=correct_code,
+    )
+
+    with TestClient(app) as student_client:
+        for _ in range(9):
+            rejected = student_client.post(
+                "/api/student/login",
+                json={
+                    "student_no": student_no,
+                    "name": name,
+                    "activation_code": "Q1W2E3",
+                },
+            )
+            assert rejected.status_code == 401, rejected.text
+
+        original_connect = main_module.connect
+
+        class CommitFailureConnection:
+            def __init__(self):
+                self.connection = original_connect(app_config.database_path)
+
+            def __getattr__(self, name: str):
+                return getattr(self.connection, name)
+
+            def commit(self) -> None:
+                raise RuntimeError("synthetic session commit failure")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                main_module,
+                "connect",
+                lambda _database_path: CommitFailureConnection(),
+            )
+            with pytest.raises(RuntimeError, match="synthetic session commit failure"):
+                student_client.post(
+                    "/api/student/login",
+                    json={
+                        "student_no": student_no,
+                        "name": name,
+                        "activation_code": correct_code,
+                    },
+                )
+
+        tenth_failure = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": student_no,
+                "name": name,
+                "activation_code": "Q1W2E3",
+            },
+        )
+        assert tenth_failure.status_code == 401, tenth_failure.text
+
+        still_locked = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": student_no,
+                "name": name,
+                "activation_code": correct_code,
+            },
+        )
+        assert still_locked.status_code == 429, still_locked.text
 
 
 @pytest.mark.parametrize("account_exists", [False, True])

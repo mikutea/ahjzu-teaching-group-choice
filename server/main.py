@@ -401,34 +401,81 @@ class Identity:
 
 
 class RateLimiter:
-    def __init__(self, *, max_keys: int = 10_000) -> None:
+    def __init__(
+        self, *, max_keys: int | None = 10_000, evict_oldest: bool = True
+    ) -> None:
+        if max_keys is not None and max_keys < 1:
+            raise ValueError("max_keys must be positive or None")
         self._events: dict[str, list[float]] = {}
         self._lock = threading.Lock()
         self._max_keys = max_keys
+        self._evict_oldest = evict_oldest
         self._last_cleanup = 0.0
 
-    def check(self, key: str, *, limit: int, window_seconds: int) -> None:
+    def _events_for_key(self, key: str, cutoff: float) -> list[float]:
+        events = [event for event in self._events.get(key, []) if event >= cutoff]
+        if events:
+            self._events[key] = events
+        else:
+            self._events.pop(key, None)
+        return events
+
+    def _cleanup(self, now: float, cutoff: float) -> None:
+        if now - self._last_cleanup < 60:
+            return
+        self._events = {
+            existing_key: [event for event in events if event >= cutoff]
+            for existing_key, events in self._events.items()
+            if any(event >= cutoff for event in events)
+        }
+        self._last_cleanup = now
+
+    def is_limited(self, key: str, *, limit: int, window_seconds: int) -> bool:
         now = time.monotonic()
         cutoff = now - window_seconds
         with self._lock:
-            if now - self._last_cleanup >= 60:
-                self._events = {
-                    existing_key: [event for event in events if event >= cutoff]
-                    for existing_key, events in self._events.items()
-                    if any(event >= cutoff for event in events)
-                }
-                self._last_cleanup = now
-            if key not in self._events and len(self._events) >= self._max_keys:
+            self._cleanup(now, cutoff)
+            events = self._events_for_key(key, cutoff)
+            if len(events) >= limit:
+                return True
+            return bool(
+                not events
+                and self._max_keys is not None
+                and not self._evict_oldest
+                and len(self._events) >= self._max_keys
+            )
+
+    def record_failure(
+        self, key: str, *, limit: int, window_seconds: int
+    ) -> bool:
+        """Atomically record one failure and return whether it was already limited."""
+
+        now = time.monotonic()
+        cutoff = now - window_seconds
+        with self._lock:
+            self._cleanup(now, cutoff)
+            events = self._events_for_key(key, cutoff)
+            if len(events) >= limit:
+                return True
+            if (
+                self._max_keys is not None
+                and key not in self._events
+                and len(self._events) >= self._max_keys
+            ):
+                if not self._evict_oldest:
+                    return True
                 oldest_key = min(
                     self._events,
                     key=lambda existing_key: self._events[existing_key][-1],
                 )
                 self._events.pop(oldest_key, None)
-            events = [event for event in self._events.get(key, []) if event >= cutoff]
-            if len(events) >= limit:
-                raise HTTPException(status_code=429, detail="尝试次数过多，请稍后再试")
             events.append(now)
             self._events[key] = events
+            return False
+
+    def check(self, key: str, *, limit: int, window_seconds: int) -> None:
+        if self.record_failure(key, limit=limit, window_seconds=window_seconds):
+            raise HTTPException(status_code=429, detail="尝试次数过多，请稍后再试")
 
     def clear(self, key: str) -> None:
         with self._lock:
@@ -438,7 +485,12 @@ class RateLimiter:
 def create_app(config: Config | None = None) -> FastAPI:
     config = config or Config.from_env()
     initialize_database(config)
-    limiter = RateLimiter()
+    student_ip_limiter = RateLimiter()
+    student_family_limiter = RateLimiter()
+    student_id_limiter = RateLimiter(max_keys=4_096, evict_oldest=False)
+    admin_ip_limiter = RateLimiter()
+    admin_account_limiter = RateLimiter()
+    activation_reveal_limiter = RateLimiter()
     app = FastAPI(
         title="教学组抢选系统",
         docs_url=None if config.environment == "production" else "/api/docs",
@@ -1219,7 +1271,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             strict_payload = None
 
         ip_key = client_key(request, "student-login-ip")
-        limiter.check(ip_key, limit=500, window_seconds=300)
+        student_ip_limiter.check(ip_key, limit=500, window_seconds=300)
         connection = connect(config.database_path)
         token = new_session_token()
         csrf_token = new_csrf_token()
@@ -1249,22 +1301,32 @@ def create_app(config: Config | None = None) -> FastAPI:
                 ).fetchone()
 
             resolved_candidate = exact_candidate or canonical_candidate
-            account_key = student_login_principal_key(
-                (
-                    "student-login-account-id"
-                    if resolved_candidate is not None
-                    else "student-login-account-unresolved"
-                ),
-                str(resolved_candidate["id"])
-                if resolved_candidate is not None
-                else (
-                    strict_payload.student_no
-                    if strict_payload is not None
-                    else payload.student_no
-                ),
+            try:
+                family_identity = normalize_student_number(payload.student_no)
+            except StudentIdentityError:
+                family_identity = payload.student_no
+            family_key = student_login_principal_key(
+                "student-login-account-family", family_identity
             )
-            limiter.check(account_key, limit=10, window_seconds=300)
-
+            id_key = None
+            if resolved_candidate is not None:
+                id_key = student_login_principal_key(
+                    "student-login-account-id", str(resolved_candidate["id"])
+                )
+                if student_id_limiter.is_limited(
+                    id_key, limit=10, window_seconds=300
+                ):
+                    family_was_limited = student_family_limiter.record_failure(
+                        family_key, limit=10, window_seconds=300
+                    )
+                    raise HTTPException(
+                        status_code=429 if family_was_limited else 401,
+                        detail=(
+                            "尝试次数过多，请稍后再试"
+                            if family_was_limited
+                            else "学号、姓名或激活码不正确"
+                        ),
+                    )
             row = None
             if exact_candidate is not None:
                 try:
@@ -1318,6 +1380,17 @@ def create_app(config: Config | None = None) -> FastAPI:
                     row = canonical_candidate
 
             if row is None:
+                family_was_limited = student_family_limiter.record_failure(
+                    family_key, limit=10, window_seconds=300
+                )
+                if id_key is not None:
+                    student_id_limiter.record_failure(
+                        id_key, limit=10, window_seconds=300
+                    )
+                if family_was_limited:
+                    raise HTTPException(
+                        status_code=429, detail="尝试次数过多，请稍后再试"
+                    )
                 raise HTTPException(status_code=401, detail="学号、姓名或激活码不正确")
             student_id = int(row["id"])
             student_data = student_payload_from_connection(connection, student_id)
@@ -1335,7 +1408,8 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise
         finally:
             connection.close()
-        limiter.clear(account_key)
+        if id_key is not None:
+            student_id_limiter.clear(id_key)
         set_session_cookie(response, "student", token)
         return {"csrf_token": csrf_token, **student_data}
 
@@ -1427,8 +1501,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         username = payload.username.strip()
         ip_key = client_key(request, "admin-login-ip")
         account_key = principal_key("admin-login-account", username)
-        limiter.check(ip_key, limit=50, window_seconds=300)
-        limiter.check(account_key, limit=10, window_seconds=300)
+        admin_ip_limiter.check(ip_key, limit=50, window_seconds=300)
+        admin_account_limiter.check(account_key, limit=10, window_seconds=300)
         read_connection = connect(config.database_path)
         try:
             candidate = read_connection.execute(
@@ -1469,7 +1543,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise
         finally:
             connection.close()
-        limiter.clear(account_key)
+        admin_account_limiter.clear(account_key)
         set_session_cookie(response, "admin", token)
         return {"csrf_token": csrf_token, "username": username}
 
@@ -2874,7 +2948,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/api/admin/students/{student_id}/activation-code/reveal")
     def reveal_student_activation_code(student_id: int, request: Request):
         identity = require_session(request, "admin", csrf=True)
-        limiter.check(
+        activation_reveal_limiter.check(
             principal_key("activation-code-reveal", str(identity.subject_id)),
             limit=500,
             window_seconds=300,
