@@ -1209,12 +1209,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             strict_payload = None
 
         ip_key = client_key(request, "student-login-ip")
-        account_key = principal_key(
-            "student-login-account",
-            strict_payload.student_no if strict_payload else payload.student_no,
-        )
         limiter.check(ip_key, limit=500, window_seconds=300)
-        limiter.check(account_key, limit=10, window_seconds=300)
         connection = connect(config.database_path)
         token = new_session_token()
         csrf_token = new_csrf_token()
@@ -1228,6 +1223,33 @@ def create_app(config: Config | None = None) -> FastAPI:
                 """,
                 (payload.student_no,),
             ).fetchone()
+
+            canonical_candidate = None
+            if (
+                exact_candidate is None
+                and strict_payload is not None
+                and strict_payload.student_no != payload.student_no
+            ):
+                canonical_candidate = connection.execute(
+                    """
+                    SELECT id, student_no, name, activation_hash, active
+                    FROM students WHERE student_no = ?
+                    """,
+                    (strict_payload.student_no,),
+                ).fetchone()
+
+            resolved_candidate = exact_candidate or canonical_candidate
+            account_key = principal_key(
+                (
+                    "student-login-account-id"
+                    if resolved_candidate is not None
+                    else "student-login-account-unresolved"
+                ),
+                str(resolved_candidate["id"])
+                if resolved_candidate is not None
+                else payload.student_no,
+            )
+            limiter.check(account_key, limit=10, window_seconds=300)
 
             row = None
             if exact_candidate is not None:
@@ -1259,38 +1281,27 @@ def create_app(config: Config | None = None) -> FastAPI:
                     )
                 ):
                     row = exact_candidate
-            elif (
-                strict_payload is not None
-                and strict_payload.student_no != payload.student_no
-            ):
-                canonical_candidate = connection.execute(
-                    """
-                    SELECT id, student_no, name, activation_hash, active
-                    FROM students WHERE student_no = ?
-                    """,
-                    (strict_payload.student_no,),
-                ).fetchone()
-                if canonical_candidate is not None:
-                    try:
-                        canonical_record_is_current = (
-                            normalize_student_number(canonical_candidate["student_no"])
-                            == canonical_candidate["student_no"]
-                            and normalize_student_name(canonical_candidate["name"])
-                            == canonical_candidate["name"]
-                        )
-                    except StudentIdentityError:
-                        canonical_record_is_current = False
-                    if (
-                        canonical_record_is_current
-                        and canonical_candidate["active"]
-                        and canonical_candidate["name"] == strict_payload.name
-                        and verify_activation_code(
-                            config.app_secret,
-                            payload.activation_code,
-                            canonical_candidate["activation_hash"],
-                        )
-                    ):
-                        row = canonical_candidate
+            elif canonical_candidate is not None:
+                try:
+                    canonical_record_is_current = (
+                        normalize_student_number(canonical_candidate["student_no"])
+                        == canonical_candidate["student_no"]
+                        and normalize_student_name(canonical_candidate["name"])
+                        == canonical_candidate["name"]
+                    )
+                except StudentIdentityError:
+                    canonical_record_is_current = False
+                if (
+                    canonical_record_is_current
+                    and canonical_candidate["active"]
+                    and canonical_candidate["name"] == strict_payload.name
+                    and verify_activation_code(
+                        config.app_secret,
+                        payload.activation_code,
+                        canonical_candidate["activation_hash"],
+                    )
+                ):
+                    row = canonical_candidate
 
             if row is None:
                 raise HTTPException(status_code=401, detail="学号、姓名或激活码不正确")
@@ -2621,6 +2632,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         updated = 0
         deactivated = 0
         rotated = 0
+        seen_student_ids: set[int] = set()
         try:
             connection.execute("BEGIN IMMEDIATE")
             require_expected_activity(request, connection, identity=identity)
@@ -2631,6 +2643,27 @@ def create_app(config: Config | None = None) -> FastAPI:
                     "SELECT id, name FROM majors WHERE active = 1"
                 ).fetchall()
             }
+            stored_students = connection.execute(
+                """
+                SELECT id, student_no, name, major_id, activation_hash,
+                       activation_ciphertext, active
+                FROM students
+                """
+            ).fetchall()
+            students_by_number = {
+                candidate["student_no"]: candidate for candidate in stored_students
+            }
+            students_by_canonical_number: dict[str, list[sqlite3.Row]] = {}
+            for candidate in stored_students:
+                try:
+                    canonical_number = normalize_student_number(
+                        candidate["student_no"]
+                    )
+                except StudentIdentityError:
+                    continue
+                students_by_canonical_number.setdefault(canonical_number, []).append(
+                    candidate
+                )
             for row in rows:
                 student_no = row.student_no
                 name = row.name
@@ -2644,15 +2677,23 @@ def create_app(config: Config | None = None) -> FastAPI:
                             f"“{major_name}”不存在或已停用"
                         ),
                     )
-                existing = connection.execute(
-                    """
-                    SELECT id, name, major_id, activation_hash,
-                           activation_ciphertext, active
-                    FROM students WHERE student_no = ?
-                    """,
-                    (student_no,),
-                ).fetchone()
+                existing = students_by_number.get(row.source_student_no)
+                if existing is None:
+                    legacy_candidates = students_by_canonical_number.get(
+                        student_no, []
+                    )
+                    if len(legacy_candidates) > 1:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"学号 {student_no} 对应多条旧格式学生记录；"
+                                "请先人工核对并清理重复记录"
+                            ),
+                        )
+                    if legacy_candidates:
+                        existing = legacy_candidates[0]
                 if existing:
+                    stored_student_no = existing["student_no"]
                     active_selection = connection.execute(
                         "SELECT 1 FROM selections WHERE student_id = ? AND revoked_at IS NULL",
                         (existing["id"],),
@@ -2681,22 +2722,29 @@ def create_app(config: Config | None = None) -> FastAPI:
                             name,
                             major_map[major_name],
                             activation_code_hash(config.app_secret, code),
-                            encrypt_activation_code(config.app_secret, student_no, code),
+                            encrypt_activation_code(
+                                config.app_secret, stored_student_no, code
+                            ),
                             utc_now(),
                             existing["id"],
                         ),
                     )
                     if credential_changed:
                         rotated += 1
-                    if credential_changed or profile_changed or access_changed:
+                    if (
+                        credential_changed
+                        or profile_changed
+                        or access_changed
+                    ):
                         connection.execute(
                             "DELETE FROM sessions WHERE role = 'student' AND subject_id = ?",
                             (existing["id"],),
                         )
                     updated += 1
+                    seen_student_ids.add(int(existing["id"]))
                 else:
                     now = utc_now()
-                    connection.execute(
+                    cursor = connection.execute(
                         """
                         INSERT INTO students
                             (student_no, name, major_id, activation_hash,
@@ -2713,6 +2761,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                             now,
                         ),
                     )
+                    seen_student_ids.add(int(cursor.lastrowid))
                     created += 1
 
             if mode == "sync":
@@ -2721,7 +2770,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                     for row in connection.execute(
                         "SELECT id, student_no, name FROM students WHERE active = 1"
                     ).fetchall()
-                    if row["student_no"] not in seen_numbers
+                    if int(row["id"]) not in seen_student_ids
                 ]
                 blocked = []
                 for missing in missing_students:

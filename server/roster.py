@@ -67,6 +67,7 @@ class RosterParseError(ValueError):
 class ParsedRosterRow:
     file_index: int
     line_number: int
+    source_student_no: str
     student_no: str
     name: str
     major_name: str
@@ -296,6 +297,7 @@ def parse_roster_file(
             ParsedRosterRow(
                 file_index=file_index,
                 line_number=row_index,
+                source_student_no=values["student_no"].strip(),
                 student_no=student_no,
                 name=name,
                 major_name=values["major"],

@@ -6,7 +6,11 @@ from fastapi.testclient import TestClient
 from server.database import connect, utc_now
 from server.main import StudentLogin
 from server.roster import parse_roster_file
-from server.security import activation_code_hash, encrypt_activation_code
+from server.security import (
+    activation_code_hash,
+    decrypt_activation_code,
+    encrypt_activation_code,
+)
 from server.student_identity import (
     StudentIdentityError,
     normalize_student_name,
@@ -304,6 +308,452 @@ def test_exact_raw_legacy_identity_wins_over_canonical_sibling_collision(
         )
         assert exact_login.status_code == 200, exact_login.text
         assert exact_login.json()["student"]["student_no"] == fullwidth_number
+
+
+def test_merge_updates_pre_nfkc_student_without_creating_a_canonical_sibling(
+    app,
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    major = dashboard["majors"][0]
+    legacy_number = "ＡＢＣＤ"
+    canonical_number = "ABCD"
+    old_name = "旧格式迁移学生"
+    new_name = "旧格式更名学生"
+    old_code = "A1B2C3"
+    connection = connect(app_config.database_path)
+    try:
+        now = utc_now()
+        cursor = connection.execute(
+            """
+            INSERT INTO students
+                (student_no, name, major_id, activation_hash,
+                 activation_ciphertext, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                legacy_number,
+                old_name,
+                major["id"],
+                activation_code_hash(app_config.app_secret, old_code),
+                encrypt_activation_code(
+                    app_config.app_secret, legacy_number, old_code
+                ),
+                now,
+                now,
+            ),
+        )
+        legacy_id = int(cursor.lastrowid)
+        connection.commit()
+    finally:
+        connection.close()
+
+    student_client = TestClient(app)
+    try:
+        assert student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": legacy_number,
+                "name": old_name,
+                "activation_code": old_code,
+            },
+        ).status_code == 200
+
+        document_number = fictional_document_number("pre-nfkc-rekey")
+        new_code = document_number[-6:]
+        imported = client.post(
+            "/api/admin/students/import",
+            headers=admin_headers,
+            files={
+                "file": (
+                    "pre-nfkc.csv",
+                    roster_csv(
+                        [(legacy_number, new_name, major["name"], document_number)]
+                    ),
+                    "text/csv",
+                )
+            },
+        )
+        assert imported.status_code == 200, imported.text
+        assert imported.json()["created"] == 0
+        assert imported.json()["updated"] == 1
+        assert imported.json()["rotated"] == 1
+        assert student_client.get("/api/student/me").status_code == 401
+
+        connection = connect(app_config.database_path)
+        try:
+            rows = connection.execute(
+                """
+                SELECT id, student_no, name, activation_hash, activation_ciphertext
+                FROM students WHERE student_no IN (?, ?)
+                """,
+                (legacy_number, canonical_number),
+            ).fetchall()
+        finally:
+            connection.close()
+        assert len(rows) == 1
+        migrated = rows[0]
+        assert int(migrated["id"]) == legacy_id
+        assert migrated["student_no"] == legacy_number
+        assert migrated["name"] == new_name
+        assert decrypt_activation_code(
+            app_config.app_secret,
+            legacy_number,
+            migrated["activation_ciphertext"],
+        ) == new_code
+        assert old_code != new_code
+
+        assert student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": legacy_number,
+                "name": old_name,
+                "activation_code": old_code,
+            },
+        ).status_code == 401
+        migrated_login = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": legacy_number,
+                "name": new_name,
+                "activation_code": new_code,
+            },
+        )
+        assert migrated_login.status_code == 200, migrated_login.text
+        assert migrated_login.json()["student"]["student_no"] == legacy_number
+    finally:
+        student_client.close()
+
+
+def test_merge_rejects_ambiguous_nfkc_equivalents_atomically(
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+):
+    major = client.get("/api/admin/dashboard").json()["majors"][0]
+    canonical_number = "ABCD"
+    legacy_number = "ＡＢＣＤ"
+    third_variant = "𝐀𝐁𝐂𝐃"
+    connection = connect(app_config.database_path)
+    try:
+        now = utc_now()
+        for student_no, name, code in (
+            (canonical_number, "规范记录", "A1B2C3"),
+            (legacy_number, "旧格式记录", "Z9Y8X7"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO students
+                    (student_no, name, major_id, activation_hash,
+                     activation_ciphertext, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    student_no,
+                    name,
+                    major["id"],
+                    activation_code_hash(app_config.app_secret, code),
+                    encrypt_activation_code(app_config.app_secret, student_no, code),
+                    now,
+                    now,
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    rejected = client.post(
+        "/api/admin/students/import",
+        headers=admin_headers,
+        files={
+            "file": (
+                "ambiguous.csv",
+                roster_csv(
+                    [
+                        (
+                            third_variant,
+                            "本次更名",
+                            major["name"],
+                            fictional_document_number("ambiguous-nfkc"),
+                        )
+                    ]
+                ),
+                "text/csv",
+            )
+        },
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert "多条旧格式学生记录" in rejected.json()["detail"]
+
+    connection = connect(app_config.database_path)
+    try:
+        rows = connection.execute(
+            "SELECT student_no, name, activation_hash FROM students ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert [(row["student_no"], row["name"]) for row in rows] == [
+        (canonical_number, "规范记录"),
+        (legacy_number, "旧格式记录"),
+    ]
+
+
+def test_sync_keeps_resolved_pre_nfkc_student_active(
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+):
+    major = client.get("/api/admin/dashboard").json()["majors"][0]
+    legacy_number = "ＳＹＮＣ２０２６"
+    name = "同步旧格式学生"
+    old_code = "A1B2C3"
+    connection = connect(app_config.database_path)
+    try:
+        now = utc_now()
+        cursor = connection.execute(
+            """
+            INSERT INTO students
+                (student_no, name, major_id, activation_hash,
+                 activation_ciphertext, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                legacy_number,
+                name,
+                major["id"],
+                activation_code_hash(app_config.app_secret, old_code),
+                encrypt_activation_code(
+                    app_config.app_secret, legacy_number, old_code
+                ),
+                now,
+                now,
+            ),
+        )
+        student_id = int(cursor.lastrowid)
+        connection.commit()
+    finally:
+        connection.close()
+
+    document_number = fictional_document_number("sync-pre-nfkc")
+    imported = client.post(
+        "/api/admin/students/import",
+        headers=admin_headers,
+        params={"mode": "sync"},
+        files={
+            "file": (
+                "sync-pre-nfkc.csv",
+                roster_csv(
+                    [(legacy_number, name, major["name"], document_number)]
+                ),
+                "text/csv",
+            )
+        },
+    )
+    assert imported.status_code == 200, imported.text
+    assert imported.json()["updated"] == 1
+    assert imported.json()["deactivated"] == 0
+
+    connection = connect(app_config.database_path)
+    try:
+        stored = connection.execute(
+            "SELECT id, student_no, active FROM students"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert [(int(row["id"]), row["student_no"], int(row["active"])) for row in stored] == [
+        (student_id, legacy_number, 1)
+    ]
+
+
+def test_selected_legacy_student_major_change_rolls_back_entire_reimport(
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    old_major, new_major = dashboard["majors"][:2]
+    group = dashboard["groups"][0]
+    legacy_number = "ＳＥＬ２０２６"
+    old_name = "已选旧格式学生"
+    old_code = "A1B2C3"
+    connection = connect(app_config.database_path)
+    try:
+        now = utc_now()
+        cursor = connection.execute(
+            """
+            INSERT INTO students
+                (student_no, name, major_id, activation_hash,
+                 activation_ciphertext, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                legacy_number,
+                old_name,
+                old_major["id"],
+                activation_code_hash(app_config.app_secret, old_code),
+                encrypt_activation_code(
+                    app_config.app_secret, legacy_number, old_code
+                ),
+                now,
+                now,
+            ),
+        )
+        student_id = int(cursor.lastrowid)
+        connection.execute(
+            """
+            INSERT INTO selections
+                (student_id, group_id, selected_at, source, operator)
+            VALUES (?, ?, ?, 'admin', 'legacy-regression')
+            """,
+            (student_id, group["id"], now),
+        )
+        before = tuple(
+            connection.execute(
+                """
+                SELECT student_no, name, major_id, activation_hash,
+                       activation_ciphertext, active
+                FROM students WHERE id = ?
+                """,
+                (student_id,),
+            ).fetchone()
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    rejected = client.post(
+        "/api/admin/students/import",
+        headers=admin_headers,
+        files={
+            "file": (
+                "selected-legacy.csv",
+                roster_csv(
+                    [
+                        (
+                            legacy_number,
+                            "试图更名学生",
+                            new_major["name"],
+                            fictional_document_number("selected-legacy-change"),
+                        )
+                    ]
+                ),
+                "text/csv",
+            )
+        },
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert "已有选择" in rejected.json()["detail"]
+
+    connection = connect(app_config.database_path)
+    try:
+        after = tuple(
+            connection.execute(
+                """
+                SELECT student_no, name, major_id, activation_hash,
+                       activation_ciphertext, active
+                FROM students WHERE id = ?
+                """,
+                (student_id,),
+            ).fetchone()
+        )
+        active_selection = connection.execute(
+            """
+            SELECT COUNT(*) FROM selections
+            WHERE student_id = ? AND revoked_at IS NULL
+            """,
+            (student_id,),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert after == before
+    assert active_selection == 1
+
+
+def test_colliding_raw_and_canonical_students_have_independent_login_limits(
+    app,
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+):
+    major_id = client.get("/api/admin/dashboard").json()["majors"][0]["id"]
+    canonical_number = "ABCD"
+    legacy_number = "ＡＢＣＤ"
+    name = "限流隔离学生"
+    canonical_code = "A1B2C3"
+    legacy_code = "Z9Y8X7"
+    connection = connect(app_config.database_path)
+    try:
+        now = utc_now()
+        for student_no, activation_code in (
+            (canonical_number, canonical_code),
+            (legacy_number, legacy_code),
+        ):
+            connection.execute(
+                """
+                INSERT INTO students
+                    (student_no, name, major_id, activation_hash,
+                     activation_ciphertext, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    student_no,
+                    name,
+                    major_id,
+                    activation_code_hash(app_config.app_secret, activation_code),
+                    encrypt_activation_code(
+                        app_config.app_secret, student_no, activation_code
+                    ),
+                    now,
+                    now,
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with TestClient(app) as student_client:
+        for _ in range(9):
+            rejected = student_client.post(
+                "/api/student/login",
+                json={
+                    "student_no": legacy_number,
+                    "name": name,
+                    "activation_code": "Q1W2E3",
+                },
+            )
+            assert rejected.status_code == 401, rejected.text
+
+        canonical_login = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": canonical_number,
+                "name": name,
+                "activation_code": canonical_code,
+            },
+        )
+        assert canonical_login.status_code == 200, canonical_login.text
+
+        tenth_legacy_attempt = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": legacy_number,
+                "name": name,
+                "activation_code": "Q1W2E3",
+            },
+        )
+        assert tenth_legacy_attempt.status_code == 401, tenth_legacy_attempt.text
+
+        still_limited = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": legacy_number,
+                "name": name,
+                "activation_code": legacy_code,
+            },
+        )
+        assert still_limited.status_code == 429, still_limited.text
 
 
 def test_safe_legacy_envelope_does_not_reveal_account_existence(
