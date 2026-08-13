@@ -6,11 +6,11 @@ import hashlib
 import hmac
 import io
 import json
-import re
 import secrets
 import sqlite3
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from ipaddress import ip_address
@@ -32,12 +32,12 @@ from .database import (
     initialize_database,
     utc_now,
 )
+from .roster import RosterParseError, parse_roster_files
 from .security import (
     activation_code_hash,
     decrypt_activation_code,
     encrypt_activation_code,
     hash_password,
-    new_activation_code,
     new_csrf_token,
     new_session_token,
     session_token_hash,
@@ -50,12 +50,12 @@ WEB_ROOT = PROJECT_ROOT / "web"
 BRAND_ROOT = PROJECT_ROOT / "assets" / "brand"
 ADMIN_COOKIE = "tg_admin_session"
 STUDENT_COOKIE = "tg_student_session"
-MAX_CSV_FILE_BYTES = 1_048_576
+MAX_ROSTER_FILE_BYTES = 1_048_576
 MAX_IMPORT_BODY_BYTES = 1_250_000
+MAX_IMPORT_FILES = 12
 MAX_ROSTER_ROWS = 2_000
 MAX_CONCURRENT_IMPORTS = 4
 IMPORT_BODY_TIMEOUT_SECONDS = 20
-ACTIVATION_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 FIXED_ORGANIZATION_NAME = "安徽建筑大学 · 建筑与空间规划学院"
 FIXED_OWNER_NAME = "Mikutea"
 COUNTDOWN_SECONDS = 10
@@ -212,10 +212,17 @@ class StudentLogin(StrictModel):
     name: str = Field(min_length=1, max_length=80)
     activation_code: str = Field(min_length=4, max_length=64)
 
-    @field_validator("student_no", "name", "activation_code", mode="before")
+    @field_validator("student_no", "name", mode="before")
     @classmethod
     def strip_values(cls, value: Any) -> Any:
         return clean_text(value) if isinstance(value, str) else value
+
+    @field_validator("activation_code", mode="before")
+    @classmethod
+    def normalize_activation_code(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return "".join(unicodedata.normalize("NFKC", value).strip().upper().split())
 
 
 class StatusUpdate(StrictModel):
@@ -568,6 +575,15 @@ def create_app(config: Config | None = None) -> FastAPI:
             return "countdown"
         return "open"
 
+    def student_status_message(phase: str) -> str:
+        messages = {
+            "waiting": "学生登录已开放，抢选尚未开始。",
+            "countdown": "学生登录已开放，统一倒计时进行中，请等待开抢。",
+            "open": "抢选进行中，学生仍可登录并提交选择。",
+            "closed": "本场抢选已结束，学生仍可登录查看选择结果。",
+        }
+        return messages.get(phase, "学生仍可登录查看当前活动状态。")
+
     def ensure_closed(connection: sqlite3.Connection) -> None:
         status = current_activity(connection)["status"]
         if status != "closed":
@@ -605,6 +621,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             """
         ).fetchone()
         server_now = utc_now()
+        phase = activity_phase(row, server_now=server_now)
         return {
             "activity_id": row["activity_id"],
             "activity_code": row["activity_code"],
@@ -613,7 +630,9 @@ def create_app(config: Config | None = None) -> FastAPI:
             "organization_name": FIXED_ORGANIZATION_NAME,
             "owner_name": FIXED_OWNER_NAME,
             "status": row["activity_status"],
-            "phase": activity_phase(row, server_now=server_now),
+            "phase": phase,
+            "student_login_allowed": True,
+            "status_message": student_status_message(phase),
             "server_now": server_now,
             "selection_opens_at": row["selection_opens_at"],
             "public_base_url": row["public_base_url"],
@@ -793,6 +812,8 @@ def create_app(config: Config | None = None) -> FastAPI:
             "server_now": settings["server_now"],
             "selection_opens_at": settings["selection_opens_at"],
             "phase": settings["phase"],
+            "student_login_allowed": settings["student_login_allowed"],
+            "status_message": settings["status_message"],
             "student": {
                 "id": student["id"],
                 "student_no": student["student_no"],
@@ -961,6 +982,24 @@ def create_app(config: Config | None = None) -> FastAPI:
         finally:
             connection.close()
 
+    @app.get("/api/public/status")
+    def public_status() -> dict[str, Any]:
+        connection = connect(config.database_path)
+        try:
+            connection.execute("BEGIN")
+            settings = setting_dict(connection)
+            return {
+                "activity_id": settings["activity_id"],
+                "status": settings["status"],
+                "phase": settings["phase"],
+                "server_now": settings["server_now"],
+                "selection_opens_at": settings["selection_opens_at"],
+                "student_login_allowed": settings["student_login_allowed"],
+                "status_message": settings["status_message"],
+            }
+        finally:
+            connection.close()
+
     @app.post("/api/student/login")
     def student_login(payload: StudentLogin, request: Request, response: Response):
         ip_key = client_key(request, "student-login-ip")
@@ -1059,6 +1098,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "server_now": settings["server_now"],
                 "selection_opens_at": settings["selection_opens_at"],
                 "phase": settings["phase"],
+                "student_login_allowed": settings["student_login_allowed"],
+                "status_message": settings["status_message"],
             }
         except Exception:
             connection.rollback()
@@ -2151,79 +2192,71 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/api/admin/students/import")
     async def import_students(
         request: Request,
-        file: Annotated[UploadFile, File(description="UTF-8 或 GB18030 CSV")],
+        file: Annotated[
+            UploadFile | None,
+            File(description="兼容旧客户端的单个 CSV、XLS 或 XLSX 名单"),
+        ] = None,
+        files: Annotated[
+            list[UploadFile] | None,
+            File(description="可重复提交的 CSV、XLS 或 XLSX 名单集合"),
+        ] = None,
         mode: Literal["merge", "sync"] = "merge",
         regenerate_existing: bool = False,
     ):
         identity = require_session(request, "admin", csrf=True)
-        content = await file.read(MAX_CSV_FILE_BYTES + 1)
-        if len(content) > MAX_CSV_FILE_BYTES:
-            raise HTTPException(status_code=413, detail="CSV 文件不能超过 1 MB")
-        text: str
-        try:
-            text = content.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            try:
-                text = content.decode("gb18030")
-            except UnicodeDecodeError as exc:
-                raise HTTPException(status_code=400, detail="CSV 编码需为 UTF-8 或 GB18030") from exc
-        try:
-            csv_rows = list(csv.reader(io.StringIO(text)))
-        except csv.Error as exc:
-            raise HTTPException(status_code=400, detail="CSV 格式无法解析") from exc
-        if not csv_rows:
-            raise HTTPException(status_code=400, detail="CSV 缺少表头")
-        aliases = {
-            "student_no": ("student_no", "学号"),
-            "name": ("name", "姓名"),
-            "major": ("major", "专业"),
-            "activation_code": ("activation_code", "激活码"),
-        }
-        alias_lookup = {
-            alias.casefold(): key for key, values in aliases.items() for alias in values
-        }
-        header_indexes: dict[str, int] = {}
-        for index, raw_header in enumerate(csv_rows[0]):
-            header = clean_text(raw_header).casefold()
-            key = alias_lookup.get(header)
-            if not key:
-                continue
-            if key in header_indexes:
-                raise HTTPException(status_code=400, detail=f"CSV 表头“{raw_header}”重复")
-            header_indexes[key] = index
-        missing_headers = [
-            aliases[key][-1]
-            for key in ("student_no", "name", "major")
-            if key not in header_indexes
-        ]
-        if missing_headers:
+        uploads = ([file] if file is not None else []) + list(files or [])
+        if not uploads:
+            raise HTTPException(status_code=400, detail="请至少上传一个名单文件")
+        if len(uploads) > MAX_IMPORT_FILES:
             raise HTTPException(
-                status_code=400,
-                detail="CSV 缺少必要表头：" + "、".join(missing_headers),
+                status_code=413,
+                detail=f"一次最多上传 {MAX_IMPORT_FILES} 个名单文件",
             )
 
-        rows: list[tuple[int, dict[str, str]]] = []
-        for line_number, raw_row in enumerate(csv_rows[1:], start=2):
-            if not any(clean_text(value) for value in raw_row):
-                continue
-            if len(raw_row) > len(csv_rows[0]) and any(
-                clean_text(value) for value in raw_row[len(csv_rows[0]) :]
-            ):
-                raise HTTPException(status_code=400, detail=f"第 {line_number} 行列数超过表头")
-            parsed: dict[str, str] = {}
-            for key, index in header_indexes.items():
-                parsed[key] = clean_text(raw_row[index]) if index < len(raw_row) else ""
-            rows.append((line_number, parsed))
-        if not rows:
-            raise HTTPException(status_code=400, detail="CSV 没有学生记录")
+        upload_data: list[tuple[str, bytes]] = []
+        try:
+            for upload in uploads:
+                content = await upload.read(MAX_ROSTER_FILE_BYTES + 1)
+                if len(content) > MAX_ROSTER_FILE_BYTES:
+                    raise HTTPException(status_code=413, detail="单个名单文件不能超过 1 MB")
+                upload_data.append((upload.filename or "upload", content))
+        finally:
+            for upload in uploads:
+                await upload.close()
+        try:
+            rows = parse_roster_files(upload_data)
+        except RosterParseError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            upload_data.clear()
         if len(rows) > MAX_ROSTER_ROWS:
             raise HTTPException(
                 status_code=413,
                 detail=f"一次最多导入 {MAX_ROSTER_ROWS} 名学生",
             )
 
+        seen_numbers: set[str] = set()
+        for row in rows:
+            if row.student_no in seen_numbers:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"第 {row.file_index} 个文件第 {row.line_number} 行的学号"
+                        "在本次名单中重复"
+                    ),
+                )
+            seen_numbers.add(row.student_no)
+            if (
+                len(row.student_no) > 40
+                or len(row.name) > 80
+                or len(row.major_name) > 80
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"第 {row.file_index} 个文件第 {row.line_number} 行字段长度超限",
+                )
+
         connection = connect(config.database_path)
-        generated: list[dict[str, str]] = []
         created = 0
         updated = 0
         deactivated = 0
@@ -2238,37 +2271,25 @@ def create_app(config: Config | None = None) -> FastAPI:
                     "SELECT id, name FROM majors WHERE active = 1"
                 ).fetchall()
             }
-            seen_numbers: set[str] = set()
-            for line_number, row in rows:
-                student_no = row.get("student_no", "")
-                name = row.get("name", "")
-                major_name = row.get("major", "")
-                supplied_code = row.get("activation_code", "").upper()
-                if not student_no or not name or not major_name:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"第 {line_number} 行必须填写学号、姓名和专业",
-                    )
-                if student_no in seen_numbers:
-                    raise HTTPException(status_code=400, detail=f"学号 {student_no} 在文件中重复")
-                seen_numbers.add(student_no)
-                if len(student_no) > 40 or len(name) > 80 or len(major_name) > 80:
-                    raise HTTPException(status_code=400, detail=f"第 {line_number} 行字段长度超限")
-                if supplied_code and not ACTIVATION_CODE_PATTERN.fullmatch(supplied_code):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"第 {line_number} 行激活码需为 8–64 位字母、数字、下划线或连字符；"
-                            "建议留空由系统生成"
-                        ),
-                    )
+            for row in rows:
+                student_no = row.student_no
+                name = row.name
+                major_name = row.major_name
+                code = row.activation_code
                 if major_name not in major_map:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"第 {line_number} 行的专业“{major_name}”不存在或已停用",
+                        detail=(
+                            f"第 {row.file_index} 个文件第 {row.line_number} 行的专业"
+                            f"“{major_name}”不存在或已停用"
+                        ),
                     )
                 existing = connection.execute(
-                    "SELECT id, name, major_id, active FROM students WHERE student_no = ?",
+                    """
+                    SELECT id, name, major_id, activation_hash,
+                           activation_ciphertext, active
+                    FROM students WHERE student_no = ?
+                    """,
                     (student_no,),
                 ).fetchone()
                 if existing:
@@ -2285,47 +2306,35 @@ def create_app(config: Config | None = None) -> FastAPI:
                         clean_text(existing["name"]) != name
                         or int(existing["major_id"]) != int(major_map[major_name])
                     )
-                    code = (
-                        new_activation_code()
-                        if regenerate_existing or not existing["active"]
-                        else supplied_code
+                    credential_changed = not verify_activation_code(
+                        config.app_secret, code, existing["activation_hash"]
                     )
-                    if code:
-                        connection.execute(
-                            """
-                            UPDATE students SET name = ?, major_id = ?, activation_hash = ?,
-                                                activation_ciphertext = ?,
-                                                active = 1, updated_at = ?
-                            WHERE id = ?
-                            """,
-                            (
-                                name,
-                                major_map[major_name],
-                                activation_code_hash(config.app_secret, code),
-                                encrypt_activation_code(
-                                    config.app_secret, student_no, code
-                                ),
-                                utc_now(),
-                                existing["id"],
-                            ),
-                        )
+                    access_changed = not bool(existing["active"])
+                    connection.execute(
+                        """
+                        UPDATE students SET name = ?, major_id = ?, activation_hash = ?,
+                                            activation_ciphertext = ?,
+                                            active = 1, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            name,
+                            major_map[major_name],
+                            activation_code_hash(config.app_secret, code),
+                            encrypt_activation_code(config.app_secret, student_no, code),
+                            utc_now(),
+                            existing["id"],
+                        ),
+                    )
+                    if credential_changed:
                         rotated += 1
-                    else:
-                        connection.execute(
-                            """
-                            UPDATE students SET name = ?, major_id = ?, active = 1, updated_at = ?
-                            WHERE id = ?
-                            """,
-                            (name, major_map[major_name], utc_now(), existing["id"]),
-                        )
-                    if code or profile_changed:
+                    if credential_changed or profile_changed or access_changed:
                         connection.execute(
                             "DELETE FROM sessions WHERE role = 'student' AND subject_id = ?",
                             (existing["id"],),
                         )
                     updated += 1
                 else:
-                    code = supplied_code or new_activation_code()
                     now = utc_now()
                     connection.execute(
                         """
@@ -2345,15 +2354,6 @@ def create_app(config: Config | None = None) -> FastAPI:
                         ),
                     )
                     created += 1
-                if code:
-                    generated.append(
-                        {
-                            "student_no": student_no,
-                            "name": name,
-                            "major": major_name,
-                            "activation_code": code,
-                        }
-                    )
 
             if mode == "sync":
                 missing_students = [
@@ -2401,7 +2401,9 @@ def create_app(config: Config | None = None) -> FastAPI:
                     "updated": updated,
                     "deactivated": deactivated,
                     "rotated": rotated,
-                    "credential_rows": len(generated),
+                    "file_count": len(uploads),
+                    "row_count": len(rows),
+                    "credential_source": "document_number_suffix",
                 },
             )
             connection.commit()
@@ -2415,7 +2417,9 @@ def create_app(config: Config | None = None) -> FastAPI:
             "updated": updated,
             "deactivated": deactivated,
             "rotated": rotated,
-            "credentials": generated,
+            "file_count": len(uploads),
+            "row_count": len(rows),
+            "activation_code_policy": "normalized_document_number_last_6",
         }
 
     @app.post("/api/admin/students/{student_id}/activation-code")
@@ -2426,53 +2430,18 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.execute("BEGIN IMMEDIATE")
             require_expected_activity(request, connection, identity=identity)
             student = connection.execute(
-                """
-                SELECT s.id, s.student_no, s.name, s.active, m.name AS major_name
-                FROM students s JOIN majors m ON m.id = s.major_id
-                WHERE s.id = ?
-                """,
+                "SELECT id FROM students WHERE id = ?",
                 (student_id,),
             ).fetchone()
             if not student:
                 raise HTTPException(status_code=404, detail="学生不存在")
-            if not student["active"]:
-                raise HTTPException(status_code=409, detail="学生已停用，请先通过名单重新启用")
-            code = new_activation_code()
-            connection.execute(
-                """
-                UPDATE students
-                SET activation_hash = ?, activation_ciphertext = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    activation_code_hash(config.app_secret, code),
-                    encrypt_activation_code(config.app_secret, student["student_no"], code),
-                    utc_now(),
-                    student_id,
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "激活码只能由证件号规范化后的末 6 位生成；"
+                    "请重新导入包含证件号的名单以更新该学生凭据"
                 ),
             )
-            connection.execute(
-                "DELETE FROM sessions WHERE role = 'student' AND subject_id = ?",
-                (student_id,),
-            )
-            audit(
-                connection,
-                actor_type="admin",
-                actor_id=identity.subject_id,
-                action="student.activation_code.rotate",
-                entity_type="student",
-                entity_id=student_id,
-                details={"student_no": student["student_no"], "sessions_revoked": True},
-            )
-            connection.commit()
-            return {
-                "credential": {
-                    "student_no": student["student_no"],
-                    "name": student["name"],
-                    "major": student["major_name"],
-                    "activation_code": code,
-                }
-            }
         except Exception:
             connection.rollback()
             raise
@@ -2505,7 +2474,10 @@ def create_app(config: Config | None = None) -> FastAPI:
             if not student["activation_ciphertext"]:
                 raise HTTPException(
                     status_code=409,
-                    detail="该学生为历史哈希凭据，原激活码无法显示；请先重置激活码",
+                    detail=(
+                        "该学生为历史哈希凭据，原激活码无法显示；"
+                        "请重新导入包含证件号的名单"
+                    ),
                 )
             try:
                 code = decrypt_activation_code(
@@ -2516,14 +2488,17 @@ def create_app(config: Config | None = None) -> FastAPI:
             except Exception as exc:
                 raise HTTPException(
                     status_code=409,
-                    detail="激活码密文无法校验，请重置激活码",
+                    detail="激活码密文无法校验，请重新导入包含证件号的名单",
                 ) from exc
             if not verify_activation_code(
                 config.app_secret, code, student["activation_hash"]
             ):
                 raise HTTPException(
                     status_code=409,
-                    detail="激活码密文与登录凭据不一致，请重置激活码",
+                    detail=(
+                        "激活码密文与登录凭据不一致；"
+                        "请重新导入包含证件号的名单"
+                    ),
                 )
             audit(
                 connection,
@@ -2685,6 +2660,47 @@ def create_app(config: Config | None = None) -> FastAPI:
             f"{activity['code']}-unselected.csv",
             ["学号", "姓名", "专业"],
             [[row["student_no"], row["name"], row["major_name"]] for row in rows],
+        )
+
+    @app.get("/api/admin/export/results.csv")
+    def export_complete_results(request: Request, activity_id: int):
+        require_session(request, "admin")
+        connection = connect(config.database_path)
+        try:
+            connection.execute("BEGIN")
+            activity = current_activity(connection)
+            if int(activity["id"]) != activity_id:
+                raise HTTPException(status_code=409, detail="当前活动已经变化，请刷新页面后重试")
+            rows = connection.execute(
+                """
+                SELECT s.student_no, s.name, m.name AS major_name,
+                       CASE WHEN se.id IS NULL THEN '未选' ELSE '已选' END AS selection_status,
+                       g.name AS group_name, se.selected_at
+                FROM students s
+                JOIN majors m ON m.id = s.major_id
+                LEFT JOIN selections se
+                  ON se.student_id = s.id AND se.revoked_at IS NULL
+                LEFT JOIN teaching_groups g ON g.id = se.group_id
+                WHERE s.active = 1
+                ORDER BY m.sort_order, s.student_no
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        return csv_response(
+            f"{activity['code']}-results.csv",
+            ["学号", "姓名", "专业", "选择状态", "教学组", "选择时间"],
+            [
+                [
+                    row["student_no"],
+                    row["name"],
+                    row["major_name"],
+                    row["selection_status"],
+                    row["group_name"],
+                    row["selected_at"],
+                ]
+                for row in rows
+            ],
         )
 
     @app.get("/api/admin/audit")

@@ -22,6 +22,16 @@ backups/
 *.db-shm
 *.db-wal
 
+# Local roster sources can contain real student identity data. Keep the one
+# reviewed fictional fixture, but never admit other roster workbooks or CSVs.
+*.csv
+!examples/fictional-students-180.csv
+*.xls
+*.xlsx
+
+# Browser QA evidence is local-only and may capture names or credentials.
+.frontend_qa*/
+
 deploy/keys/
 *.pem
 *.key

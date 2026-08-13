@@ -3,6 +3,10 @@
 .env
 data
 backups
+.frontend_qa*
+*.csv
+*.xls
+*.xlsx
 design
 docs
 tests
@@ -11,4 +15,3 @@ scripts
 *.db
 __pycache__
 .pytest_cache
-
