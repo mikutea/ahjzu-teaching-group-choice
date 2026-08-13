@@ -26,6 +26,35 @@ def roster_csv(rows: list[tuple[str, str, str, str]]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+def insert_login_identity(
+    *, app_config, client: TestClient, student_no: str, name: str, code: str
+) -> None:
+    major_id = client.get("/api/admin/dashboard").json()["majors"][0]["id"]
+    connection = connect(app_config.database_path)
+    try:
+        now = utc_now()
+        connection.execute(
+            """
+            INSERT INTO students
+                (student_no, name, major_id, activation_hash,
+                 activation_ciphertext, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                student_no,
+                name,
+                major_id,
+                activation_code_hash(app_config.app_secret, code),
+                encrypt_activation_code(app_config.app_secret, student_no, code),
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize(
     ("student_no", "name", "expected_message"),
     [
@@ -756,6 +785,7 @@ def test_colliding_raw_and_canonical_students_have_independent_login_limits(
         assert still_limited.status_code == 429, still_limited.text
 
 
+@pytest.mark.parametrize("reverse_direction", [False, True])
 @pytest.mark.parametrize("account_exists", [False, True])
 def test_unresolved_nfkc_aliases_cannot_reveal_account_existence_via_rate_limit(
     app,
@@ -763,45 +793,32 @@ def test_unresolved_nfkc_aliases_cannot_reveal_account_existence_via_rate_limit(
     client: TestClient,
     admin_headers: dict[str, str],
     account_exists: bool,
+    reverse_direction: bool,
 ):
     canonical_number = "ENUM2026"
     nfkc_alias = "ＥＮＵＭ２０２６"
     name = "枚举保护学生"
     correct_code = "A1B2C3"
     if account_exists:
-        major_id = client.get("/api/admin/dashboard").json()["majors"][0]["id"]
-        connection = connect(app_config.database_path)
-        try:
-            now = utc_now()
-            connection.execute(
-                """
-                INSERT INTO students
-                    (student_no, name, major_id, activation_hash,
-                     activation_ciphertext, active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-                """,
-                (
-                    canonical_number,
-                    name,
-                    major_id,
-                    activation_code_hash(app_config.app_secret, correct_code),
-                    encrypt_activation_code(
-                        app_config.app_secret, canonical_number, correct_code
-                    ),
-                    now,
-                    now,
-                ),
-            )
-            connection.commit()
-        finally:
-            connection.close()
+        insert_login_identity(
+            app_config=app_config,
+            client=client,
+            student_no=canonical_number,
+            name=name,
+            code=correct_code,
+        )
+    first_number, probe_number = (
+        (nfkc_alias, canonical_number)
+        if reverse_direction
+        else (canonical_number, nfkc_alias)
+    )
 
     with TestClient(app) as student_client:
         for _ in range(10):
             rejected = student_client.post(
                 "/api/student/login",
                 json={
-                    "student_no": canonical_number,
+                    "student_no": first_number,
                     "name": name,
                     "activation_code": "Q1W2E3",
                 },
@@ -811,12 +828,56 @@ def test_unresolved_nfkc_aliases_cannot_reveal_account_existence_via_rate_limit(
         nfkc_probe = student_client.post(
             "/api/student/login",
             json={
-                "student_no": nfkc_alias,
+                "student_no": probe_number,
                 "name": name,
                 "activation_code": correct_code,
             },
         )
         assert nfkc_probe.status_code == 429, nfkc_probe.text
+
+
+@pytest.mark.parametrize("account_exists", [False, True])
+def test_case_sensitive_unresolved_buckets_do_not_reveal_account_existence(
+    app,
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    account_exists: bool,
+):
+    stored_number = "CASE2026"
+    distinct_number = "case2026"
+    name = "大小写枚举保护学生"
+    correct_code = "A1B2C3"
+    if account_exists:
+        insert_login_identity(
+            app_config=app_config,
+            client=client,
+            student_no=stored_number,
+            name=name,
+            code=correct_code,
+        )
+
+    with TestClient(app) as student_client:
+        for _ in range(10):
+            rejected = student_client.post(
+                "/api/student/login",
+                json={
+                    "student_no": stored_number,
+                    "name": name,
+                    "activation_code": "Q1W2E3",
+                },
+            )
+            assert rejected.status_code == 401, rejected.text
+
+        case_probe = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": distinct_number,
+                "name": name,
+                "activation_code": correct_code,
+            },
+        )
+        assert case_probe.status_code == 401, case_probe.text
 
 
 def test_safe_legacy_envelope_does_not_reveal_account_existence(

@@ -499,6 +499,16 @@ def create_app(config: Config | None = None) -> FastAPI:
         ).hexdigest()
         return f"{namespace}:{digest[:24]}"
 
+    def student_login_principal_key(namespace: str, value: str) -> str:
+        """Hash an already-selected login identity without changing its semantics."""
+
+        digest = hmac.new(
+            config.app_secret.encode("utf-8"),
+            namespace.encode("utf-8") + b"\0" + value.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return f"{namespace}:{digest[:24]}"
+
     def require_session_from_connection(
         request: Request,
         role: Literal["student", "admin"],
@@ -1239,7 +1249,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 ).fetchone()
 
             resolved_candidate = exact_candidate or canonical_candidate
-            account_key = principal_key(
+            account_key = student_login_principal_key(
                 (
                     "student-login-account-id"
                     if resolved_candidate is not None
