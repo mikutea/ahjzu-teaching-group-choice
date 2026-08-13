@@ -756,6 +756,69 @@ def test_colliding_raw_and_canonical_students_have_independent_login_limits(
         assert still_limited.status_code == 429, still_limited.text
 
 
+@pytest.mark.parametrize("account_exists", [False, True])
+def test_unresolved_nfkc_aliases_cannot_reveal_account_existence_via_rate_limit(
+    app,
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    account_exists: bool,
+):
+    canonical_number = "ENUM2026"
+    nfkc_alias = "ＥＮＵＭ２０２６"
+    name = "枚举保护学生"
+    correct_code = "A1B2C3"
+    if account_exists:
+        major_id = client.get("/api/admin/dashboard").json()["majors"][0]["id"]
+        connection = connect(app_config.database_path)
+        try:
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT INTO students
+                    (student_no, name, major_id, activation_hash,
+                     activation_ciphertext, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    canonical_number,
+                    name,
+                    major_id,
+                    activation_code_hash(app_config.app_secret, correct_code),
+                    encrypt_activation_code(
+                        app_config.app_secret, canonical_number, correct_code
+                    ),
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    with TestClient(app) as student_client:
+        for _ in range(10):
+            rejected = student_client.post(
+                "/api/student/login",
+                json={
+                    "student_no": canonical_number,
+                    "name": name,
+                    "activation_code": "Q1W2E3",
+                },
+            )
+            assert rejected.status_code == 401, rejected.text
+
+        nfkc_probe = student_client.post(
+            "/api/student/login",
+            json={
+                "student_no": nfkc_alias,
+                "name": name,
+                "activation_code": correct_code,
+            },
+        )
+        assert nfkc_probe.status_code == 429, nfkc_probe.text
+
+
 def test_safe_legacy_envelope_does_not_reveal_account_existence(
     app,
     app_config,

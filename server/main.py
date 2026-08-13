@@ -1247,7 +1247,11 @@ def create_app(config: Config | None = None) -> FastAPI:
                 ),
                 str(resolved_candidate["id"])
                 if resolved_candidate is not None
-                else payload.student_no,
+                else (
+                    strict_payload.student_no
+                    if strict_payload is not None
+                    else payload.student_no
+                ),
             )
             limiter.check(account_key, limit=10, window_seconds=300)
 
