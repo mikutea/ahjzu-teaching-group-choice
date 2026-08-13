@@ -6,13 +6,14 @@ import hashlib
 import hmac
 import io
 import json
+import re
 import secrets
 import sqlite3
 import threading
 import time
 import unicodedata
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -20,7 +21,10 @@ from typing import Annotated, Any, Literal
 import qrcode
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Config, PROJECT_ROOT
@@ -61,6 +65,15 @@ FIXED_OWNER_NAME = "Mikutea"
 COUNTDOWN_SECONDS = 10
 PRESENCE_FRESH_SECONDS = 35
 HEARTBEAT_WRITE_INTERVAL_SECONDS = 15
+MAX_ADMIN_SESSIONS_PER_USER = 8
+
+STUDENT_NUMBER_PATTERN = re.compile(r"^[A-Za-z0-9_-]{4,32}$")
+STUDENT_NAME_PATTERN = re.compile(
+    r"^[A-Za-z0-9\u00C0-\u024F\u1E00-\u1EFF"
+    r"\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF"
+    r"\U00020000-\U0002FA1F ·•・'’\-‐‑]+$"
+)
+ACTIVATION_CODE_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
 
 
 def session_utc_now() -> str:
@@ -208,21 +221,44 @@ class AdminLogin(StrictModel):
 
 
 class StudentLogin(StrictModel):
-    student_no: str = Field(min_length=1, max_length=40)
+    student_no: str = Field(min_length=4, max_length=32)
     name: str = Field(min_length=1, max_length=80)
-    activation_code: str = Field(min_length=4, max_length=64)
+    activation_code: str = Field(min_length=6, max_length=6)
 
     @field_validator("student_no", "name", mode="before")
     @classmethod
-    def strip_values(cls, value: Any) -> Any:
-        return clean_text(value) if isinstance(value, str) else value
+    def strip_values(cls, value: Any, info: ValidationInfo) -> Any:
+        if not isinstance(value, str):
+            return value
+        if any(unicodedata.category(character).startswith("C") for character in value):
+            raise ValueError(f"{info.field_name} 不能包含控制字符")
+        return clean_text(value)
+
+    @field_validator("student_no")
+    @classmethod
+    def validate_student_number(cls, value: str) -> str:
+        if not STUDENT_NUMBER_PATTERN.fullmatch(value):
+            raise ValueError("学号只能包含英文字母、数字、下划线或连字符")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def validate_student_name(cls, value: str) -> str:
+        if not STUDENT_NAME_PATTERN.fullmatch(value):
+            raise ValueError("姓名包含不支持的字符")
+        return value
 
     @field_validator("activation_code", mode="before")
     @classmethod
     def normalize_activation_code(cls, value: Any) -> Any:
         if not isinstance(value, str):
             return value
-        return "".join(unicodedata.normalize("NFKC", value).strip().upper().split())
+        normalized = "".join(
+            unicodedata.normalize("NFKC", value).strip().upper().split()
+        )
+        if not ACTIVATION_CODE_PATTERN.fullmatch(normalized):
+            raise ValueError("个人激活码必须是 6 位英文字母或数字")
+        return normalized
 
 
 class StatusUpdate(StrictModel):
@@ -329,6 +365,10 @@ class RevokeSelection(StrictModel):
 class PasswordChange(StrictModel):
     current_password: str = Field(min_length=1, max_length=256)
     new_password: str = Field(min_length=12, max_length=256)
+
+
+class ArchiveDelete(StrictModel):
+    confirmation: Literal["DELETE"]
 
 
 @dataclass(frozen=True)
@@ -511,10 +551,11 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection.execute(
             "DELETE FROM sessions WHERE expires_at <= ?", (session_utc_now(),)
         )
-        connection.execute(
-            "DELETE FROM sessions WHERE role = ? AND subject_id = ?",
-            (role, subject_id),
-        )
+        if role == "student":
+            connection.execute(
+                "DELETE FROM sessions WHERE role = 'student' AND subject_id = ?",
+                (subject_id,),
+            )
         connection.execute(
             """
             INSERT INTO sessions
@@ -532,6 +573,23 @@ def create_app(config: Config | None = None) -> FastAPI:
                 expires.isoformat(timespec="seconds"),
             ),
         )
+        if role == "admin":
+            connection.execute(
+                """
+                DELETE FROM sessions
+                WHERE token_hash IN (
+                    SELECT token_hash FROM sessions
+                    WHERE role = 'admin' AND subject_id = ? AND token_hash <> ?
+                    ORDER BY created_at DESC, token_hash DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (
+                    subject_id,
+                    session_token_hash(token),
+                    MAX_ADMIN_SESSIONS_PER_USER - 1,
+                ),
+            )
 
     def set_session_cookie(response: Response, role: Literal["student", "admin"], token: str) -> None:
         cookie_name = ADMIN_COOKIE if role == "admin" else STUDENT_COOKIE
@@ -588,6 +646,125 @@ def create_app(config: Config | None = None) -> FastAPI:
         status = current_activity(connection)["status"]
         if status != "closed":
             raise HTTPException(status_code=409, detail="请先关闭抢选再修改结构或配额")
+
+    def rebalance_group_quotas(
+        connection: sqlite3.Connection, group_id: int, total_capacity: int
+    ) -> list[dict[str, Any]]:
+        """Deterministically fit the major matrix to a group's new capacity.
+
+        Existing quotas are the preferred weights.  When every quota is zero,
+        active roster counts become the weights, with an equal active-major
+        fallback.  Current selections are hard lower bounds.  Integer leftovers
+        use the largest-remainder method with stable major ordering.
+        """
+
+        now = utc_now()
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO quotas (major_id, group_id, capacity, updated_at)
+            SELECT id, ?, 0, ? FROM majors
+            """,
+            (group_id, now),
+        )
+        rows = connection.execute(
+            """
+            SELECT q.major_id, q.capacity, m.name AS major_name, m.active,
+                   m.sort_order,
+                   (SELECT COUNT(*) FROM students roster
+                    WHERE roster.major_id = q.major_id AND roster.active = 1
+                   ) AS student_count,
+                   (SELECT COUNT(*) FROM selections se
+                    JOIN students selected_student
+                      ON selected_student.id = se.student_id
+                    WHERE se.group_id = q.group_id
+                      AND selected_student.major_id = q.major_id
+                      AND se.revoked_at IS NULL
+                   ) AS selected_count
+            FROM quotas q JOIN majors m ON m.id = q.major_id
+            WHERE q.group_id = ?
+            ORDER BY m.sort_order, m.id
+            """,
+            (group_id,),
+        ).fetchall()
+        selected_total = sum(int(row["selected_count"]) for row in rows)
+        if total_capacity < selected_total:
+            raise HTTPException(
+                status_code=409,
+                detail=f"总容量不能小于当前已选人数 {selected_total}",
+            )
+        if not rows:
+            connection.execute(
+                "UPDATE teaching_groups SET total_capacity = ?, updated_at = ? WHERE id = ?",
+                (total_capacity, now, group_id),
+            )
+            return []
+
+        weights = [int(row["capacity"]) for row in rows]
+        if not any(weights):
+            weights = [
+                int(row["student_count"]) if bool(row["active"]) else 0
+                for row in rows
+            ]
+        if not any(weights):
+            weights = [1 if bool(row["active"]) else 0 for row in rows]
+        if not any(weights):
+            weights = [1 for _ in rows]
+
+        remaining = total_capacity - selected_total
+        weight_total = sum(weights)
+        shares = [remaining * weight // weight_total for weight in weights]
+        remainders = [remaining * weight % weight_total for weight in weights]
+        undistributed = remaining - sum(shares)
+        remainder_order = sorted(
+            range(len(rows)),
+            key=lambda index: (
+                -remainders[index],
+                int(rows[index]["sort_order"]),
+                int(rows[index]["major_id"]),
+            ),
+        )
+        for index in remainder_order[:undistributed]:
+            shares[index] += 1
+        targets = [
+            int(row["selected_count"]) + shares[index]
+            for index, row in enumerate(rows)
+        ]
+
+        # Lower to selection floors before changing total capacity.  This
+        # ordering remains valid for both shrinking and growing under SQLite's
+        # quota/group guard triggers; final values are invisible until commit.
+        for row in rows:
+            connection.execute(
+                """
+                UPDATE quotas SET capacity = ?, updated_at = ?
+                WHERE major_id = ? AND group_id = ?
+                """,
+                (int(row["selected_count"]), now, int(row["major_id"]), group_id),
+            )
+        connection.execute(
+            "UPDATE teaching_groups SET total_capacity = ?, updated_at = ? WHERE id = ?",
+            (total_capacity, now, group_id),
+        )
+        adjustments: list[dict[str, Any]] = []
+        for row, target in zip(rows, targets, strict=True):
+            connection.execute(
+                """
+                UPDATE quotas SET capacity = ?, updated_at = ?
+                WHERE major_id = ? AND group_id = ?
+                """,
+                (target, now, int(row["major_id"]), group_id),
+            )
+            if int(row["capacity"]) != target:
+                adjustments.append(
+                    {
+                        "major_id": int(row["major_id"]),
+                        "major_name": row["major_name"],
+                        "from": int(row["capacity"]),
+                        "to": target,
+                        "selected_count": int(row["selected_count"]),
+                    }
+                )
+        return adjustments
 
     def require_expected_activity(
         request: Request,
@@ -1242,8 +1419,11 @@ def create_app(config: Config | None = None) -> FastAPI:
                 (replacement_hash, utc_now(), identity.subject_id),
             )
             connection.execute(
-                "DELETE FROM sessions WHERE role = 'admin' AND token_hash <> ?",
-                (identity.token_hash,),
+                """
+                DELETE FROM sessions
+                WHERE role = 'admin' AND subject_id = ? AND token_hash <> ?
+                """,
+                (identity.subject_id, identity.token_hash),
             )
             audit(
                 connection,
@@ -1837,6 +2017,90 @@ def create_app(config: Config | None = None) -> FastAPI:
         finally:
             connection.close()
 
+    @app.delete("/api/admin/activities/{activity_id}")
+    def delete_activity_archive(
+        activity_id: int, payload: ArchiveDelete, request: Request
+    ):
+        """Permanently remove one verified archive, never the live activity.
+
+        The fixed confirmation literal is an independent server-side guard; the
+        UI presents two human confirmations before sending it.  Only summary
+        metadata is retained in the current activity's audit trail.
+        """
+
+        identity = require_session(request, "admin", csrf=True)
+        connection = connect(config.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            current = require_expected_activity(
+                request, connection, identity=identity
+            )
+            row = connection.execute(
+                """
+                SELECT id, code, status, archived_at, summary_json,
+                       snapshot_json, snapshot_sha256
+                FROM activities WHERE id = ?
+                """,
+                (activity_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="活动不存在")
+            if int(row["id"]) == int(current["id"]) or row["status"] != "archived":
+                raise HTTPException(status_code=409, detail="只能删除已归档的历史活动")
+            if not row["snapshot_json"] or not row["snapshot_sha256"]:
+                raise HTTPException(
+                    status_code=500, detail="归档校验失败，请先运行数据库检查"
+                )
+            digest = hashlib.sha256(row["snapshot_json"].encode("utf-8")).hexdigest()
+            if not hmac.compare_digest(digest, str(row["snapshot_sha256"])):
+                raise HTTPException(
+                    status_code=500, detail="归档校验失败，请先运行数据库检查"
+                )
+            try:
+                summary = json.loads(row["summary_json"])
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise HTTPException(
+                    status_code=500, detail="归档校验失败，请先运行数据库检查"
+                ) from exc
+            safe_summary = {
+                key: int(summary[key]) for key in ("students", "selected", "unselected")
+            }
+
+            # Archived audit rows are part of the immutable snapshot being
+            # deleted.  Record a non-PII tombstone under the live activity first,
+            # then remove rows that would otherwise RESTRICT the archive delete.
+            audit(
+                connection,
+                actor_type="admin",
+                actor_id=identity.subject_id,
+                action="activity.archive.delete",
+                entity_type="activity_archive",
+                entity_id=activity_id,
+                details={
+                    "code": row["code"],
+                    "archived_at": row["archived_at"],
+                    "summary": safe_summary,
+                    "snapshot_sha256": row["snapshot_sha256"],
+                },
+                activity_id=int(current["id"]),
+            )
+            connection.execute(
+                "DELETE FROM audit_logs WHERE activity_id = ?", (activity_id,)
+            )
+            connection.execute("DELETE FROM activities WHERE id = ?", (activity_id,))
+            connection.commit()
+            return {"ok": True, "deleted_activity_id": activity_id}
+        except KeyError as exc:
+            connection.rollback()
+            raise HTTPException(
+                status_code=500, detail="归档校验失败，请先运行数据库检查"
+            ) from exc
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     @app.post("/api/admin/majors")
     def create_major(payload: MajorCreate, request: Request):
         identity = require_session(request, "admin", csrf=True)
@@ -2044,14 +2308,10 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "SELECT COUNT(*) AS count FROM selections WHERE group_id = ? AND revoked_at IS NULL",
                 (group_id,),
             ).fetchone()["count"]
-            quota_sum = connection.execute(
-                "SELECT COALESCE(SUM(capacity), 0) AS total FROM quotas WHERE group_id = ?",
-                (group_id,),
-            ).fetchone()["total"]
-            if "total_capacity" in values and values["total_capacity"] < max(selected, quota_sum):
+            if "total_capacity" in values and values["total_capacity"] < selected:
                 raise HTTPException(
                     status_code=409,
-                    detail=f"总容量不能小于当前配额合计 {quota_sum} 或已选人数 {selected}",
+                    detail=f"总容量不能小于当前已选人数 {selected}",
                 )
             if values.get("active") == 0 and bool(before["active"]) and selected:
                 raise HTTPException(
@@ -2061,17 +2321,25 @@ def create_app(config: Config | None = None) -> FastAPI:
                         "请先撤销这些选择"
                     ),
                 )
+            quota_adjustments: list[dict[str, Any]] = []
+            capacity_changed = (
+                "total_capacity" in values
+                and int(values["total_capacity"]) != int(before["total_capacity"])
+            )
+            if capacity_changed:
+                quota_adjustments = rebalance_group_quotas(
+                    connection, group_id, int(values["total_capacity"])
+                )
             group_updates = {
                 "name": "UPDATE teaching_groups SET name = ?, updated_at = ? WHERE id = ?",
-                "total_capacity": (
-                    "UPDATE teaching_groups SET total_capacity = ?, updated_at = ? WHERE id = ?"
-                ),
                 "active": "UPDATE teaching_groups SET active = ?, updated_at = ? WHERE id = ?",
                 "sort_order": (
                     "UPDATE teaching_groups SET sort_order = ?, updated_at = ? WHERE id = ?"
                 ),
             }
             for column, value in values.items():
+                if column == "total_capacity":
+                    continue
                 connection.execute(group_updates[column], (value, utc_now(), group_id))
             audit(
                 connection,
@@ -2080,7 +2348,11 @@ def create_app(config: Config | None = None) -> FastAPI:
                 action="group.update",
                 entity_type="teaching_group",
                 entity_id=group_id,
-                details={"before": dict(before), "changed": values},
+                details={
+                    "before": dict(before),
+                    "changed": values,
+                    "quota_adjustments": quota_adjustments,
+                },
             )
             connection.commit()
         except Exception:
@@ -2088,7 +2360,11 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise
         finally:
             connection.close()
-        return {"ok": True}
+        return {
+            "ok": True,
+            "quotas_adjusted": bool(quota_adjustments),
+            "quota_adjustments": quota_adjustments,
+        }
 
     @app.delete("/api/admin/groups/{group_id}")
     def delete_group(group_id: int, request: Request):
@@ -2701,6 +2977,273 @@ def create_app(config: Config | None = None) -> FastAPI:
                 ]
                 for row in rows
             ],
+        )
+
+    @app.get("/api/admin/export/results.xlsx")
+    def export_complete_results_xlsx(request: Request, activity_id: int):
+        """Export the complete roster and result in a WPS-friendly workbook."""
+
+        require_session(request, "admin")
+        connection = connect(config.database_path)
+        try:
+            connection.execute("BEGIN")
+            activity = current_activity(connection)
+            if int(activity["id"]) != activity_id:
+                raise HTTPException(
+                    status_code=409, detail="当前活动已经变化，请刷新页面后重试"
+                )
+            result_rows = connection.execute(
+                """
+                SELECT s.student_no, s.name, m.name AS major_name,
+                       CASE WHEN se.id IS NULL THEN '未选' ELSE '已选' END
+                         AS selection_status,
+                       g.name AS group_name, se.selected_at
+                FROM students s
+                JOIN majors m ON m.id = s.major_id
+                LEFT JOIN selections se
+                  ON se.student_id = s.id AND se.revoked_at IS NULL
+                LEFT JOIN teaching_groups g ON g.id = se.group_id
+                WHERE s.active = 1
+                ORDER BY m.sort_order, s.student_no
+                """
+            ).fetchall()
+            group_rows = connection.execute(
+                """
+                SELECT g.name, g.total_capacity,
+                       COUNT(se.id) AS selected_count
+                FROM teaching_groups g
+                LEFT JOIN selections se
+                  ON se.group_id = g.id AND se.revoked_at IS NULL
+                WHERE g.active = 1
+                GROUP BY g.id, g.name, g.total_capacity, g.sort_order
+                ORDER BY g.sort_order, g.id
+                """
+            ).fetchall()
+            major_rows = connection.execute(
+                """
+                SELECT m.name,
+                       COUNT(DISTINCT CASE WHEN s.active = 1 THEN s.id END)
+                         AS student_count,
+                       COUNT(DISTINCT CASE
+                         WHEN s.active = 1 AND se.id IS NOT NULL THEN s.id END)
+                         AS selected_count
+                FROM majors m
+                LEFT JOIN students s ON s.major_id = m.id
+                LEFT JOIN selections se
+                  ON se.student_id = s.id AND se.revoked_at IS NULL
+                WHERE m.active = 1
+                GROUP BY m.id, m.name, m.sort_order
+                ORDER BY m.sort_order, m.id
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+
+        workbook = Workbook()
+        workbook.iso_dates = True
+        results_sheet = workbook.active
+        results_sheet.title = "完整结果"
+        summary_sheet = workbook.create_sheet("汇总")
+
+        brand_fill = PatternFill("solid", fgColor="6E2432")
+        accent_fill = PatternFill("solid", fgColor="E8D6C5")
+        pale_fill = PatternFill("solid", fgColor="F7F1EC")
+        header_font = Font(name="等线", size=11, bold=True, color="FFFFFF")
+        body_font = Font(name="等线", size=11, color="2B2223")
+        title_font = Font(name="等线", size=18, bold=True, color="6E2432")
+        thin_side = Side(style="thin", color="D8C9C2")
+        cell_border = Border(
+            left=thin_side, right=thin_side, top=thin_side, bottom=thin_side
+        )
+        centered = Alignment(horizontal="center", vertical="center")
+
+        def xlsx_safe_text(value: Any) -> str:
+            """Keep user-controlled workbook text from becoming a formula."""
+
+            text = "" if value is None else str(value)
+            visible = text.lstrip(" \t\r\n")
+            if text.startswith(("\t", "\r", "\n")) or visible.startswith(
+                ("=", "+", "-", "@")
+            ):
+                return "'" + text
+            return text
+
+        def xlsx_timestamp(value: Any) -> Any:
+            if not value:
+                return ""
+            try:
+                parsed = datetime.fromisoformat(str(value))
+            except ValueError:
+                return xlsx_safe_text(value)
+            # Excel stores naive wall times.  Export Beijing local time because
+            # this classroom application and its operators are in that zone.
+            return parsed.astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None)
+
+        result_headers = ["学号", "姓名", "专业", "状态", "教学组", "选择时间"]
+        results_sheet.append(result_headers)
+        for row in result_rows:
+            results_sheet.append(
+                [
+                    xlsx_safe_text(row["student_no"]),
+                    xlsx_safe_text(row["name"]),
+                    xlsx_safe_text(row["major_name"]),
+                    row["selection_status"],
+                    xlsx_safe_text(row["group_name"]),
+                    xlsx_timestamp(row["selected_at"]),
+                ]
+            )
+        for cell in results_sheet[1]:
+            cell.fill = brand_fill
+            cell.font = header_font
+            cell.alignment = centered
+            cell.border = cell_border
+        for row in results_sheet.iter_rows(min_row=2):
+            for cell in row:
+                cell.font = body_font
+                cell.border = cell_border
+                cell.alignment = Alignment(vertical="center")
+            row[0].number_format = "@"
+            row[0].alignment = Alignment(horizontal="left", vertical="center")
+            row[3].alignment = centered
+            if isinstance(row[5].value, datetime):
+                row[5].number_format = "yyyy-mm-dd hh:mm:ss"
+        results_sheet.freeze_panes = "A2"
+        results_sheet.auto_filter.ref = f"A1:F{max(1, results_sheet.max_row)}"
+        results_sheet.sheet_view.showGridLines = False
+        results_sheet.row_dimensions[1].height = 26
+        for column, width in {
+            "A": 36,
+            "B": 20,
+            "C": 20,
+            "D": 12,
+            "E": 24,
+            "F": 28,
+        }.items():
+            results_sheet.column_dimensions[column].width = width
+        if result_rows:
+            table = Table(displayName="CompleteResults", ref=f"A1:F{results_sheet.max_row}")
+            table.tableStyleInfo = TableStyleInfo(
+                name="TableStyleMedium2",
+                showFirstColumn=False,
+                showLastColumn=False,
+                showRowStripes=True,
+                showColumnStripes=False,
+            )
+            results_sheet.add_table(table)
+
+        total_students = len(result_rows)
+        selected_students = sum(
+            1 for row in result_rows if row["selection_status"] == "已选"
+        )
+        summary_sheet.merge_cells("A1:D1")
+        summary_sheet["A1"] = "教学组抢选结果汇总"
+        summary_sheet["A1"].font = title_font
+        summary_sheet["A1"].alignment = Alignment(vertical="center")
+        summary_sheet.row_dimensions[1].height = 34
+        metadata = [
+            ("活动名称", xlsx_safe_text(activity["title"])),
+            ("活动编号", xlsx_safe_text(activity["code"])),
+            ("导出时间", xlsx_timestamp(utc_now())),
+        ]
+        for row_index, (label, value) in enumerate(metadata, start=3):
+            summary_sheet.cell(row_index, 1, label)
+            summary_sheet.cell(row_index, 2, value)
+            summary_sheet.cell(row_index, 1).fill = accent_fill
+            summary_sheet.cell(row_index, 1).font = Font(
+                name="等线", size=11, bold=True, color="6E2432"
+            )
+
+        summary_sheet.append([])
+        metric_header_row = 7
+        metrics = [
+            ("总学生", total_students),
+            ("已选", selected_students),
+            ("未选", total_students - selected_students),
+            (
+                "完成率",
+                selected_students / total_students if total_students else 0,
+            ),
+        ]
+        for column, (label, value) in enumerate(metrics, start=1):
+            label_cell = summary_sheet.cell(metric_header_row, column, label)
+            value_cell = summary_sheet.cell(metric_header_row + 1, column, value)
+            label_cell.fill = brand_fill
+            label_cell.font = header_font
+            label_cell.alignment = centered
+            value_cell.fill = pale_fill
+            value_cell.font = Font(name="等线", size=14, bold=True, color="6E2432")
+            value_cell.alignment = centered
+            if label == "完成率":
+                value_cell.number_format = "0.0%"
+
+        group_start = 11
+        summary_sheet.cell(group_start, 1, "教学组")
+        summary_sheet.cell(group_start, 2, "容量")
+        summary_sheet.cell(group_start, 3, "已选")
+        summary_sheet.cell(group_start, 4, "剩余")
+        for cell in summary_sheet[group_start]:
+            cell.fill = brand_fill
+            cell.font = header_font
+            cell.alignment = centered
+        for row_index, row in enumerate(group_rows, start=group_start + 1):
+            selected_count = int(row["selected_count"])
+            summary_sheet.append(
+                [
+                    xlsx_safe_text(row["name"]),
+                    int(row["total_capacity"]),
+                    selected_count,
+                    int(row["total_capacity"]) - selected_count,
+                ]
+            )
+
+        major_start = group_start + len(group_rows) + 3
+        for column, value in enumerate(["专业", "学生数", "已选", "未选"], start=1):
+            cell = summary_sheet.cell(major_start, column, value)
+            cell.fill = brand_fill
+            cell.font = header_font
+            cell.alignment = centered
+        for row_index, row in enumerate(major_rows, start=major_start + 1):
+            student_count = int(row["student_count"])
+            selected_count = int(row["selected_count"])
+            for column, value in enumerate(
+                [
+                    xlsx_safe_text(row["name"]),
+                    student_count,
+                    selected_count,
+                    student_count - selected_count,
+                ],
+                start=1,
+            ):
+                summary_sheet.cell(row_index, column, value)
+
+        for row in summary_sheet.iter_rows(
+            min_row=3, max_row=summary_sheet.max_row, min_col=1, max_col=4
+        ):
+            for cell in row:
+                if cell.value is not None:
+                    cell.border = cell_border
+                    if cell.font == Font():
+                        cell.font = body_font
+                    if cell.alignment == Alignment():
+                        cell.alignment = Alignment(vertical="center")
+        summary_sheet.freeze_panes = "A11"
+        summary_sheet.sheet_view.showGridLines = False
+        for column, width in {"A": 28, "B": 26, "C": 18, "D": 18}.items():
+            summary_sheet.column_dimensions[column].width = width
+
+        output = io.BytesIO()
+        workbook.save(output)
+        return Response(
+            content=output.getvalue(),
+            media_type=(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ),
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{activity["code"]}-results.xlsx"'
+                ),
+                "Cache-Control": "no-store",
+            },
         )
 
     @app.get("/api/admin/audit")

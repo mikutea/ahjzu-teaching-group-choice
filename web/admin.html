@@ -79,6 +79,15 @@
 
       <section id="view-overview" class="admin-view">
         <div id="live-board" class="live-board">
+          <section id="board-countdown-overlay" class="board-countdown-overlay" aria-live="assertive" aria-atomic="true">
+            <div class="countdown-content">
+              <span class="college-wordmark college-wordmark--countdown"><img src="/brand/college-wordmark-official.png" alt="建筑与空间规划学院"></span>
+              <span>全体同步倒计时</span>
+              <strong id="board-overlay-countdown">10</strong>
+              <h2>倒计时结束后同时开放抢选</h2>
+              <small>请保持手机页面打开 · 扫码入口持续可用</small>
+            </div>
+          </section>
           <header class="board-presentation-header">
             <div class="board-presentation-brand">
               <span class="college-wordmark college-wordmark--board"><img src="/brand/college-wordmark-official.png" alt="建筑与空间规划学院"></span>
@@ -92,16 +101,31 @@
           <section class="board-panel board-panel--stats" aria-labelledby="stats-title">
             <div class="panel-kicker">GROUP STATUS</div>
             <h2 id="stats-title">各教学组进度</h2>
-            <div class="board-subheading">
+            <div id="waiting-overview" class="waiting-overview">
+              <div class="waiting-overview__metrics">
+                <article class="metric-card metric-card--online">
+                  <span>已进入候场</span><strong id="waiting-online">0</strong><small>人</small>
+                </article>
+                <article class="metric-card">
+                  <span>尚未进入</span><strong id="waiting-absent">0</strong><small>人</small>
+                </article>
+              </div>
+              <div class="waiting-overview__progress">
+                <div class="progress-label"><span>候场完成率</span><strong id="waiting-rate">0%</strong></div>
+                <div class="progress-track"><span id="waiting-rate-bar"></span></div>
+              </div>
+              <p>学生完成身份核验后会自动进入候场；老师确认人员情况后，可在仍有人未进入时继续开始。</p>
+            </div>
+            <div class="board-subheading selection-only">
               <h3>名额使用情况</h3>
               <span id="group-progress-page" class="board-page-indicator" aria-live="polite"></span>
             </div>
-            <div id="group-progress" class="group-progress"></div>
-            <div class="board-subheading board-subheading--feed">
+            <div id="group-progress" class="group-progress selection-only"></div>
+            <div class="board-subheading board-subheading--feed selection-only">
               <h3>实时选择流水</h3>
-              <span class="board-page-indicator">最新动态</span>
+              <span id="live-feed-state" class="board-page-indicator">实时流动</span>
             </div>
-            <div id="live-selection-feed" class="live-selection-feed" aria-live="polite"></div>
+            <div id="live-selection-feed" class="live-selection-feed selection-only" aria-live="polite"></div>
           </section>
 
           <section class="board-panel board-panel--qr" aria-labelledby="qr-title">
@@ -132,8 +156,8 @@
 
           <section class="board-panel board-panel--unselected" aria-labelledby="unselected-title">
             <div class="panel-kicker">LIVE METRICS</div>
-            <h2>当前抢选进度</h2>
-            <div class="stat-pair">
+            <h2 id="board-roster-heading">候场学生情况</h2>
+            <div class="stat-pair selection-only">
               <article class="metric-card metric-card--selected">
                 <span>已选</span><strong id="metric-selected">0</strong><small>人</small>
               </article>
@@ -141,17 +165,9 @@
                 <span>未选</span><strong id="metric-unselected">0</strong><small>人</small>
               </article>
             </div>
-            <div class="overall-progress">
+            <div class="overall-progress selection-only">
               <div class="progress-label"><span>总体完成率</span><strong id="metric-rate">0%</strong></div>
               <div class="progress-track"><span id="metric-rate-bar"></span></div>
-            </div>
-            <div class="stat-pair stat-pair--presence" aria-label="候场情况">
-              <article class="metric-card metric-card--online">
-                <span>已进入候场</span><strong id="metric-online">0</strong><small>人</small>
-              </article>
-              <article class="metric-card">
-                <span>尚未进入</span><strong id="metric-absent">0</strong><small>人</small>
-              </article>
             </div>
             <div class="panel-title-row">
               <div>
@@ -177,8 +193,9 @@
           <div class="content-card__heading">
             <div><p class="eyebrow">RECENT ACTIVITY</p><h2>最近选择记录</h2></div>
             <div class="content-card__actions">
+              <span id="export-completion-callout" class="export-completion-callout is-hidden" role="status">全员已完成，可导出统一 Excel</span>
               <a id="export-selections" class="button button--outline" href="/api/admin/export/selections.csv">导出选择记录</a>
-              <a id="export-complete-results" class="button button--primary" href="/api/admin/export/results.csv">导出本场完整结果</a>
+              <a id="export-complete-results" class="button button--primary" href="/api/admin/export/results.xlsx">导出本场完整结果 Excel</a>
             </div>
           </div>
           <div class="table-scroll">
@@ -205,7 +222,7 @@
             <div id="major-editor" class="entity-editor"></div>
           </section>
           <section class="content-card">
-            <div class="content-card__heading"><div><h3>教学组设置</h3><p id="group-count-label">0 个教学组</p><p class="entity-status-help">“停用”不会删除教学组；已有选择记录时系统会阻止停用。重新启用后请复核各专业配额。</p></div></div>
+            <div class="content-card__heading"><div><h3>教学组设置</h3><p id="group-count-label">0 个教学组</p><p class="entity-status-help">“停用”不会删除教学组；已有选择记录时系统会阻止停用。调整总容量时，专业配额矩阵会以各专业已选人数为下限自动重算，不会反向阻止容量设置。</p></div></div>
             <form id="add-group-form" class="inline-add-form inline-add-form--group">
               <input name="name" maxlength="80" required placeholder="例如：第七教学组">
               <input name="capacity" type="number" min="0" max="1000" value="30" aria-label="总容量">
@@ -216,7 +233,7 @@
         </div>
         <section class="content-card quota-card">
           <div class="content-card__heading">
-            <div><h3>专业 × 教学组配额矩阵</h3><p>每一格都可修改；各专业配额合计不能超过该教学组总容量。</p></div>
+            <div><h3>专业 × 教学组配额矩阵</h3><p>矩阵随专业、教学组和总容量实时变化；手动调整单格时仍会校验已选人数和该组总容量。</p></div>
             <span class="legend-chip"><i></i> 已选 / 配额</span>
           </div>
           <div id="quota-matrix" class="quota-matrix"></div>
@@ -267,7 +284,7 @@
         </div>
         <section class="content-card roster-card">
           <div class="content-card__heading roster-card__heading">
-            <div><h3>本场完整学生名单</h3><p>激活码默认掩码保护，可按需显示并在 60 秒后自动隐藏；如历史名单缺少证件号，请在关闭抢选后重新导入该生名单。</p></div>
+            <div><h3>本场完整学生名单</h3><p>激活码使用证件号后 6 位，仅提供“显示明文”查看并在 60 秒后自动隐藏，不提供随机生成或重置；如历史名单缺少证件号，请在关闭抢选后重新导入该生名单。</p></div>
             <span id="student-roster-count" class="count-chip">0 人</span>
           </div>
           <label class="compact-search roster-search">
@@ -305,8 +322,7 @@
         </section>
         <div class="settings-grid">
           <form id="settings-form" class="content-card settings-form">
-            <h3>基础设置</h3>
-            <label class="field"><span>活动标题</span><input name="activity_title" maxlength="120" required></label>
+            <h3>访问与版权</h3>
             <label class="field"><span>学生端访问地址</span><input name="public_base_url" type="url" maxlength="300" placeholder="例如：http://192.168.22.50"></label>
             <p class="field-help">二维码将指向该地址。校内 HTTP 可先试用，正式跨网使用应配置 HTTPS。</p>
             <div class="fixed-copyright" aria-label="固定版权信息">
@@ -322,6 +338,7 @@
             <label class="field"><span>新密码</span><input name="new_password" type="password" minlength="12" autocomplete="new-password" required></label>
             <label class="field"><span>确认新密码</span><input name="confirm_password" type="password" minlength="12" autocomplete="new-password" required></label>
             <p class="field-help">至少 12 位；修改后其他管理端会话自动失效。</p>
+            <p class="field-help admin-multidevice-note">日常登录支持电脑投屏与手机管理端同时在线；在其中一台设备退出不会影响其他设备，修改密码才会使其他管理端重新登录。</p>
             <button class="button button--secondary" type="submit">更新密码</button>
           </form>
         </div>

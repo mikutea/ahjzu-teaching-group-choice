@@ -14,6 +14,9 @@ const adminState = {
   rosterFingerprint: "",
   rosterLoopSetupFrame: null,
   liveFeedFingerprint: "",
+  liveFeedScrollFrame: null,
+  liveFeedScrollLastTime: 0,
+  liveFeedLoopSetupFrame: null,
   revealedActivationCodes: new Map(),
   activationHideTimers: new Map(),
   phaseActionPending: false,
@@ -39,13 +42,16 @@ const adminEls = {
   lastRefresh: document.querySelector("#last-refresh"),
   selected: document.querySelector("#metric-selected"),
   unselected: document.querySelector("#metric-unselected"),
-  online: document.querySelector("#metric-online"),
-  absent: document.querySelector("#metric-absent"),
+  waitingOnline: document.querySelector("#waiting-online"),
+  waitingAbsent: document.querySelector("#waiting-absent"),
+  waitingRate: document.querySelector("#waiting-rate"),
+  waitingRateBar: document.querySelector("#waiting-rate-bar"),
   rate: document.querySelector("#metric-rate"),
   rateBar: document.querySelector("#metric-rate-bar"),
   groupProgress: document.querySelector("#group-progress"),
   groupProgressPage: document.querySelector("#group-progress-page"),
   liveSelectionFeed: document.querySelector("#live-selection-feed"),
+  liveFeedState: document.querySelector("#live-feed-state"),
   qr: document.querySelector("#student-qr"),
   qrPlaceholder: document.querySelector("#qr-placeholder"),
   publicUrl: document.querySelector("#public-url-label"),
@@ -56,11 +62,14 @@ const adminEls = {
   boardStageLabel: document.querySelector("#board-stage-label"),
   boardStageDetail: document.querySelector("#board-stage-detail"),
   boardCountdown: document.querySelector("#board-countdown-value"),
+  boardOverlayCountdown: document.querySelector("#board-overlay-countdown"),
   boardStart: document.querySelector("#board-start-countdown"),
   boardActivityTitle: document.querySelector("#board-activity-title"),
   boardHeaderPhase: document.querySelector("#board-header-phase"),
   boardClock: document.querySelector("#board-clock"),
   boardExitFullscreen: document.querySelector("#board-exit-fullscreen"),
+  boardRosterHeading: document.querySelector("#board-roster-heading"),
+  statsTitle: document.querySelector("#stats-title"),
   unselectedCount: document.querySelector("#unselected-count"),
   unselectedPage: document.querySelector("#unselected-page"),
   unselectedTitle: document.querySelector("#unselected-title"),
@@ -89,6 +98,7 @@ const adminEls = {
   importResult: document.querySelector("#import-result"),
   exportSelections: document.querySelector("#export-selections"),
   exportCompleteResults: document.querySelector("#export-complete-results"),
+  exportCompletionCallout: document.querySelector("#export-completion-callout"),
   exportUnselected: document.querySelector("#export-unselected"),
   toast: document.querySelector("#admin-toast"),
   dangerDialog: document.querySelector("#danger-dialog"),
@@ -212,6 +222,9 @@ function showAdminLogin() {
   adminState.revealedActivationCodes.clear();
   scrubRevealedActivationCodeDom();
   stopRosterAutoScroll();
+  stopLiveFeedAutoScroll();
+  adminState.rosterFingerprint = "";
+  adminState.liveFeedFingerprint = "";
 }
 
 function dashboardField(data, key) {
@@ -242,6 +255,14 @@ function dashboardPhase(data = adminState.dashboard) {
   if (raw === "countdown" && (remaining === null || remaining <= 0)) return "open";
   if (["open", "selecting", "active"].includes(raw) || status === "open") return "open";
   return "waiting";
+}
+
+function boardDisplayMode(data = adminState.dashboard, phase = dashboardPhase(data)) {
+  if (phase === "countdown") return "countdown";
+  if (phase === "open") return "selection";
+  const currentActivity = (data?.activities || []).find((activity) => activity.current);
+  const hasStarted = Boolean(currentActivity?.opened_at) || Number(data?.totals?.selected || 0) > 0;
+  return phase === "closed" && hasStarted ? "selection" : "waiting";
 }
 
 function normalizedPresence(data = adminState.dashboard) {
@@ -342,6 +363,7 @@ function startAdminPolling() {
 function renderDashboard(data) {
   synchronizeServerClock(data);
   const phase = dashboardPhase(data);
+  const displayMode = boardDisplayMode(data, phase);
   const structureLocked = phase === "countdown" || phase === "open" || data.settings.status === "open";
   const presence = normalizedPresence(data);
   const activityId = Number(data.settings.activity_id);
@@ -350,6 +372,10 @@ function renderDashboard(data) {
     adminState.activationHideTimers.clear();
     adminState.revealedActivationCodes.clear();
     scrubRevealedActivationCodeDom();
+    stopRosterAutoScroll();
+    stopLiveFeedAutoScroll();
+    adminState.rosterFingerprint = "";
+    adminState.liveFeedFingerprint = "";
   }
   adminState.lastActivityId = activityId;
   const rate = data.totals.students ? Math.round((data.totals.selected / data.totals.students) * 100) : 0;
@@ -359,8 +385,11 @@ function renderDashboard(data) {
   document.title = `${data.settings.activity_title} · 管理端`;
   adminEls.selected.textContent = String(data.totals.selected);
   adminEls.unselected.textContent = String(data.totals.unselected);
-  adminEls.online.textContent = String(presence.online);
-  adminEls.absent.textContent = String(presence.absent);
+  const waitingRate = data.totals.students ? Math.round((presence.online / data.totals.students) * 100) : 0;
+  adminEls.waitingOnline.textContent = String(presence.online);
+  adminEls.waitingAbsent.textContent = String(presence.absent);
+  adminEls.waitingRate.textContent = `${waitingRate}%`;
+  adminEls.waitingRateBar.style.width = `${waitingRate}%`;
   adminEls.rate.textContent = `${rate}%`;
   adminEls.rateBar.style.width = `${rate}%`;
   const badgeLabels = { waiting: "候场中", countdown: "倒计时", open: "进行中", closed: "已关闭" };
@@ -369,10 +398,20 @@ function renderDashboard(data) {
   adminEls.statusBadge.textContent = badgeLabels[phase];
   renderReadiness(data.readiness, structureLocked);
   renderBoardStage(data, phase, presence);
+  liveBoard.dataset.displayMode = displayMode;
+  liveBoard.classList.toggle("phase-waiting", displayMode === "waiting");
+  liveBoard.classList.toggle("phase-selection", displayMode === "selection");
+  liveBoard.classList.toggle("phase-countdown", displayMode === "countdown");
+  adminEls.statsTitle.textContent = displayMode === "waiting" ? "候场进度" : "各教学组抢选进度";
+  adminEls.boardRosterHeading.textContent = displayMode === "waiting" ? "候场学生情况" : "当前抢选进度";
 
   const activityQuery = `activity_id=${encodeURIComponent(data.settings.activity_id)}`;
   adminEls.exportSelections.href = `/api/admin/export/selections.csv?${activityQuery}`;
-  adminEls.exportCompleteResults.href = `/api/admin/export/results.csv?${activityQuery}`;
+  adminEls.exportCompleteResults.href = `/api/admin/export/results.xlsx?${activityQuery}`;
+  const complete = Number(data.totals.students) > 0 && Number(data.totals.unselected) === 0;
+  adminEls.exportCompleteResults.classList.toggle("is-complete", complete);
+  adminEls.exportCompleteResults.textContent = complete ? "全部完成 · 导出本场完整结果 Excel" : "导出本场完整结果 Excel";
+  adminEls.exportCompletionCallout.classList.toggle("is-hidden", !complete);
   adminEls.exportUnselected.href = `/api/admin/export/unselected.csv?${activityQuery}`;
   if (adminState.currentView === "overview") {
     renderGroupProgress(data.groups);
@@ -410,6 +449,7 @@ function renderBoardStage(data, phase, presence) {
   if (phase === "countdown") {
     adminEls.boardStageLabel.textContent = "全体同步倒计时";
     adminEls.boardCountdown.textContent = String(remainingSeconds);
+    adminEls.boardOverlayCountdown.textContent = String(remainingSeconds);
     adminEls.boardStageDetail.textContent = `已进入候场 ${presence.online} / ${total} 人，倒计时结束后同时进入抢选`;
     adminEls.boardStatus.textContent = "倒计时正在同步到全部学生端";
     adminEls.boardLiveNote.textContent = "请保持大屏与学生手机页面打开";
@@ -510,7 +550,15 @@ function renderActivities(activities) {
       download.href = `/api/admin/activities/${activity.id}/archive.json`;
       download.textContent = "下载归档";
       download.title = activity.snapshot_sha256 ? `SHA-256：${activity.snapshot_sha256}` : "下载活动归档";
-      meta.append(download);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "button button--danger activity-delete";
+      remove.dataset.action = "delete-archive";
+      remove.dataset.activityId = String(activity.id);
+      remove.dataset.activityTitle = activity.title;
+      remove.textContent = "删除";
+      remove.title = "永久删除该历史归档（需要二次确认）";
+      meta.append(download, remove);
     }
     row.append(info, meta);
     return row;
@@ -520,6 +568,28 @@ function renderActivities(activities) {
   const disabled = current?.status === "open";
   adminEls.newActivityForm.querySelectorAll("input, button").forEach((element) => { element.disabled = disabled; });
 }
+
+adminEls.activityList.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-action=delete-archive]");
+  if (!button) return;
+  const targetActivityId = Number(button.dataset.activityId);
+  const title = button.dataset.activityTitle || "该活动";
+  if (!await confirmDanger("删除历史归档", `即将删除“${title}”。删除后管理端不再保留该场活动的归档快照，请先确认已经下载并妥善保存。`)) return;
+  if (!await confirmDanger("再次确认永久删除", `这是最后一次确认：确定永久删除“${title}”吗？此操作不可撤销。`)) return;
+  button.disabled = true;
+  try {
+    await adminApi(`/api/admin/activities/${targetActivityId}`, {
+      method: "DELETE",
+      body: JSON.stringify({ confirmation: "DELETE" }),
+      activityId: adminState.dashboard?.settings.activity_id,
+    });
+    showAdminToast("历史归档已删除", "success");
+    await loadDashboard();
+  } catch (error) {
+    button.disabled = false;
+    showAdminToast(error.message, "error");
+  }
+});
 
 function renderGroupProgress(groups) {
   const activeGroups = groups.filter((group) => group.active);
@@ -553,11 +623,100 @@ function renderGroupProgress(groups) {
   adminEls.groupProgress.replaceChildren(...elements);
 }
 
-function renderLiveSelectionFeed(rows) {
-  const recentRows = rows.slice(0, 4);
-  const fingerprint = JSON.stringify(recentRows.map((record) => [record.student_id, record.name, record.group_name, record.selected_at]));
-  if (adminState.liveFeedFingerprint === fingerprint) return;
+function captureLiveFeedScrollRatio() {
+  const list = adminEls.liveSelectionFeed;
+  const loopHeight = Number(list.dataset.loopHeight || 0);
+  if (loopHeight > 0) return (list.scrollTop % loopHeight) / loopHeight;
+  const max = Math.max(0, list.scrollHeight - list.clientHeight);
+  return max > 0 ? list.scrollTop / max : 0;
+}
+
+function restoreLiveFeedScrollRatio(ratio) {
+  const list = adminEls.liveSelectionFeed;
+  const loopHeight = Number(list.dataset.loopHeight || 0);
+  const max = loopHeight > 0 ? loopHeight - 1 : Math.max(0, list.scrollHeight - list.clientHeight);
+  list.scrollTop = Math.min(max, Math.max(0, ratio * max));
+}
+
+function stopLiveFeedAutoScroll() {
+  if (adminState.liveFeedScrollFrame) cancelAnimationFrame(adminState.liveFeedScrollFrame);
+  if (adminState.liveFeedLoopSetupFrame) cancelAnimationFrame(adminState.liveFeedLoopSetupFrame);
+  adminState.liveFeedScrollFrame = null;
+  adminState.liveFeedLoopSetupFrame = null;
+  adminState.liveFeedScrollLastTime = 0;
+}
+
+function startLiveFeedAutoScroll() {
+  stopLiveFeedAutoScroll();
+  if (reducedMotionPreference.matches) return;
+  const loopHeight = Number(adminEls.liveSelectionFeed.dataset.loopHeight || 0);
+  if (loopHeight <= 0) return;
+  const tick = (now) => {
+    if (document.hidden || adminState.currentView !== "overview") {
+      stopLiveFeedAutoScroll();
+      return;
+    }
+    const list = adminEls.liveSelectionFeed;
+    const cycleHeight = Number(list.dataset.loopHeight || 0);
+    if (cycleHeight > 0) {
+      const elapsed = adminState.liveFeedScrollLastTime ? Math.min(80, now - adminState.liveFeedScrollLastTime) : 0;
+      const next = list.scrollTop + elapsed * 0.022;
+      list.scrollTop = next >= cycleHeight ? next - cycleHeight : next;
+    }
+    adminState.liveFeedScrollLastTime = now;
+    adminState.liveFeedScrollFrame = requestAnimationFrame(tick);
+  };
+  adminState.liveFeedScrollFrame = requestAnimationFrame(tick);
+}
+
+function setupLiveFeedLoop(previousScrollRatio) {
+  if (adminState.liveFeedLoopSetupFrame) cancelAnimationFrame(adminState.liveFeedLoopSetupFrame);
+  adminState.liveFeedLoopSetupFrame = requestAnimationFrame(() => {
+    adminState.liveFeedLoopSetupFrame = null;
+    const list = adminEls.liveSelectionFeed;
+    list.querySelectorAll("[data-feed-clone]").forEach((clone) => clone.remove());
+    delete list.dataset.loopHeight;
+    list.scrollTop = 0;
+    const originals = [...list.children];
+    const canLoop = originals.length > 1 && list.scrollHeight > list.clientHeight + 4;
+    adminEls.liveFeedState.textContent = canLoop && !reducedMotionPreference.matches ? "连续滚动" : originals.length ? "实时更新" : "";
+    if (!canLoop || reducedMotionPreference.matches) {
+      restoreLiveFeedScrollRatio(previousScrollRatio);
+      stopLiveFeedAutoScroll();
+      return;
+    }
+    const firstTop = originals[0].offsetTop;
+    const clones = originals.map((item) => {
+      const clone = item.cloneNode(true);
+      clone.dataset.feedClone = "true";
+      clone.setAttribute("aria-hidden", "true");
+      return clone;
+    });
+    list.append(...clones);
+    const loopHeight = clones[0].offsetTop - firstTop;
+    if (loopHeight <= 0) return;
+    list.dataset.loopHeight = String(loopHeight);
+    restoreLiveFeedScrollRatio(previousScrollRatio);
+    startLiveFeedAutoScroll();
+  });
+}
+
+function renderLiveSelectionFeed(rows, { force = false } = {}) {
+  const recentRows = rows.slice(0, 20);
+  const fingerprint = JSON.stringify([
+    boardDisplayMode(),
+    ...recentRows.map((record) => [
+      record.student_id,
+      record.name,
+      record.major_name,
+      record.group_name,
+      record.selected_at,
+    ]),
+  ]);
+  if (!force && adminState.liveFeedFingerprint === fingerprint) return;
+  const previousScrollRatio = captureLiveFeedScrollRatio();
   adminState.liveFeedFingerprint = fingerprint;
+  stopLiveFeedAutoScroll();
   const items = recentRows.map((record) => {
     const item = document.createElement("article");
     item.className = "selection-feed-item";
@@ -580,6 +739,7 @@ function renderLiveSelectionFeed(rows) {
     items.push(empty);
   }
   adminEls.liveSelectionFeed.replaceChildren(...items);
+  setupLiveFeedLoop(previousScrollRatio);
 }
 
 function renderQr(publicUrl) {
@@ -610,8 +770,8 @@ function filteredUnselectedStudents() {
 }
 
 function boardStudentListData() {
-  const phase = dashboardPhase();
-  if (["waiting", "countdown"].includes(phase)) return normalizedPresence().absentStudents;
+  const mode = boardDisplayMode();
+  if (["waiting", "countdown"].includes(mode)) return normalizedPresence().absentStudents;
   return adminState.dashboard?.unselected_students || [];
 }
 
@@ -702,8 +862,8 @@ function setupRosterLoop(previousScrollRatio) {
 }
 
 function renderUnselectedList({ force = false } = {}) {
-  const phase = dashboardPhase();
-  const isCheckIn = ["waiting", "countdown"].includes(phase);
+  const mode = boardDisplayMode();
+  const isCheckIn = ["waiting", "countdown"].includes(mode);
   const all = boardStudentListData();
   const filtered = filteredUnselectedStudents();
   const previousScrollRatio = captureRosterScrollRatio();
@@ -713,7 +873,7 @@ function renderUnselectedList({ force = false } = {}) {
   adminEls.unselectedCount.textContent = `${all.length} 人`;
   adminEls.unselectedPage.textContent = visibleStudents.length ? "实时更新" : "";
   const fingerprint = JSON.stringify([
-    phase,
+    mode,
     adminEls.unselectedSearch.value.trim().toLowerCase(),
     ...visibleStudents.map((student) => [student.id, student.name, student.major_name]),
   ]);
@@ -1017,7 +1177,7 @@ function clearRevealedActivationCode(studentId) {
 
 function scrubRevealedActivationCodeDom() {
   adminEls.rosterBody.querySelectorAll(".activation-code-value.is-revealed").forEach((value) => {
-    value.textContent = "••••••••";
+    value.textContent = "••••••";
     value.classList.remove("is-revealed");
   });
   adminEls.rosterBody.querySelectorAll("button[data-action=hide-activation-code]").forEach((button) => {
@@ -1096,7 +1256,7 @@ function renderStudentRoster(data = adminState.dashboard) {
       ?? student.activation_code_available
       ?? student.has_recoverable_activation_code
       ?? true;
-    value.textContent = revealedCode || (revealable ? "••••••••" : "历史码不可显示");
+    value.textContent = revealedCode || (revealable ? "••••••" : "历史码不可显示");
     value.classList.toggle("is-revealed", Boolean(revealedCode));
     const reveal = document.createElement("button");
     reveal.type = "button";
@@ -1117,7 +1277,7 @@ function renderStudentRoster(data = adminState.dashboard) {
 }
 
 function fillSettingsForm(settings) {
-  for (const key of ["activity_title", "public_base_url"]) {
+  for (const key of ["public_base_url"]) {
     const field = adminEls.settingsForm.elements.namedItem(key);
     if (field && document.activeElement !== field) field.value = settings[key] || "";
   }
@@ -1130,9 +1290,11 @@ function switchAdminView(viewName) {
   document.querySelector(`#view-${viewName}`).classList.remove("is-hidden");
   if (viewName !== "overview") {
     stopRosterAutoScroll();
+    stopLiveFeedAutoScroll();
     loadDashboard({ quiet: true });
   } else {
     renderUnselectedList({ force: true });
+    renderLiveSelectionFeed(adminState.dashboard?.recent_selections || [], { force: true });
   }
 }
 
@@ -1179,11 +1341,17 @@ async function handleSelectionPhaseAction() {
   const readinessMessage = readiness.warnings.length
     ? `就绪检查已通过。仍有提醒：${readiness.warnings.join("；")}。`
     : "就绪检查已通过。";
+  const presence = normalizedPresence();
+  const absentStudents = presence.absentStudents || [];
+  const absentDetail = absentStudents.map((student) => `${student.name}（${student.major_name}）`).join("、");
+  const startMessage = presence.absent > 0
+    ? `${readinessMessage}\n\n还有 ${presence.absent} 名同学未进入候场：\n${absentDetail || "名单正在同步，请以右侧实时名单为准"}\n\n仍可继续开始。确认后，全体学生端将同步进入 10 秒倒计时，倒计时结束后同时开放提交。`
+    : `${readinessMessage}全部 ${presence.online} 名同学均已进入候场。确认后，全体学生端将同步进入 10 秒倒计时，倒计时结束后同时开放提交。`;
   const confirmed = await confirmDanger(
     phase === "open" ? "关闭学生抢选" : "开始全体 10 秒倒计时",
     phase === "open"
       ? "关闭后学生无法继续提交，管理员仍可补位和撤销。"
-      : `${readinessMessage}确认后，全部已登录学生端将同步进入 10 秒倒计时；倒计时结束后同时开放提交。`,
+      : startMessage,
   );
   if (!confirmed) return;
   adminState.phaseActionPending = true;
@@ -1223,20 +1391,24 @@ const liveBoard = document.querySelector("#live-board");
 const fullscreenButton = document.querySelector("#fullscreen-board");
 const reducedMotionPreference = window.matchMedia("(prefers-reduced-motion: reduce)");
 reducedMotionPreference.addEventListener?.("change", () => {
-  if (adminState.dashboard && adminState.currentView === "overview") renderUnselectedList({ force: true });
+  if (adminState.dashboard && adminState.currentView === "overview") {
+    renderUnselectedList({ force: true });
+    renderLiveSelectionFeed(adminState.dashboard.recent_selections || [], { force: true });
+  }
 });
 
 function leavePresentationMode() {
   liveBoard.classList.remove("is-presentation");
   document.body.classList.remove("is-presentation");
   stopRosterAutoScroll();
+  stopLiveFeedAutoScroll();
 }
 
 function updateFullscreenButton() {
   fullscreenButton.textContent = document.fullscreenElement || liveBoard.classList.contains("is-presentation") ? "退出全屏" : "⛶ 全屏展示";
   if (adminState.dashboard) {
     renderGroupProgress(adminState.dashboard.groups || []);
-    renderLiveSelectionFeed(adminState.dashboard.recent_selections || []);
+    renderLiveSelectionFeed(adminState.dashboard.recent_selections || [], { force: true });
     renderUnselectedList({ force: true });
   }
 }
@@ -1365,8 +1537,13 @@ adminEls.groupEditor.addEventListener("click", async (event) => {
   const activityId = Number(adminEls.groupEditor.dataset.activityId);
   try {
     if (button.dataset.action === "save-group") {
-      await adminApi(`/api/admin/groups/${id}`, { method: "PATCH", body: JSON.stringify({ name: row._nameInput.value, total_capacity: Number(row._capacityInput.value) }), activityId });
-      showAdminToast("教学组设置已保存", "success");
+      const result = await adminApi(`/api/admin/groups/${id}`, { method: "PATCH", body: JSON.stringify({ name: row._nameInput.value, total_capacity: Number(row._capacityInput.value) }), activityId });
+      showAdminToast(
+        result?.quotas_adjusted || result?.quota_adjustments?.length
+          ? "教学组容量已保存，专业配额已按已选下限自动重算"
+          : "教学组设置已保存，配额矩阵已同步复核",
+        "success",
+      );
     } else if (button.dataset.action === "toggle-group-status") {
       const nextActive = button.dataset.nextActive === "true";
       const actionName = nextActive ? "重新启用教学组" : "停用教学组";
@@ -1411,7 +1588,7 @@ adminEls.settingsForm.addEventListener("submit", async (event) => {
   try {
     await adminApi("/api/admin/settings", { method: "PATCH", body: JSON.stringify(values), activityId });
     delete adminEls.settingsForm.dataset.activityId;
-    showAdminToast("活动标题和访问地址已保存", "success");
+    showAdminToast("学生端访问地址已保存", "success");
     await loadDashboard();
   } catch (error) { showAdminToast(error.message, "error"); }
 });
@@ -1595,7 +1772,7 @@ document.querySelector("#download-template").addEventListener("click", () => {
 
 for (const [anchor, filename, message] of [
   [adminEls.exportSelections, "选择记录.csv", "选择记录已导出"],
-  [adminEls.exportCompleteResults, "本场完整结果.csv", "本场完整结果已导出"],
+  [adminEls.exportCompleteResults, "本场完整结果.xlsx", "完整名单与抢选结果 Excel 已导出"],
   [adminEls.exportUnselected, "未选学生名单.csv", "未选学生名单已导出"],
 ]) {
   anchor.addEventListener("click", (event) => {
@@ -1674,7 +1851,11 @@ adminEls.recentBody.addEventListener("click", async (event) => {
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && adminState.currentView === "overview" && adminState.csrf) loadDashboard({ quiet: true });
+  if (!document.hidden && adminState.currentView === "overview" && adminState.csrf) {
+    adminState.rosterFingerprint = "";
+    adminState.liveFeedFingerprint = "";
+    loadDashboard({ quiet: true });
+  }
 });
 
 loadAdminSession();
