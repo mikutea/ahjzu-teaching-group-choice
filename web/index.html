@@ -7,7 +7,7 @@
   <title>教学组线上抢选</title>
   <link rel="stylesheet" href="/assets/app.css">
 </head>
-<body class="student-body">
+<body class="student-body" data-student-view="login">
   <div class="blueprint-grid" aria-hidden="true"></div>
   <header class="student-brandbar">
     <a class="college-wordmark college-wordmark--mobile" href="/" aria-label="建筑与空间规划学院教学组抢选首页">
@@ -37,16 +37,19 @@
       <form id="student-login-form" class="form-stack" novalidate>
         <label class="field">
           <span>学号</span>
-          <input id="student-no" name="student_no" inputmode="numeric" autocomplete="username" maxlength="40" required placeholder="请输入学号">
+          <input id="student-no" name="student_no" type="text" inputmode="text" autocomplete="username" autocapitalize="characters" autocorrect="off" spellcheck="false" enterkeyhint="next" minlength="4" maxlength="32" pattern="[A-Za-z0-9_-]{4,32}" required placeholder="请输入学号" aria-describedby="student-no-error">
+          <small id="student-no-error" class="form-error field-validation is-hidden" aria-live="polite"></small>
         </label>
         <label class="field">
           <span>姓名</span>
-          <input id="student-name" name="name" autocomplete="name" maxlength="80" required placeholder="请输入姓名">
+          <input id="student-name" name="name" type="text" inputmode="text" autocomplete="name" autocapitalize="words" enterkeyhint="next" minlength="1" maxlength="80" pattern="[A-Za-zÀ-ɏ\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF·•・'’\-‐‑ ]{1,80}" required placeholder="请输入姓名" aria-describedby="student-name-error">
+          <small id="student-name-error" class="form-error field-validation is-hidden" aria-live="polite"></small>
         </label>
         <label class="field">
           <span>个人激活码</span>
-          <input id="activation-code" name="activation_code" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" minlength="6" maxlength="6" required placeholder="请输入证件号后 6 位" aria-describedby="activation-code-help">
+          <input id="activation-code" name="activation_code" type="text" inputmode="text" autocomplete="one-time-code" autocapitalize="characters" autocorrect="off" spellcheck="false" enterkeyhint="go" minlength="6" maxlength="6" pattern="[A-Za-z0-9]{6}" required placeholder="请输入证件号后 6 位" aria-describedby="activation-code-help activation-code-error">
           <small id="activation-code-help" class="field-help">个人激活码固定为证件号后 6 位，不会随机生成</small>
+          <small id="activation-code-error" class="form-error field-validation is-hidden" aria-live="polite"></small>
         </label>
         <button class="button button--primary button--wide" type="submit">
           核验并进入 <span aria-hidden="true">→</span>
@@ -57,7 +60,7 @@
 
     <section id="choice-view" class="student-card is-hidden" aria-labelledby="choice-title">
       <div class="student-identity">
-        <div class="student-avatar" aria-hidden="true">建</div>
+        <div id="student-major-badge" class="student-avatar" role="img" aria-label="专业标识" title="专业标识">专</div>
         <div>
           <p id="student-display-name" class="student-identity__name"></p>
           <p id="student-display-meta" class="student-identity__meta"></p>
@@ -78,7 +81,7 @@
 
     <section id="waiting-view" class="student-card waiting-card is-hidden" aria-labelledby="waiting-title">
       <div class="student-identity">
-        <div class="student-avatar" aria-hidden="true">建</div>
+        <div id="waiting-major-badge" class="student-avatar" role="img" aria-label="专业标识" title="专业标识">专</div>
         <div>
           <p id="waiting-student-name" class="student-identity__name"></p>
           <p id="waiting-student-meta" class="student-identity__meta"></p>
@@ -107,8 +110,11 @@
         <span>系统记录时间</span>
         <strong id="success-time"></strong>
       </div>
-      <p class="success-card__tip">请截图留存。最终安排以学院发布结果为准。</p>
-      <button id="success-logout" class="button button--secondary button--wide" type="button">安全退出</button>
+      <p class="success-card__tip">可下载学院统一尺寸的结果卡。最终安排以学院发布结果为准。</p>
+      <div class="success-card__actions">
+        <button id="download-result-card" class="button button--primary button--wide" type="button">下载统一结果卡</button>
+        <button id="success-logout" class="button button--secondary button--wide" type="button">安全退出</button>
+      </div>
     </section>
 
     <div id="student-message" class="toast" role="status" aria-live="polite"></div>
