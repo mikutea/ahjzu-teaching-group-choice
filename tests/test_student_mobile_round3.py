@@ -93,6 +93,24 @@ eval(source + `
     invalid: validateStudentLoginPayload({
       student_no: "12<script>", name: "张三🙂", activation_code: "12*456"
     }),
+    legacy: [
+      {student_no: "LEGACY.2026.001", name: "旧版兼容学生", activation_code: "A1B2C3"},
+      {student_no: "L".repeat(35), name: "=Legacy Name", activation_code: "A1B2C3"},
+    ].map((payload) => validateStudentLoginPayload(payload)),
+    unsafeEnvelope: {
+      studentNoControl: validateStudentLoginPayload({
+        student_no: "bad\\nnumber", name: "正常姓名", activation_code: "A1B2C3"
+      }),
+      nameControl: validateStudentLoginPayload({
+        student_no: "20260001", name: "坏\\u0007姓名", activation_code: "A1B2C3"
+      }),
+      studentNoTooLong: validateStudentLoginPayload({
+        student_no: "L".repeat(41), name: "正常姓名", activation_code: "A1B2C3"
+      }),
+      nameTooLong: validateStudentLoginPayload({
+        student_no: "20260001", name: "名".repeat(81), activation_code: "A1B2C3"
+      }),
+    },
     badges: [
       professionalBadge("建筑学（五年制）"),
       professionalBadge("城乡规划"),
@@ -117,12 +135,17 @@ eval(source + `
     assert execution.returncode == 0, execution.stderr
     result = json.loads(execution.stdout)
     assert result["normalized"] == {
-        "student_no": "ABC_12",
+        "student_no": "ＡＢＣ＿１２",
         "name": "O’Connor · 李",
         "activation_code": "A1B2C3",
     }
     assert result["valid"] == {}
-    assert set(result["invalid"]) == {"student_no", "name", "activation_code"}
+    assert set(result["invalid"]) == {"activation_code"}
+    assert result["legacy"] == [{}, {}]
+    assert set(result["unsafeEnvelope"]["studentNoControl"]) == {"student_no"}
+    assert set(result["unsafeEnvelope"]["nameControl"]) == {"name"}
+    assert set(result["unsafeEnvelope"]["studentNoTooLong"]) == {"student_no"}
+    assert set(result["unsafeEnvelope"]["nameTooLong"]) == {"name"}
     assert result["badges"] == ["建", "规", "景", "室", "专"]
     assert result["supportedNames"] == [0, 0, 0, 0]
 
@@ -130,6 +153,11 @@ eval(source + `
 def test_major_badges_and_standardized_result_card_are_exposed_without_secrets() -> None:
     parser, html = _student_dom()
     student_js = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
+
+    assert "studentLoginFields.student_no.input.minLength = 1" in student_js
+    assert "studentLoginFields.student_no.input.maxLength = STUDENT_NO_MAX_INPUT_LENGTH" in student_js
+    assert 'studentLoginFields.student_no.input.removeAttribute("pattern")' in student_js
+    assert 'studentLoginFields.name.input.removeAttribute("pattern")' in student_js
 
     for badge_id in ("student-major-badge", "waiting-major-badge"):
         badge = parser.by_id[badge_id]

@@ -6,7 +6,6 @@ import hashlib
 import hmac
 import io
 import json
-import re
 import secrets
 import sqlite3
 import threading
@@ -24,7 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.table import Table, TableStyleInfo
-from pydantic import BaseModel, Field, ValidationInfo, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Config, PROJECT_ROOT
@@ -48,6 +47,17 @@ from .security import (
     verify_activation_code,
     verify_password,
 )
+from .student_identity import (
+    ACTIVATION_CODE_LENGTH,
+    STUDENT_NAME_MAX_LENGTH,
+    STUDENT_NAME_MIN_LENGTH,
+    STUDENT_NUMBER_MAX_LENGTH,
+    STUDENT_NUMBER_MIN_LENGTH,
+    StudentIdentityError,
+    normalize_activation_code,
+    normalize_student_name,
+    normalize_student_number,
+)
 
 
 WEB_ROOT = PROJECT_ROOT / "web"
@@ -66,15 +76,6 @@ COUNTDOWN_SECONDS = 10
 PRESENCE_FRESH_SECONDS = 35
 HEARTBEAT_WRITE_INTERVAL_SECONDS = 15
 MAX_ADMIN_SESSIONS_PER_USER = 8
-
-STUDENT_NUMBER_PATTERN = re.compile(r"^[A-Za-z0-9_-]{4,32}$")
-STUDENT_NAME_PATTERN = re.compile(
-    r"^[A-Za-z0-9\u00C0-\u024F\u1E00-\u1EFF"
-    r"\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF"
-    r"\U00020000-\U0002FA1F ·•・'’\-‐‑]+$"
-)
-ACTIVATION_CODE_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
-
 
 def session_utc_now() -> str:
     """Wall clock for credential expiry, intentionally separate from event test clocks."""
@@ -221,44 +222,64 @@ class AdminLogin(StrictModel):
 
 
 class StudentLogin(StrictModel):
-    student_no: str = Field(min_length=4, max_length=32)
-    name: str = Field(min_length=1, max_length=80)
-    activation_code: str = Field(min_length=6, max_length=6)
+    student_no: str = Field(
+        min_length=STUDENT_NUMBER_MIN_LENGTH,
+        max_length=STUDENT_NUMBER_MAX_LENGTH,
+    )
+    name: str = Field(
+        min_length=STUDENT_NAME_MIN_LENGTH,
+        max_length=STUDENT_NAME_MAX_LENGTH,
+    )
+    activation_code: str = Field(
+        min_length=ACTIVATION_CODE_LENGTH,
+        max_length=ACTIVATION_CODE_LENGTH,
+    )
 
-    @field_validator("student_no", "name", mode="before")
+    @field_validator("student_no", mode="before")
     @classmethod
-    def strip_values(cls, value: Any, info: ValidationInfo) -> Any:
-        if not isinstance(value, str):
-            return value
-        if any(unicodedata.category(character).startswith("C") for character in value):
-            raise ValueError(f"{info.field_name} 不能包含控制字符")
-        return clean_text(value)
+    def normalize_student_number_field(cls, value: Any) -> str:
+        return normalize_student_number(value)
 
-    @field_validator("student_no")
+    @field_validator("name", mode="before")
     @classmethod
-    def validate_student_number(cls, value: str) -> str:
-        if not STUDENT_NUMBER_PATTERN.fullmatch(value):
-            raise ValueError("学号只能包含英文字母、数字、下划线或连字符")
-        return value
-
-    @field_validator("name")
-    @classmethod
-    def validate_student_name(cls, value: str) -> str:
-        if not STUDENT_NAME_PATTERN.fullmatch(value):
-            raise ValueError("姓名包含不支持的字符")
-        return value
+    def normalize_student_name_field(cls, value: Any) -> str:
+        return normalize_student_name(value)
 
     @field_validator("activation_code", mode="before")
     @classmethod
     def normalize_activation_code(cls, value: Any) -> Any:
+        return normalize_activation_code(value)
+
+
+class StudentLoginRequest(StrictModel):
+    """Safe historical envelope; the endpoint applies the strict shared contract.
+
+    Releases before the shared contract admitted student numbers up to 40
+    characters and arbitrary names up to 80 characters.  Keeping this narrow
+    envelope lets an exact, already-stored legacy identity authenticate without
+    rewriting the student number that binds its encrypted activation code.
+    """
+
+    student_no: str = Field(min_length=1, max_length=40)
+    name: str = Field(min_length=1, max_length=STUDENT_NAME_MAX_LENGTH)
+    activation_code: str = Field(
+        min_length=ACTIVATION_CODE_LENGTH,
+        max_length=ACTIVATION_CODE_LENGTH,
+    )
+
+    @field_validator("student_no", "name", mode="before")
+    @classmethod
+    def normalize_legacy_identity_text(cls, value: Any) -> Any:
         if not isinstance(value, str):
             return value
-        normalized = "".join(
-            unicodedata.normalize("NFKC", value).strip().upper().split()
-        )
-        if not ACTIVATION_CODE_PATTERN.fullmatch(normalized):
-            raise ValueError("个人激活码必须是 6 位英文字母或数字")
-        return normalized
+        if any(unicodedata.category(character).startswith("C") for character in value):
+            raise ValueError("身份信息不能包含控制字符")
+        return clean_text(value)
+
+    @field_validator("activation_code", mode="before")
+    @classmethod
+    def normalize_request_activation_code(cls, value: Any) -> str:
+        return normalize_activation_code(value)
 
 
 class StatusUpdate(StrictModel):
@@ -380,34 +401,81 @@ class Identity:
 
 
 class RateLimiter:
-    def __init__(self, *, max_keys: int = 10_000) -> None:
+    def __init__(
+        self, *, max_keys: int | None = 10_000, evict_oldest: bool = True
+    ) -> None:
+        if max_keys is not None and max_keys < 1:
+            raise ValueError("max_keys must be positive or None")
         self._events: dict[str, list[float]] = {}
         self._lock = threading.Lock()
         self._max_keys = max_keys
+        self._evict_oldest = evict_oldest
         self._last_cleanup = 0.0
 
-    def check(self, key: str, *, limit: int, window_seconds: int) -> None:
+    def _events_for_key(self, key: str, cutoff: float) -> list[float]:
+        events = [event for event in self._events.get(key, []) if event >= cutoff]
+        if events:
+            self._events[key] = events
+        else:
+            self._events.pop(key, None)
+        return events
+
+    def _cleanup(self, now: float, cutoff: float) -> None:
+        if now - self._last_cleanup < 60:
+            return
+        self._events = {
+            existing_key: [event for event in events if event >= cutoff]
+            for existing_key, events in self._events.items()
+            if any(event >= cutoff for event in events)
+        }
+        self._last_cleanup = now
+
+    def is_limited(self, key: str, *, limit: int, window_seconds: int) -> bool:
         now = time.monotonic()
         cutoff = now - window_seconds
         with self._lock:
-            if now - self._last_cleanup >= 60:
-                self._events = {
-                    existing_key: [event for event in events if event >= cutoff]
-                    for existing_key, events in self._events.items()
-                    if any(event >= cutoff for event in events)
-                }
-                self._last_cleanup = now
-            if key not in self._events and len(self._events) >= self._max_keys:
+            self._cleanup(now, cutoff)
+            events = self._events_for_key(key, cutoff)
+            if len(events) >= limit:
+                return True
+            return bool(
+                not events
+                and self._max_keys is not None
+                and not self._evict_oldest
+                and len(self._events) >= self._max_keys
+            )
+
+    def record_failure(
+        self, key: str, *, limit: int, window_seconds: int
+    ) -> bool:
+        """Atomically record one failure and return whether it was already limited."""
+
+        now = time.monotonic()
+        cutoff = now - window_seconds
+        with self._lock:
+            self._cleanup(now, cutoff)
+            events = self._events_for_key(key, cutoff)
+            if len(events) >= limit:
+                return True
+            if (
+                self._max_keys is not None
+                and key not in self._events
+                and len(self._events) >= self._max_keys
+            ):
+                if not self._evict_oldest:
+                    return True
                 oldest_key = min(
                     self._events,
                     key=lambda existing_key: self._events[existing_key][-1],
                 )
                 self._events.pop(oldest_key, None)
-            events = [event for event in self._events.get(key, []) if event >= cutoff]
-            if len(events) >= limit:
-                raise HTTPException(status_code=429, detail="尝试次数过多，请稍后再试")
             events.append(now)
             self._events[key] = events
+            return False
+
+    def check(self, key: str, *, limit: int, window_seconds: int) -> None:
+        if self.record_failure(key, limit=limit, window_seconds=window_seconds):
+            raise HTTPException(status_code=429, detail="尝试次数过多，请稍后再试")
 
     def clear(self, key: str) -> None:
         with self._lock:
@@ -417,7 +485,12 @@ class RateLimiter:
 def create_app(config: Config | None = None) -> FastAPI:
     config = config or Config.from_env()
     initialize_database(config)
-    limiter = RateLimiter()
+    student_ip_limiter = RateLimiter()
+    student_family_limiter = RateLimiter()
+    student_id_limiter = RateLimiter(max_keys=4_096, evict_oldest=False)
+    admin_ip_limiter = RateLimiter()
+    admin_account_limiter = RateLimiter()
+    activation_reveal_limiter = RateLimiter()
     app = FastAPI(
         title="教学组抢选系统",
         docs_url=None if config.environment == "production" else "/api/docs",
@@ -474,6 +547,16 @@ def create_app(config: Config | None = None) -> FastAPI:
         digest = hmac.new(
             config.app_secret.encode("utf-8"),
             f"{namespace}:{clean_text(value).casefold()}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return f"{namespace}:{digest[:24]}"
+
+    def student_login_principal_key(namespace: str, value: str) -> str:
+        """Hash an already-selected login identity without changing its semantics."""
+
+        digest = hmac.new(
+            config.app_secret.encode("utf-8"),
+            namespace.encode("utf-8") + b"\0" + value.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
         return f"{namespace}:{digest[:24]}"
@@ -1178,33 +1261,136 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.close()
 
     @app.post("/api/student/login")
-    def student_login(payload: StudentLogin, request: Request, response: Response):
+    def student_login(
+        payload: StudentLoginRequest, request: Request, response: Response
+    ):
+        strict_payload: StudentLogin | None = None
+        try:
+            strict_payload = StudentLogin.model_validate(payload.model_dump())
+        except ValidationError:
+            strict_payload = None
+
         ip_key = client_key(request, "student-login-ip")
-        account_key = principal_key("student-login-account", payload.student_no)
-        limiter.check(ip_key, limit=500, window_seconds=300)
-        limiter.check(account_key, limit=10, window_seconds=300)
+        student_ip_limiter.check(ip_key, limit=500, window_seconds=300)
         connection = connect(config.database_path)
         token = new_session_token()
         csrf_token = new_csrf_token()
         now_dt = datetime.now(UTC)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
+            exact_candidate = connection.execute(
                 """
-                SELECT id, name, activation_hash, active
+                SELECT id, student_no, name, activation_hash, active
                 FROM students WHERE student_no = ?
                 """,
                 (payload.student_no,),
             ).fetchone()
-            valid = (
-                row
-                and row["active"]
-                and clean_text(row["name"]) == payload.name
-                and verify_activation_code(
-                    config.app_secret, payload.activation_code, row["activation_hash"]
-                )
+
+            canonical_candidate = None
+            if (
+                exact_candidate is None
+                and strict_payload is not None
+                and strict_payload.student_no != payload.student_no
+            ):
+                canonical_candidate = connection.execute(
+                    """
+                    SELECT id, student_no, name, activation_hash, active
+                    FROM students WHERE student_no = ?
+                    """,
+                    (strict_payload.student_no,),
+                ).fetchone()
+
+            resolved_candidate = exact_candidate or canonical_candidate
+            try:
+                family_identity = normalize_student_number(payload.student_no)
+            except StudentIdentityError:
+                family_identity = payload.student_no
+            family_key = student_login_principal_key(
+                "student-login-account-family", family_identity
             )
-            if not valid:
+            id_key = None
+            if resolved_candidate is not None:
+                id_key = student_login_principal_key(
+                    "student-login-account-id", str(resolved_candidate["id"])
+                )
+                if student_id_limiter.is_limited(
+                    id_key, limit=10, window_seconds=300
+                ):
+                    family_was_limited = student_family_limiter.record_failure(
+                        family_key, limit=10, window_seconds=300
+                    )
+                    raise HTTPException(
+                        status_code=429 if family_was_limited else 401,
+                        detail=(
+                            "尝试次数过多，请稍后再试"
+                            if family_was_limited
+                            else "学号、姓名或激活码不正确"
+                        ),
+                    )
+            row = None
+            if exact_candidate is not None:
+                try:
+                    stored_identity_is_current = (
+                        normalize_student_number(exact_candidate["student_no"])
+                        == exact_candidate["student_no"]
+                        and normalize_student_name(exact_candidate["name"])
+                        == exact_candidate["name"]
+                    )
+                except StudentIdentityError:
+                    stored_identity_is_current = False
+                current_identity_match = bool(
+                    stored_identity_is_current
+                    and strict_payload
+                    and exact_candidate["name"] == strict_payload.name
+                )
+                legacy_identity_match = bool(
+                    not stored_identity_is_current
+                    and exact_candidate["name"] == payload.name
+                )
+                if (
+                    exact_candidate["active"]
+                    and (current_identity_match or legacy_identity_match)
+                    and verify_activation_code(
+                        config.app_secret,
+                        payload.activation_code,
+                        exact_candidate["activation_hash"],
+                    )
+                ):
+                    row = exact_candidate
+            elif canonical_candidate is not None:
+                try:
+                    canonical_record_is_current = (
+                        normalize_student_number(canonical_candidate["student_no"])
+                        == canonical_candidate["student_no"]
+                        and normalize_student_name(canonical_candidate["name"])
+                        == canonical_candidate["name"]
+                    )
+                except StudentIdentityError:
+                    canonical_record_is_current = False
+                if (
+                    canonical_record_is_current
+                    and canonical_candidate["active"]
+                    and canonical_candidate["name"] == strict_payload.name
+                    and verify_activation_code(
+                        config.app_secret,
+                        payload.activation_code,
+                        canonical_candidate["activation_hash"],
+                    )
+                ):
+                    row = canonical_candidate
+
+            if row is None:
+                family_was_limited = student_family_limiter.record_failure(
+                    family_key, limit=10, window_seconds=300
+                )
+                if id_key is not None:
+                    student_id_limiter.record_failure(
+                        id_key, limit=10, window_seconds=300
+                    )
+                if family_was_limited:
+                    raise HTTPException(
+                        status_code=429, detail="尝试次数过多，请稍后再试"
+                    )
                 raise HTTPException(status_code=401, detail="学号、姓名或激活码不正确")
             student_id = int(row["id"])
             student_data = student_payload_from_connection(connection, student_id)
@@ -1222,7 +1408,8 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise
         finally:
             connection.close()
-        limiter.clear(account_key)
+        if id_key is not None:
+            student_id_limiter.clear(id_key)
         set_session_cookie(response, "student", token)
         return {"csrf_token": csrf_token, **student_data}
 
@@ -1314,8 +1501,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         username = payload.username.strip()
         ip_key = client_key(request, "admin-login-ip")
         account_key = principal_key("admin-login-account", username)
-        limiter.check(ip_key, limit=50, window_seconds=300)
-        limiter.check(account_key, limit=10, window_seconds=300)
+        admin_ip_limiter.check(ip_key, limit=50, window_seconds=300)
+        admin_account_limiter.check(account_key, limit=10, window_seconds=300)
         read_connection = connect(config.database_path)
         try:
             candidate = read_connection.execute(
@@ -1356,7 +1543,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise
         finally:
             connection.close()
-        limiter.clear(account_key)
+        admin_account_limiter.clear(account_key)
         set_session_cookie(response, "admin", token)
         return {"csrf_token": csrf_token, "username": username}
 
@@ -2522,11 +2709,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                     ),
                 )
             seen_numbers.add(row.student_no)
-            if (
-                len(row.student_no) > 40
-                or len(row.name) > 80
-                or len(row.major_name) > 80
-            ):
+            if len(row.major_name) > 80:
                 raise HTTPException(
                     status_code=400,
                     detail=f"第 {row.file_index} 个文件第 {row.line_number} 行字段长度超限",
@@ -2537,6 +2720,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         updated = 0
         deactivated = 0
         rotated = 0
+        seen_student_ids: set[int] = set()
         try:
             connection.execute("BEGIN IMMEDIATE")
             require_expected_activity(request, connection, identity=identity)
@@ -2547,6 +2731,27 @@ def create_app(config: Config | None = None) -> FastAPI:
                     "SELECT id, name FROM majors WHERE active = 1"
                 ).fetchall()
             }
+            stored_students = connection.execute(
+                """
+                SELECT id, student_no, name, major_id, activation_hash,
+                       activation_ciphertext, active
+                FROM students
+                """
+            ).fetchall()
+            students_by_number = {
+                candidate["student_no"]: candidate for candidate in stored_students
+            }
+            students_by_canonical_number: dict[str, list[sqlite3.Row]] = {}
+            for candidate in stored_students:
+                try:
+                    canonical_number = normalize_student_number(
+                        candidate["student_no"]
+                    )
+                except StudentIdentityError:
+                    continue
+                students_by_canonical_number.setdefault(canonical_number, []).append(
+                    candidate
+                )
             for row in rows:
                 student_no = row.student_no
                 name = row.name
@@ -2560,15 +2765,23 @@ def create_app(config: Config | None = None) -> FastAPI:
                             f"“{major_name}”不存在或已停用"
                         ),
                     )
-                existing = connection.execute(
-                    """
-                    SELECT id, name, major_id, activation_hash,
-                           activation_ciphertext, active
-                    FROM students WHERE student_no = ?
-                    """,
-                    (student_no,),
-                ).fetchone()
+                existing = students_by_number.get(row.source_student_no)
+                if existing is None:
+                    legacy_candidates = students_by_canonical_number.get(
+                        student_no, []
+                    )
+                    if len(legacy_candidates) > 1:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"学号 {student_no} 对应多条旧格式学生记录；"
+                                "请先人工核对并清理重复记录"
+                            ),
+                        )
+                    if legacy_candidates:
+                        existing = legacy_candidates[0]
                 if existing:
+                    stored_student_no = existing["student_no"]
                     active_selection = connection.execute(
                         "SELECT 1 FROM selections WHERE student_id = ? AND revoked_at IS NULL",
                         (existing["id"],),
@@ -2597,22 +2810,29 @@ def create_app(config: Config | None = None) -> FastAPI:
                             name,
                             major_map[major_name],
                             activation_code_hash(config.app_secret, code),
-                            encrypt_activation_code(config.app_secret, student_no, code),
+                            encrypt_activation_code(
+                                config.app_secret, stored_student_no, code
+                            ),
                             utc_now(),
                             existing["id"],
                         ),
                     )
                     if credential_changed:
                         rotated += 1
-                    if credential_changed or profile_changed or access_changed:
+                    if (
+                        credential_changed
+                        or profile_changed
+                        or access_changed
+                    ):
                         connection.execute(
                             "DELETE FROM sessions WHERE role = 'student' AND subject_id = ?",
                             (existing["id"],),
                         )
                     updated += 1
+                    seen_student_ids.add(int(existing["id"]))
                 else:
                     now = utc_now()
-                    connection.execute(
+                    cursor = connection.execute(
                         """
                         INSERT INTO students
                             (student_no, name, major_id, activation_hash,
@@ -2629,6 +2849,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                             now,
                         ),
                     )
+                    seen_student_ids.add(int(cursor.lastrowid))
                     created += 1
 
             if mode == "sync":
@@ -2637,7 +2858,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                     for row in connection.execute(
                         "SELECT id, student_no, name FROM students WHERE active = 1"
                     ).fetchall()
-                    if row["student_no"] not in seen_numbers
+                    if int(row["id"]) not in seen_student_ids
                 ]
                 blocked = []
                 for missing in missing_students:
@@ -2727,7 +2948,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/api/admin/students/{student_id}/activation-code/reveal")
     def reveal_student_activation_code(student_id: int, request: Request):
         identity = require_session(request, "admin", csrf=True)
-        limiter.check(
+        activation_reveal_limiter.check(
             principal_key("activation-code-reveal", str(identity.subject_id)),
             limit=500,
             window_seconds=300,
