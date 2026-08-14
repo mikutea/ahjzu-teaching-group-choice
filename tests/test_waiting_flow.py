@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -32,7 +31,7 @@ def import_roster(
         "/api/admin/students/import",
         headers=headers,
         files={
-            "file": (
+            "files": (
                 "students.csv",
                 ("\n".join(csv_rows) + "\n").encode("utf-8"),
                 "text/csv",
@@ -68,7 +67,7 @@ def student_headers(payload: dict, activity_id: int) -> dict[str, str]:
     }
 
 
-def test_activation_code_is_encrypted_revealable_and_random_reset_is_forbidden(
+def test_activation_code_is_encrypted_and_revealable(
     app,
     client: TestClient,
     admin_headers: dict[str, str],
@@ -82,7 +81,7 @@ def test_activation_code_is_encrypted_revealable_and_random_reset_is_forbidden(
         client,
         admin_headers,
         major_name,
-        [("20500001", "Activation Student", document_number)],
+        [("20500000001", "Activation Student", document_number)],
     )
     assert imported.status_code == 200, imported.text
 
@@ -95,7 +94,7 @@ def test_activation_code_is_encrypted_revealable_and_random_reset_is_forbidden(
         stored = connection.execute(
             """
             SELECT id, activation_hash, activation_ciphertext
-            FROM students WHERE student_no = '20500001'
+            FROM students WHERE student_no = '20500000001'
             """
         ).fetchone()
         assert stored is not None
@@ -109,7 +108,7 @@ def test_activation_code_is_encrypted_revealable_and_random_reset_is_forbidden(
 
     student, login = login_student(
         app,
-        student_no="20500001",
+        student_no="20500000001",
         name="Activation Student",
         activation_code=activation_code,
     )
@@ -125,7 +124,7 @@ def test_activation_code_is_encrypted_revealable_and_random_reset_is_forbidden(
     assert revealed.status_code == 200, revealed.text
     assert "no-store" in revealed.headers.get("cache-control", "").lower()
     assert revealed.json()["credential"] == {
-        "student_no": "20500001",
+        "student_no": "20500000001",
         "name": "Activation Student",
         "major": major_name,
         "activation_code": activation_code,
@@ -133,12 +132,6 @@ def test_activation_code_is_encrypted_revealable_and_random_reset_is_forbidden(
     audit_actions = [row["action"] for row in client.get("/api/admin/audit").json()]
     assert "student.activation_code.reveal" in audit_actions
 
-    reset = client.post(
-        f"/api/admin/students/{student_id}/activation-code",
-        headers=admin_headers,
-    )
-    assert reset.status_code == 409, reset.text
-    assert "重新导入" in reset.json()["detail"]
     revealed_again = client.post(
         f"/api/admin/students/{student_id}/activation-code/reveal",
         headers=admin_headers,
@@ -151,71 +144,13 @@ def test_activation_code_is_encrypted_revealable_and_random_reset_is_forbidden(
         assert same_code.post(
             "/api/student/login",
             json={
-                "student_no": "20500001",
+                "student_no": "20500000001",
                 "name": "Activation Student",
                 "activation_code": activation_code,
             },
         ).status_code == 200
     finally:
         same_code.close()
-
-
-def test_legacy_hash_only_activation_code_requires_reimport_before_reveal(
-    client: TestClient,
-    admin_headers: dict[str, str],
-    app_config,
-):
-    dashboard = client.get("/api/admin/dashboard").json()
-    major_name = dashboard["majors"][0]["name"]
-    imported = import_roster(
-        client,
-        admin_headers,
-        major_name,
-        [("20500002", "Legacy Student", fictional_document_number("LEGACY99"))],
-    )
-    assert imported.status_code == 200, imported.text
-    student_id = next(
-        row["id"]
-        for row in client.get("/api/admin/dashboard").json()["students"]
-        if row["student_no"] == "20500002"
-    )
-
-    connection = connect(app_config.database_path)
-    try:
-        connection.execute(
-            "UPDATE students SET activation_ciphertext = NULL WHERE id = ?",
-            (student_id,),
-        )
-    finally:
-        connection.close()
-
-    unavailable = client.post(
-        f"/api/admin/students/{student_id}/activation-code/reveal",
-        headers=admin_headers,
-    )
-    assert unavailable.status_code == 409
-    assert "重新导入" in unavailable.json()["detail"]
-    reset = client.post(
-        f"/api/admin/students/{student_id}/activation-code",
-        headers=admin_headers,
-    )
-    assert reset.status_code == 409, reset.text
-    repaired = import_roster(
-        client,
-        admin_headers,
-        major_name,
-        [("20500002", "Legacy Student", fictional_document_number("LEGACY99"))],
-    )
-    assert repaired.status_code == 200, repaired.text
-    revealed = client.post(
-        f"/api/admin/students/{student_id}/activation-code/reveal",
-        headers=admin_headers,
-    )
-    assert revealed.status_code == 200, revealed.text
-    assert (
-        revealed.json()["credential"]["activation_code"]
-        == fictional_activation_code("LEGACY99")
-    )
 
 
 def test_copyright_is_fixed_and_settings_api_cannot_change_it(
@@ -260,13 +195,13 @@ def test_major_and_group_can_only_be_disabled_when_safe(
         client,
         admin_headers,
         occupied_major["name"],
-        [("20510001", "Assigned Student", fictional_document_number("ASSIGNED1"))],
+        [("20510000001", "Assigned Student", fictional_document_number("ASSIGNED1"))],
     )
     assert imported.status_code == 200, imported.text
     student_id = next(
         row["id"]
         for row in client.get("/api/admin/dashboard").json()["students"]
-        if row["student_no"] == "20510001"
+        if row["student_no"] == "20510000001"
     )
 
     major_blocked = client.patch(
@@ -340,16 +275,16 @@ def test_waiting_room_presence_heartbeat_and_absent_roster(
         admin_headers,
         major_name,
         [
-            ("20520001", "Entered Student", fictional_document_number("ENTERED1")),
-            ("20520002", "Absent Student", fictional_document_number("ABSENT22")),
-            ("20520003", "Also Absent", fictional_document_number("ABSENT33")),
+            ("20520000001", "Entered Student", fictional_document_number("ENTERED1")),
+            ("20520000002", "Absent Student", fictional_document_number("ABSENT22")),
+            ("20520000003", "Also Absent", fictional_document_number("ABSENT33")),
         ],
     )
     assert imported.status_code == 200, imported.text
 
     student, login = login_student(
         app,
-        student_no="20520001",
+        student_no="20520000001",
         name="Entered Student",
         activation_code=fictional_activation_code("ENTERED1"),
     )
@@ -360,11 +295,11 @@ def test_waiting_room_presence_heartbeat_and_absent_roster(
         assert waiting["presence"]["online_count"] == 1
         assert waiting["presence"]["absent_count"] == 2
         assert [row["student_no"] for row in waiting["entered_students"]] == [
-            "20520001"
+            "20520000001"
         ]
         assert {row["student_no"] for row in waiting["absent_students"]} == {
-            "20520002",
-            "20520003",
+            "20520000002",
+            "20520000003",
         }
 
         connection = connect(app_config.database_path)
@@ -426,12 +361,12 @@ def test_countdown_uses_server_clock_and_opens_atomically_without_sleeping(
         client,
         admin_headers,
         major_name,
-        [("20530001", "Countdown Student", fictional_document_number("COUNTDWN"))],
+        [("20530000001", "Countdown Student", fictional_document_number("COUNTDWN"))],
     )
     assert imported.status_code == 200, imported.text
     student, login = login_student(
         app,
-        student_no="20530001",
+        student_no="20530000001",
         name="Countdown Student",
         activation_code=fictional_activation_code("COUNTDWN"),
     )
@@ -440,7 +375,7 @@ def test_countdown_uses_server_clock_and_opens_atomically_without_sleeping(
         assert login["server_now"] == controlled_utc_now()
         assert login["selection_opens_at"] is None
 
-        started = client.post("/api/admin/start-countdown", headers=admin_headers)
+        started = client.post("/api/admin/countdown", headers=admin_headers)
         assert started.status_code == 200, started.text
         opens_at = (base + timedelta(seconds=10)).isoformat(timespec="seconds")
         assert started.json()["selection_opens_at"] == opens_at
@@ -491,10 +426,10 @@ def test_cancelling_countdown_returns_to_waiting_and_clears_schedule(
         client,
         admin_headers,
         dashboard["majors"][0]["name"],
-        [("20530002", "Cancelled Countdown", fictional_document_number("CANCEL10"))],
+        [("20530000002", "Cancelled Countdown", fictional_document_number("CANCEL10"))],
     )
     assert imported.status_code == 200, imported.text
-    started = client.post("/api/admin/start-countdown", headers=admin_headers)
+    started = client.post("/api/admin/countdown", headers=admin_headers)
     assert started.status_code == 200, started.text
     assert started.json()["phase"] == "countdown"
 
@@ -521,17 +456,17 @@ def test_activity_rollover_clears_countdown_and_revokes_old_student_session(
         client,
         admin_headers,
         major_name,
-        [("20540001", "Rollover Student", fictional_document_number("ROLLOVER"))],
+        [("20540000001", "Rollover Student", fictional_document_number("ROLLOVER"))],
     )
     assert imported.status_code == 200, imported.text
     student, _ = login_student(
         app,
-        student_no="20540001",
+        student_no="20540000001",
         name="Rollover Student",
         activation_code=fictional_activation_code("ROLLOVER"),
     )
     try:
-        started = client.post("/api/admin/start-countdown", headers=admin_headers)
+        started = client.post("/api/admin/countdown", headers=admin_headers)
         assert started.status_code == 200, started.text
         assert started.json()["selection_opens_at"]
         closed = client.post(
@@ -605,8 +540,8 @@ def test_one_hundred_fifty_students_after_countdown_never_oversell(
 
     rows = [
         (
-            f"2055{index:04d}",
-            f"Countdown Load {index:03d}",
+            f"2055000{index:04d}",
+            f"CountdownLoad{chr(65 + (index // 26) // 26)}{chr(65 + (index // 26) % 26)}{chr(65 + index % 26)}",
             fictional_document_number(f"FLOW{index:04d}"),
         )
         for index in range(150)
@@ -627,7 +562,7 @@ def test_one_hundred_fifty_students_after_countdown_never_oversell(
             clients.append(student)
             payloads.append(payload)
 
-        started = client.post("/api/admin/start-countdown", headers=admin_headers)
+        started = client.post("/api/admin/countdown", headers=admin_headers)
         assert started.status_code == 200, started.text
 
         early = clients[0].post(
@@ -686,41 +621,6 @@ def test_one_hundred_fifty_students_after_countdown_never_oversell(
             student.close()
 
 
-def test_forbidden_random_reset_does_not_revoke_existing_student_session(
-    app, client: TestClient, admin_headers: dict[str, str]
-):
-    dashboard = client.get("/api/admin/dashboard").json()
-    activity_id = int(dashboard["settings"]["activity_id"])
-    imported = import_roster(
-        client,
-        admin_headers,
-        dashboard["majors"][0]["name"],
-        [("20560001", "Heartbeat Reset Race", fictional_document_number("HEARTRST"))],
-    )
-    assert imported.status_code == 200, imported.text
-    student, login = login_student(
-        app,
-        student_no="20560001",
-        name="Heartbeat Reset Race",
-        activation_code=fictional_activation_code("HEARTRST"),
-    )
-    student_id = int(login["student"]["id"])
-    try:
-        reset = client.post(
-            f"/api/admin/students/{student_id}/activation-code",
-            headers=admin_headers,
-        )
-        assert reset.status_code == 409, reset.text
-        heartbeat = student.post(
-            "/api/student/heartbeat",
-            headers=student_headers(login, activity_id),
-        )
-        assert heartbeat.status_code == 200, heartbeat.text
-        assert student.get("/api/student/me").status_code == 200
-    finally:
-        student.close()
-
-
 def test_activity_rollover_cannot_race_heartbeat_into_old_activity(
     app,
     client: TestClient,
@@ -733,12 +633,12 @@ def test_activity_rollover_cannot_race_heartbeat_into_old_activity(
         client,
         admin_headers,
         dashboard["majors"][0]["name"],
-        [("20560002", "Heartbeat Rollover Race", fictional_document_number("HEARTROL"))],
+        [("20560000002", "Heartbeat Rollover Race", fictional_document_number("HEARTROL"))],
     )
     assert imported.status_code == 200, imported.text
     student, login = login_student(
         app,
-        student_no="20560002",
+        student_no="20560000002",
         name="Heartbeat Rollover Race",
         activation_code=fictional_activation_code("HEARTROL"),
     )
@@ -818,42 +718,3 @@ def test_activity_rollover_cannot_race_heartbeat_into_old_activity(
     finally:
         allow_heartbeat.set()
         student.close()
-
-
-def test_migrated_hash_only_rows_are_maintenance_compatible(app_config):
-    """A v0 fixture is covered elsewhere; this pins nullable ciphertext semantics."""
-    from server.database import initialize_database
-    from server.maintenance import check_database, migrate_and_check
-    from server.security import activation_code_hash
-
-    initialize_database(app_config)
-    connection = connect(app_config.database_path)
-    try:
-        major_id = int(connection.execute("SELECT id FROM majors ORDER BY id LIMIT 1").fetchone()[0])
-        now = "2026-01-01T00:00:00+00:00"
-        connection.execute(
-            """
-            INSERT INTO students
-                (student_no, name, major_id, activation_hash, activation_ciphertext,
-                 active, created_at, updated_at)
-            VALUES ('legacy-hash-only', 'Legacy Hash Only', ?, ?, NULL, 1, ?, ?)
-            """,
-            (
-                major_id,
-                activation_code_hash(app_config.app_secret, "HASHONLY"),
-                now,
-                now,
-            ),
-        )
-    finally:
-        connection.close()
-
-    assert check_database(app_config.database_path) == "ok"
-    assert migrate_and_check(app_config) == "MIGRATION_CHECK_OK"
-    connection = sqlite3.connect(app_config.database_path)
-    try:
-        assert connection.execute(
-            "SELECT activation_ciphertext FROM students WHERE student_no = 'legacy-hash-only'"
-        ).fetchone()[0] is None
-    finally:
-        connection.close()

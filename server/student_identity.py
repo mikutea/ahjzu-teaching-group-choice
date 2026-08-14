@@ -5,17 +5,21 @@ import unicodedata
 from typing import Any
 
 
-STUDENT_NUMBER_MIN_LENGTH = 4
-STUDENT_NUMBER_MAX_LENGTH = 32
+STUDENT_NUMBER_LENGTH = 11
+STUDENT_NUMBER_MIN_LENGTH = STUDENT_NUMBER_LENGTH
+STUDENT_NUMBER_MAX_LENGTH = STUDENT_NUMBER_LENGTH
 STUDENT_NAME_MIN_LENGTH = 1
-STUDENT_NAME_MAX_LENGTH = 80
+STUDENT_NAME_MAX_LENGTH = 40
 ACTIVATION_CODE_LENGTH = 6
 
-STUDENT_NUMBER_PATTERN = re.compile(r"^[A-Za-z0-9_-]{4,32}$")
-STUDENT_NAME_PATTERN = re.compile(
-    r"^[A-Za-z0-9\u00C0-\u024F\u1E00-\u1EFF"
+STUDENT_NUMBER_PATTERN = re.compile(r"^[0-9]{11}$")
+_STUDENT_NAME_LETTERS = (
+    r"A-Za-z"
     r"\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF"
-    r"\U00020000-\U0002FA1F ·•・'’\-‐‑]+$"
+    r"\U00020000-\U0002FA1F"
+)
+STUDENT_NAME_PATTERN = re.compile(
+    rf"^[{_STUDENT_NAME_LETTERS}]+(?:[ ·•・][{_STUDENT_NAME_LETTERS}]+)*$"
 )
 ACTIVATION_CODE_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
 
@@ -36,16 +40,8 @@ def normalize_student_number(value: Any) -> str:
     """Return the canonical value accepted by both import and login."""
 
     text = unicodedata.normalize("NFKC", _require_text(value, "学号")).strip()
-    if len(text) < STUDENT_NUMBER_MIN_LENGTH:
-        raise StudentIdentityError(
-            f"学号不能少于 {STUDENT_NUMBER_MIN_LENGTH} 个字符"
-        )
-    if len(text) > STUDENT_NUMBER_MAX_LENGTH:
-        raise StudentIdentityError(
-            f"学号不能超过 {STUDENT_NUMBER_MAX_LENGTH} 个字符"
-        )
     if not STUDENT_NUMBER_PATTERN.fullmatch(text):
-        raise StudentIdentityError("学号只能包含英文字母、数字、下划线或连字符")
+        raise StudentIdentityError(f"学号必须是 {STUDENT_NUMBER_LENGTH} 位数字")
     return text
 
 
@@ -61,13 +57,15 @@ def normalize_student_name(value: Any) -> str:
             f"姓名不能超过 {STUDENT_NAME_MAX_LENGTH} 个字符"
         )
     if not STUDENT_NAME_PATTERN.fullmatch(text):
-        raise StudentIdentityError("姓名包含不支持的字符")
+        raise StudentIdentityError(
+            "姓名只能包含中文或英文字母，姓名各部分之间可使用空格或中点"
+        )
     return text
 
 
 def normalize_activation_code(value: Any) -> str:
     text = _require_text(value, "个人激活码")
-    normalized = "".join(unicodedata.normalize("NFKC", text).strip().upper().split())
+    normalized = unicodedata.normalize("NFKC", text).strip().upper()
     if not ACTIVATION_CODE_PATTERN.fullmatch(normalized):
         raise StudentIdentityError(
             f"个人激活码必须是 {ACTIVATION_CODE_LENGTH} 位英文字母或数字"

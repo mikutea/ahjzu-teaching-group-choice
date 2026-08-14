@@ -1,8 +1,10 @@
 "use strict";
 
-const STUDENT_NO_MAX_INPUT_LENGTH = 40;
-const STUDENT_NAME_MAX_INPUT_LENGTH = 80;
+const STUDENT_NO_INPUT_LENGTH = 11;
+const STUDENT_NAME_MAX_INPUT_LENGTH = 40;
 const CONTROL_CHARACTER_PATTERN = /\p{C}/u;
+const STUDENT_NO_PATTERN = /^\d{11}$/;
+const STUDENT_NAME_PATTERN = /^[A-Za-z\p{Script=Han}]+(?:[ ·•・][A-Za-z\p{Script=Han}]+)*$/u;
 const ACTIVATION_CODE_PATTERN = /^[A-Z0-9]{6}$/;
 
 function normalizeCompatibilityText(value) {
@@ -15,12 +17,9 @@ function trimUnicodeSeparators(value) {
 
 function normalizeStudentLoginPayload(values) {
   return {
-    // Preserve identity characters for an exact legacy-record fallback. The
-    // server applies NFKC before matching every current-contract identity.
-    student_no: trimUnicodeSeparators(values.student_no),
-    name: trimUnicodeSeparators(values.name).replace(/\p{Z}+/gu, " "),
+    student_no: trimUnicodeSeparators(normalizeCompatibilityText(values.student_no)),
+    name: trimUnicodeSeparators(normalizeCompatibilityText(values.name)).replace(/\p{Z}+/gu, " "),
     activation_code: trimUnicodeSeparators(normalizeCompatibilityText(values.activation_code))
-      .replace(/\p{Z}+/gu, "")
       .toUpperCase(),
   };
 }
@@ -31,8 +30,8 @@ function validateStudentLoginPayload(payload) {
     errors.student_no = "请输入学号";
   } else if (CONTROL_CHARACTER_PATTERN.test(payload.student_no)) {
     errors.student_no = "学号不能包含换行或其他控制字符";
-  } else if (Array.from(payload.student_no).length > STUDENT_NO_MAX_INPUT_LENGTH) {
-    errors.student_no = `学号不能超过 ${STUDENT_NO_MAX_INPUT_LENGTH} 个字符`;
+  } else if (!STUDENT_NO_PATTERN.test(payload.student_no)) {
+    errors.student_no = "学号必须是 11 位数字";
   }
   if (!payload.name) {
     errors.name = "请输入姓名";
@@ -40,24 +39,58 @@ function validateStudentLoginPayload(payload) {
     errors.name = "姓名不能包含换行或其他控制字符";
   } else if (Array.from(payload.name).length > STUDENT_NAME_MAX_INPUT_LENGTH) {
     errors.name = `姓名不能超过 ${STUDENT_NAME_MAX_INPUT_LENGTH} 个字符`;
+  } else if (!STUDENT_NAME_PATTERN.test(payload.name)) {
+    errors.name = "姓名只能包含中文或英文字母，各部分之间可使用空格或中点";
   }
   if (!payload.activation_code) {
     errors.activation_code = "请输入个人激活码";
   } else if (CONTROL_CHARACTER_PATTERN.test(payload.activation_code)) {
     errors.activation_code = "个人激活码不能包含控制字符";
   } else if (!ACTIVATION_CODE_PATTERN.test(payload.activation_code)) {
-    errors.activation_code = "个人激活码须为证件号后 6 位字母或数字";
+    errors.activation_code = "个人激活码必须是 6 位英文字母或数字";
   }
   return errors;
 }
 
 function professionalBadge(majorName) {
   const major = normalizeCompatibilityText(majorName).trim();
-  if (major.includes("建筑学")) return "建";
-  if (major.includes("城乡规划")) return "规";
-  if (major.includes("风景园林")) return "景";
-  const firstMeaningful = Array.from(major).find((character) => /[\p{Script=Han}\p{Script=Latin}]/u.test(character));
-  return firstMeaningful ? firstMeaningful.toLocaleUpperCase("zh-CN") : "专";
+  if (/建筑学/.test(major)) return "建筑学";
+  if (/(城乡|城市)规划/.test(major)) return "城乡规划";
+  if (/风景园林/.test(major)) return "风景园林";
+  if (/环境设计/.test(major)) return "环境设计";
+  const baseName = major.split(/[（(]/, 1)[0].trim();
+  if (!baseName) return "专业";
+  const characters = Array.from(baseName);
+  return characters.length <= 6 ? baseName : `${characters.slice(0, 6).join("")}…`;
+}
+
+const STUDENT_CLOCK_SYNC_PATHS = new Set([
+  "/api/public/info",
+  "/api/student/login",
+  "/api/student/me",
+]);
+const studentResponseClockTimings = new WeakMap();
+
+function beginStudentClockRequestTiming(path) {
+  if (!STUDENT_CLOCK_SYNC_PATHS.has(path)) return null;
+  return {
+    requestWallMs: Date.now(),
+    requestMonotonicMs: studentMonotonicNow(),
+  };
+}
+
+function finishStudentClockRequestTiming(timing) {
+  if (!timing) return null;
+  return {
+    ...timing,
+    responseWallMs: Date.now(),
+    responseMonotonicMs: studentMonotonicNow(),
+  };
+}
+
+function rememberStudentResponseClockTiming(payload, timing) {
+  if (!timing || !payload || typeof payload !== "object") return;
+  studentResponseClockTimings.set(payload, timing);
 }
 
 const studentState = {
@@ -69,15 +102,21 @@ const studentState = {
   messageTimer: null,
   countdownTimer: null,
   pollInFlight: false,
+  lastSelectedSyncAt: 0,
   heartbeatInFlight: false,
   boundaryRefreshPending: false,
-  serverClockOffset: 0,
   connectionInterrupted: false,
   lastBackgroundErrorAt: 0,
   sessionReloadTimer: null,
   lastPhase: null,
   resultCardInFlight: false,
   resultCardLogoPromise: null,
+  serverClockEpochMs: null,
+  serverClockMonotonicMs: null,
+  serverClockSynchronized: false,
+  serverClockOffsetMs: null,
+  serverClockLastSampleRttMs: null,
+  clockTimer: null,
 };
 
 const studentEls = {
@@ -108,7 +147,11 @@ const studentEls = {
   confirmGroupName: document.querySelector("#confirm-group-name"),
   successMessage: document.querySelector("#success-message"),
   successTime: document.querySelector("#success-time"),
+  successBadge: document.querySelector("#success-major-badge"),
   downloadResultCard: document.querySelector("#download-result-card"),
+  clock: document.querySelector("#student-clock"),
+  clockStatus: document.querySelector("#student-clock-status"),
+  clockTime: document.querySelector("#student-server-clock"),
 };
 
 const studentLoginFields = {
@@ -125,14 +168,6 @@ const studentLoginFields = {
     error: document.querySelector("#activation-code-error"),
   },
 };
-
-// The HTML keeps a strict progressive-enhancement hint, while the running app
-// accepts the bounded historical envelope and lets the server decide whether
-// an unusual identity is an exact legacy record or an invalid new request.
-studentLoginFields.student_no.input.minLength = 1;
-studentLoginFields.student_no.input.maxLength = STUDENT_NO_MAX_INPUT_LENGTH;
-studentLoginFields.student_no.input.removeAttribute("pattern");
-studentLoginFields.name.input.removeAttribute("pattern");
 
 const studentFieldLabels = {
   student_no: "学号",
@@ -157,7 +192,12 @@ function focusFirstStudentFieldError(errors) {
   const fieldName = Object.keys(studentLoginFields).find((key) => errors[key]);
   if (!fieldName) return;
   const field = studentLoginFields[fieldName];
-  field.input.focus({ preventScroll: false });
+  field.input.focus({ preventScroll: true });
+  requestAnimationFrame(() => {
+    if (document.activeElement === field.input) {
+      field.input.scrollIntoView({ block: "center", inline: "nearest", behavior: "auto" });
+    }
+  });
   if (typeof field.input.select === "function") field.input.select();
 }
 
@@ -187,9 +227,9 @@ function translateValidationIssue(issue) {
   if (type === "json_invalid") return "提交内容无法识别，请刷新页面后重试";
   if (type.startsWith("value_error")) {
     const fieldMessages = {
-      student_no: "学号格式不符合要求，请核对名单中的原始学号",
-      name: "姓名格式不符合要求，请核对名单中的原始姓名",
-      activation_code: "个人激活码须为证件号后 6 位字母或数字",
+      student_no: "学号必须是名单中的 11 位数字",
+      name: "姓名只能包含中文或英文字母，各部分之间可使用空格或中点",
+      activation_code: "个人激活码必须是 6 位英文字母或数字",
     };
     return fieldMessages[field] || `${label}内容不符合要求`;
   }
@@ -225,6 +265,7 @@ function apiErrorDetails(data, status) {
 }
 
 async function studentApi(path, options = {}) {
+  const clockRequestTiming = beginStudentClockRequestTiming(path);
   const headers = new Headers(options.headers || {});
   const method = (options.method || "GET").toUpperCase();
   if (options.body && !(options.body instanceof FormData)) {
@@ -243,8 +284,10 @@ async function studentApi(path, options = {}) {
     headers.set("X-Activity-ID", String(studentState.payload.settings.activity_id));
   }
   let response;
+  let clockResponseTiming = null;
   try {
     response = await fetch(path, { ...options, headers, credentials: "same-origin" });
+    clockResponseTiming = finishStudentClockRequestTiming(clockRequestTiming);
   } catch (_) {
     const error = new Error("网络连接失败，请检查网络后重试");
     error.status = 0;
@@ -262,6 +305,7 @@ async function studentApi(path, options = {}) {
     error.field = details.field;
     throw error;
   }
+  rememberStudentResponseClockTiming(data, clockResponseTiming);
   return data;
 }
 
@@ -279,13 +323,15 @@ function reportStudentConnectionIssue(error) {
   if (studentState.connectionInterrupted && now - studentState.lastBackgroundErrorAt < 10_000) return;
   studentState.connectionInterrupted = true;
   studentState.lastBackgroundErrorAt = now;
+  renderStudentServerClock();
   showStudentMessage(error.status === 0 ? "网络连接中断，页面会自动重试" : `${error.message}；页面会自动重试`, "error");
 }
 
 function markStudentConnectionHealthy() {
-  if (!studentState.connectionInterrupted) return;
+  const recovered = studentState.connectionInterrupted;
   studentState.connectionInterrupted = false;
-  showStudentMessage("连接已恢复，名额和活动状态已同步", "success");
+  renderStudentServerClock();
+  if (recovered) showStudentMessage("连接已恢复，名额和活动状态已同步", "success");
 }
 
 function handleStudentSessionExpired() {
@@ -301,15 +347,93 @@ function studentField(payload, key) {
   return payload?.[key] ?? payload?.settings?.[key] ?? null;
 }
 
+function studentMonotonicNow() {
+  return typeof globalThis.performance?.now === "function" ? globalThis.performance.now() : Date.now();
+}
+
+function currentStudentServerTimeMs() {
+  if (!studentState.serverClockSynchronized) return Date.now();
+  const elapsed = Math.max(0, studentMonotonicNow() - studentState.serverClockMonotonicMs);
+  return studentState.serverClockEpochMs + elapsed;
+}
+
 function synchronizeStudentClock(payload) {
   const parsed = Date.parse(studentField(payload, "server_now") || "");
-  if (Number.isFinite(parsed)) studentState.serverClockOffset = parsed - Date.now();
+  if (!Number.isFinite(parsed)) return;
+  const synchronizedMonotonicMs = studentMonotonicNow();
+  const timing = payload && typeof payload === "object"
+    ? studentResponseClockTimings.get(payload)
+    : null;
+  let estimatedServerNowMs = parsed;
+  let sampledOffsetMs = parsed - Date.now();
+  let sampledRoundTripMs = 0;
+  if (timing) {
+    const requestMonotonicMs = Number(timing.requestMonotonicMs);
+    const responseMonotonicMs = Number(timing.responseMonotonicMs);
+    const requestWallMs = Number(timing.requestWallMs);
+    const responseWallMs = Number(timing.responseWallMs);
+    if (
+      Number.isFinite(requestMonotonicMs)
+      && Number.isFinite(responseMonotonicMs)
+      && responseMonotonicMs >= requestMonotonicMs
+    ) {
+      sampledRoundTripMs = responseMonotonicMs - requestMonotonicMs;
+      const monotonicMidpointMs = (requestMonotonicMs + responseMonotonicMs) / 2;
+      estimatedServerNowMs = parsed + Math.max(0, synchronizedMonotonicMs - monotonicMidpointMs);
+    }
+    if (Number.isFinite(requestWallMs) && Number.isFinite(responseWallMs)) {
+      const wallMidpointMs = (requestWallMs + responseWallMs) / 2;
+      sampledOffsetMs = parsed - wallMidpointMs;
+    }
+  }
+  const previousServerNowMs = studentState.serverClockSynchronized
+    ? studentState.serverClockEpochMs
+      + Math.max(0, synchronizedMonotonicMs - studentState.serverClockMonotonicMs)
+    : null;
+  if (Number.isFinite(previousServerNowMs)) {
+    estimatedServerNowMs = Math.max(estimatedServerNowMs, previousServerNowMs);
+  }
+  studentState.serverClockEpochMs = estimatedServerNowMs;
+  studentState.serverClockMonotonicMs = synchronizedMonotonicMs;
+  studentState.serverClockOffsetMs = sampledOffsetMs;
+  studentState.serverClockLastSampleRttMs = sampledRoundTripMs;
+  studentState.serverClockSynchronized = true;
+  renderStudentServerClock();
+}
+
+function renderStudentServerClock() {
+  const browserOffline = typeof navigator !== "undefined" && navigator.onLine === false;
+  const interrupted = studentState.connectionInterrupted || browserOffline;
+  const status = !studentState.serverClockSynchronized
+    ? (interrupted ? "未同步" : "正在同步")
+    : (interrupted ? "同步中断" : "服务器时间");
+  const syncStatus = !studentState.serverClockSynchronized ? "syncing" : interrupted ? "interrupted" : "synced";
+  studentEls.clock.dataset.syncStatus = syncStatus;
+  studentEls.clockStatus.textContent = status;
+  if (!studentState.serverClockSynchronized) {
+    studentEls.clockTime.textContent = "--:--:--";
+    studentEls.clockTime.removeAttribute("datetime");
+    studentEls.clock.setAttribute("aria-label", `${status}，尚未取得服务器时间`);
+    return;
+  }
+  const now = new Date(currentStudentServerTimeMs());
+  const fullText = now.toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" });
+  studentEls.clockTime.textContent = now.toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZone: "Asia/Shanghai",
+  });
+  studentEls.clockTime.dateTime = now.toISOString();
+  studentEls.clock.title = `${status}：${fullText}`;
+  studentEls.clock.setAttribute("aria-label", `${status} ${fullText}`);
 }
 
 function millisecondsUntilStudentOpen(payload = studentState.payload) {
   const target = Date.parse(studentField(payload, "selection_opens_at") || "");
   if (!Number.isFinite(target)) return null;
-  return target - (Date.now() + studentState.serverClockOffset);
+  return target - currentStudentServerTimeMs();
 }
 
 function studentPhase(payload = studentState.payload) {
@@ -385,6 +509,37 @@ function drawWrappedCardText(context, text, x, y, maxWidth, lineHeight, maxLines
   return y + Math.max(1, lines.length) * lineHeight;
 }
 
+function fittedCardTextLines(context, text, maxWidth) {
+  const characters = Array.from(String(text || "—"));
+  const lines = [];
+  let line = "";
+  for (const character of characters) {
+    const candidate = line + character;
+    if (line && context.measureText(candidate).width > maxWidth) {
+      lines.push(line);
+      line = character;
+    } else {
+      line = candidate;
+    }
+  }
+  if (line || !lines.length) lines.push(line || "—");
+  return lines;
+}
+
+function drawFittedCardText(context, text, x, y, maxWidth, maxFontSize = 42, maxLines = 2) {
+  let fontSize = maxFontSize;
+  let lines = [];
+  while (fontSize >= 1) {
+    context.font = `900 ${fontSize}px "Microsoft YaHei", "PingFang SC", sans-serif`;
+    lines = fittedCardTextLines(context, text, maxWidth);
+    if (lines.length <= maxLines) break;
+    fontSize -= 1;
+  }
+  const lineHeight = Math.max(fontSize + 5, Math.round(fontSize * 1.16));
+  lines.forEach((line, index) => context.fillText(line, x, y + index * lineHeight));
+  return { fontSize, lineCount: lines.length, bottom: y + lines.length * lineHeight };
+}
+
 function loadResultCardLogo() {
   if (studentState.resultCardLogoPromise) return studentState.resultCardLogoPromise;
   studentState.resultCardLogoPromise = new Promise((resolve, reject) => {
@@ -415,24 +570,24 @@ function resultCardBlob(canvas) {
 
 async function createResultCardBlob(payload) {
   if (!payload?.selection || !payload?.student || !payload?.settings) {
-    throw new Error("尚未读取到完整选择结果，请刷新页面后重试");
+    throw new Error("尚未读取到完整抢选结果，请刷新页面后重试");
   }
   if (document.fonts?.ready) await document.fonts.ready;
   const logo = await loadResultCardLogo();
   const canvas = document.createElement("canvas");
   canvas.width = 1080;
-  canvas.height = 1440;
+  canvas.height = 1350;
   const context = canvas.getContext("2d");
-  if (!context) throw new Error("当前浏览器无法创建结果卡，请更换浏览器后重试");
+  if (!context) throw new Error("当前浏览器无法创建抢选结果凭证，请更换浏览器后重试");
 
-  context.fillStyle = "#f3eded";
+  context.fillStyle = "#eee5e2";
   context.fillRect(0, 0, canvas.width, canvas.height);
-  context.strokeStyle = "rgba(127, 41, 47, .055)";
+  context.strokeStyle = "rgba(127, 41, 47, .05)";
   context.lineWidth = 1;
-  for (let coordinate = 0; coordinate <= 1440; coordinate += 36) {
+  for (let coordinate = 0; coordinate <= 1404; coordinate += 54) {
     context.beginPath();
     context.moveTo(coordinate, 0);
-    context.lineTo(coordinate, 1440);
+    context.lineTo(coordinate, 1350);
     context.stroke();
     context.beginPath();
     context.moveTo(0, coordinate);
@@ -441,106 +596,134 @@ async function createResultCardBlob(payload) {
   }
 
   context.save();
-  context.shadowColor = "rgba(72, 24, 29, .16)";
-  context.shadowBlur = 34;
-  context.shadowOffsetY = 14;
-  roundedRectangle(context, 54, 48, 972, 1344, 34);
+  context.shadowColor = "rgba(72, 24, 29, .18)";
+  context.shadowBlur = 36;
+  context.shadowOffsetY = 16;
+  roundedRectangle(context, 48, 40, 984, 1270, 36);
   context.fillStyle = "#fffdfc";
   context.fill();
   context.restore();
 
-  roundedRectangle(context, 54, 48, 972, 18, 9);
+  roundedRectangle(context, 48, 40, 984, 1270, 36);
+  context.strokeStyle = "rgba(127, 41, 47, .22)";
+  context.lineWidth = 2;
+  context.stroke();
+
+  context.save();
+  roundedRectangle(context, 48, 40, 984, 274, 36);
+  context.clip();
   context.fillStyle = "#7f292f";
+  context.fillRect(48, 40, 984, 274);
+  context.strokeStyle = "rgba(255, 255, 255, .12)";
+  context.lineWidth = 2;
+  for (let x = -120; x < 1200; x += 96) {
+    context.beginPath();
+    context.moveTo(x, 314);
+    context.lineTo(x + 230, 40);
+    context.stroke();
+  }
+  context.restore();
+
+  roundedRectangle(context, 48, 40, 984, 12, 6);
+  context.fillStyle = "#c9a363";
   context.fill();
 
-  // The official college wordmark is white artwork. Give it a full brand
-  // field so every stroke remains visible in the downloaded card.
-  context.fillStyle = "#7f292f";
-  context.fillRect(54, 66, 972, 250);
-
-  // The source asset contains transparent margins; crop to its official visible artwork.
-  context.drawImage(logo, 328, 152, 3808, 909, 96, 98, 888, 212);
+  // Crop only the transparent margins around the official college wordmark.
+  context.drawImage(logo, 328, 152, 3808, 909, 96, 74, 888, 212);
 
   context.fillStyle = "#7f292f";
-  context.font = '800 24px "Microsoft YaHei", "PingFang SC", sans-serif';
-  context.letterSpacing = "3px";
-  context.fillText("TEACHING GROUP SELECTION", 96, 364);
-  context.letterSpacing = "0px";
-  context.fillStyle = "#2f292a";
-  context.font = '900 58px "Microsoft YaHei", "PingFang SC", sans-serif';
-  const titleBottom = drawWrappedCardText(context, payload.settings.activity_title, 96, 434, 888, 72, 2);
+  context.font = '800 22px "Microsoft YaHei", "PingFang SC", sans-serif';
+  context.fillText("TEACHING GROUP SELECTION · OFFICIAL RECEIPT", 92, 362);
+  context.fillStyle = "#282123";
+  context.font = '900 56px "Microsoft YaHei", "PingFang SC", sans-serif';
+  context.fillText("抢选结果凭证", 92, 430);
+  context.fillStyle = "#6f6466";
+  context.font = '700 25px "Microsoft YaHei", "PingFang SC", sans-serif';
+  const activityBottom = drawWrappedCardText(context, payload.settings.activity_title, 92, 474, 896, 35, 2);
 
-  const statusY = Math.max(540, titleBottom + 5);
-  roundedRectangle(context, 96, statusY, 888, 92, 18);
+  const statusY = Math.max(536, activityBottom + 8);
+  roundedRectangle(context, 92, statusY, 896, 78, 18);
   context.fillStyle = "#eaf4f0";
   context.fill();
+  context.strokeStyle = "#bdd8ce";
+  context.lineWidth = 2;
+  context.stroke();
   context.fillStyle = "#2f7560";
-  context.font = '900 33px "Microsoft YaHei", "PingFang SC", sans-serif';
-  context.fillText("✓  服务器已确认选择成功", 132, statusY + 58);
+  context.font = '900 29px "Microsoft YaHei", "PingFang SC", sans-serif';
+  context.fillText("✓  服务器已确认本次抢选结果", 128, statusY + 51);
 
-  const detailsY = statusY + 116;
-  roundedRectangle(context, 96, detailsY, 888, 400, 24);
+  const detailsY = statusY + 104;
+  roundedRectangle(context, 92, detailsY, 896, 430, 24);
   context.fillStyle = "#f8f3f3";
   context.fill();
   context.strokeStyle = "#c9aaad";
   context.lineWidth = 2;
   context.stroke();
 
-  const labelFont = '700 23px "Microsoft YaHei", "PingFang SC", sans-serif';
-  const valueFont = '900 34px "Microsoft YaHei", "PingFang SC", sans-serif';
+  const labelFont = '700 21px "Microsoft YaHei", "PingFang SC", sans-serif';
+  const valueFont = '900 33px "Microsoft YaHei", "PingFang SC", sans-serif';
   const detailRows = [
-    ["学生", payload.student.name, 150, detailsY + 48],
-    ["学号", payload.student.student_no, 150, detailsY + 170],
-    ["专业", payload.student.major_name, 570, detailsY + 48],
-    ["教学组", payload.selection.group_name, 570, detailsY + 170],
+    ["姓名", payload.student.name, 132, detailsY + 52, 360],
+    ["学号", payload.student.student_no, 570, detailsY + 52, 350],
+    ["专业", payload.student.major_name, 132, detailsY + 174, 360],
+    ["系统记录时间", formatStudentTime(payload.selection.selected_at), 570, detailsY + 174, 350],
   ];
-  for (const [label, value, x, y] of detailRows) {
+  for (const [label, value, x, y, maxWidth] of detailRows) {
     context.fillStyle = "#766d6e";
     context.font = labelFont;
     context.fillText(label, x, y);
     context.fillStyle = "#2f292a";
     context.font = valueFont;
-    drawWrappedCardText(context, value, x, y + 40, x < 500 ? 350 : 340, 40, 2);
+    if (label === "姓名" || label === "专业") {
+      drawFittedCardText(context, value, x, y + 43, maxWidth, 33, 2);
+    } else {
+      drawWrappedCardText(context, value, x, y + 43, maxWidth, 40, 2);
+    }
   }
   context.strokeStyle = "#e4d7d8";
   context.beginPath();
-  context.moveTo(126, detailsY + 280);
-  context.lineTo(954, detailsY + 280);
+  context.moveTo(124, detailsY + 286);
+  context.lineTo(956, detailsY + 286);
   context.stroke();
   context.fillStyle = "#766d6e";
   context.font = labelFont;
-  context.fillText("系统记录时间", 150, detailsY + 320);
+  context.fillText("已选教学组", 132, detailsY + 330);
   context.fillStyle = "#7f292f";
-  context.font = '900 34px "Microsoft YaHei", "PingFang SC", sans-serif';
-  context.fillText(formatStudentTime(payload.selection.selected_at), 150, detailsY + 366);
+  drawFittedCardText(context, payload.selection.group_name, 132, detailsY + 382, 800, 42, 2);
 
-  const verificationY = detailsY + 440;
+  const verificationY = detailsY + 474;
+  roundedRectangle(context, 92, verificationY, 896, 116, 18);
+  context.fillStyle = "#fff8eb";
+  context.fill();
+  context.strokeStyle = "#ead1ac";
+  context.lineWidth = 2;
+  context.stroke();
   context.fillStyle = "#7f292f";
-  context.font = '900 27px "Microsoft YaHei", "PingFang SC", sans-serif';
-  context.fillText("结果核验说明", 96, verificationY);
+  context.font = '900 24px "Microsoft YaHei", "PingFang SC", sans-serif';
+  context.fillText("核验提示", 126, verificationY + 39);
   context.fillStyle = "#766d6e";
-  context.font = '500 24px "Microsoft YaHei", "PingFang SC", sans-serif';
+  context.font = '600 21px "Microsoft YaHei", "PingFang SC", sans-serif';
   drawWrappedCardText(
     context,
-    "本卡片由系统按统一尺寸生成，仅作为学生本人提交凭据；最终教学组安排以学院正式发布结果为准。",
-    96,
-    verificationY + 48,
-    888,
-    40,
-    3,
+    "请妥善保存本凭证，便于后续核对；最终教学组安排以学院正式发布结果及系统导出记录为准。",
+    126,
+    verificationY + 76,
+    820,
+    31,
+    2,
   );
 
   context.strokeStyle = "#c9aaad";
   context.setLineDash([8, 8]);
   context.beginPath();
-  context.moveTo(96, 1301);
-  context.lineTo(984, 1301);
+  context.moveTo(92, 1262);
+  context.lineTo(988, 1262);
   context.stroke();
   context.setLineDash([]);
   context.fillStyle = "#766d6e";
   context.font = '600 20px "Microsoft YaHei", "PingFang SC", sans-serif';
   context.textAlign = "center";
-  context.fillText("安徽建筑大学 · 建筑与空间规划学院  制作：Mikutea", 540, 1348);
+  context.fillText("安徽建筑大学 · 建筑与空间规划学院  制作：Mikutea", 540, 1294);
   context.textAlign = "start";
 
   return resultCardBlob(canvas);
@@ -550,25 +733,25 @@ async function downloadStudentResultCard() {
   if (studentState.resultCardInFlight) return;
   studentState.resultCardInFlight = true;
   studentEls.downloadResultCard.disabled = true;
-  studentEls.downloadResultCard.textContent = "正在生成 1080 × 1440 结果卡…";
+  studentEls.downloadResultCard.textContent = "正在生成 1080 × 1350 凭证…";
   try {
     const blob = await createResultCardBlob(studentState.payload);
     const objectUrl = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     const safeStudentNo = String(studentState.payload.student.student_no).replace(/[^A-Za-z0-9_-]/g, "_");
     anchor.href = objectUrl;
-    anchor.download = `教学组选择结果-${safeStudentNo}.png`;
+    anchor.download = `抢选结果凭证-${safeStudentNo}.png`;
     document.body.append(anchor);
     anchor.click();
     anchor.remove();
     setTimeout(() => URL.revokeObjectURL(objectUrl), 1500);
-    showStudentMessage("统一结果卡已生成，请在浏览器下载记录中查看", "success");
+    showStudentMessage("抢选结果凭证已下载，请妥善保存", "success");
   } catch (error) {
     showStudentMessage(error.message || "结果卡下载失败，请稍后重试", "error");
   } finally {
     studentState.resultCardInFlight = false;
     studentEls.downloadResultCard.disabled = false;
-    studentEls.downloadResultCard.textContent = "下载统一结果卡";
+    studentEls.downloadResultCard.textContent = "下载抢选结果凭证";
   }
 }
 
@@ -613,11 +796,18 @@ function createGroupOption(group, payload) {
 
 function updateProfessionalBadges(majorName) {
   const badge = professionalBadge(majorName);
-  const accessibleLabel = `${majorName || "当前"}专业标识：${badge}`;
-  for (const element of [studentEls.displayBadge, studentEls.waitingBadge]) {
+  const accessibleLabel = `专业：${majorName || badge}`;
+  for (const element of [studentEls.displayBadge, studentEls.waitingBadge, studentEls.successBadge]) {
     element.textContent = badge;
     element.title = accessibleLabel;
     element.setAttribute("aria-label", accessibleLabel);
+  }
+}
+
+function setStudentCountdownDisplay(value) {
+  const nextValue = String(value);
+  if (studentEls.countdownValue.textContent !== nextValue) {
+    studentEls.countdownValue.textContent = nextValue;
   }
 }
 
@@ -655,8 +845,6 @@ function renderStudentPayload(payload) {
     studentEls.successView.classList.remove("is-hidden");
     studentEls.successMessage.textContent = `已成功选择「${payload.selection.group_name}」`;
     studentEls.successTime.textContent = formatStudentTime(payload.selection.selected_at);
-    clearInterval(studentState.pollTimer);
-    clearInterval(studentState.heartbeatTimer);
     return;
   }
 
@@ -671,17 +859,17 @@ function renderStudentPayload(payload) {
     const remaining = millisecondsUntilStudentOpen(payload);
     const seconds = remaining === null ? 10 : Math.max(0, Math.ceil(remaining / 1000));
     if (phase === "countdown") {
-      studentEls.countdownValue.textContent = String(seconds);
+      setStudentCountdownDisplay(seconds);
       studentEls.waitingTitle.textContent = "全体同步倒计时";
       studentEls.waitingMessage.textContent = "倒计时结束后将自动进入选组页面，请不要退出或锁屏。";
       studentEls.waitingLiveNote.textContent = "时间以服务器为准，所有同学同时开抢";
     } else if (["closed", "ended", "paused"].includes(phase)) {
-      studentEls.countdownValue.textContent = "END";
+      setStudentCountdownDisplay("END");
       studentEls.waitingTitle.textContent = phase === "paused" ? "抢选已暂停" : "本场抢选已关闭";
       studentEls.waitingMessage.textContent = "当前无法提交，请等待老师后续通知。";
       studentEls.waitingLiveNote.textContent = "页面会继续自动同步活动状态";
     } else {
-      studentEls.countdownValue.textContent = "READY";
+      setStudentCountdownDisplay("READY");
       studentEls.waitingTitle.textContent = "已进入抢选候场";
       studentEls.waitingMessage.textContent = "请保持页面打开，等待老师开始统一倒计时。";
       studentEls.waitingLiveNote.textContent = "候场状态每秒自动同步";
@@ -705,9 +893,10 @@ async function loadPublicInfo() {
   try {
     const data = await studentApi("/api/public/info");
     synchronizeStudentClock(data);
+    markStudentConnectionHealthy();
     renderStudentSettings(data.settings, data);
   } catch (error) {
-    showStudentMessage(error.message, "error");
+    reportStudentConnectionIssue(error);
   }
 }
 
@@ -715,6 +904,7 @@ async function loadStudentSession() {
   try {
     const data = await studentApi("/api/student/me");
     studentState.csrf = data.csrf_token;
+    markStudentConnectionHealthy();
     renderStudentPayload(data);
     startStudentPolling();
   } catch (error) {
@@ -725,16 +915,25 @@ async function loadStudentSession() {
 function startStudentPolling() {
   clearInterval(studentState.pollTimer);
   clearInterval(studentState.heartbeatTimer);
-  if (studentState.payload?.selection) return;
   studentState.pollTimer = setInterval(async () => {
     if (studentState.pollInFlight) return;
+    const pollStartedAt = studentMonotonicNow();
+    if (
+      studentState.payload?.selection
+      && pollStartedAt - studentState.lastSelectedSyncAt < 5000
+    ) return;
+    if (studentState.payload?.selection) studentState.lastSelectedSyncAt = pollStartedAt;
     studentState.pollInFlight = true;
     try {
+      const hadSelection = Boolean(studentState.payload?.selection);
       const data = await studentApi("/api/student/me");
       markStudentConnectionHealthy();
       const selectedStillAvailable = data.groups.some((group) => group.id === studentState.selectedGroupId && !group.full);
       if (!selectedStillAvailable) studentState.selectedGroupId = null;
       renderStudentPayload(data);
+      if (hadSelection && !data.selection) {
+        showStudentMessage("原选择已被管理员撤销，请按当前状态重新选择或等待通知", "error");
+      }
     } catch (error) {
       if (error.status === 401) {
         handleStudentSessionExpired();
@@ -764,7 +963,7 @@ function tickStudentCountdown() {
   const phase = studentPhase(payload);
   if (phase === "countdown") {
     const seconds = Math.max(0, Math.ceil((millisecondsUntilStudentOpen(payload) || 0) / 1000));
-    studentEls.countdownValue.textContent = String(seconds);
+    setStudentCountdownDisplay(seconds);
     studentEls.publicStatus.lastElementChild.textContent = `统一倒计时 ${seconds} 秒 · 即将同时开抢`;
     return;
   }
@@ -806,6 +1005,7 @@ studentEls.loginForm.addEventListener("submit", async (event) => {
     });
     studentState.csrf = data.csrf_token;
     studentState.selectedGroupId = null;
+    markStudentConnectionHealthy();
     renderStudentPayload(data);
     startStudentPolling();
     showStudentMessage("身份核验成功", "success");
@@ -823,8 +1023,11 @@ studentEls.loginForm.addEventListener("submit", async (event) => {
 
 studentEls.loginForm.addEventListener("input", (event) => {
   if (!(event.target instanceof HTMLInputElement)) return;
-  if (event.target.name === "activation_code") {
-    const normalized = normalizeCompatibilityText(event.target.value).toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
+  if (event.target.name === "student_no") {
+    const normalized = normalizeCompatibilityText(event.target.value).replace(/\D/g, "").slice(0, STUDENT_NO_INPUT_LENGTH);
+    if (normalized !== event.target.value) event.target.value = normalized;
+  } else if (event.target.name === "activation_code") {
+    const normalized = Array.from(normalizeCompatibilityText(event.target.value).toUpperCase()).slice(0, 6).join("");
     if (normalized !== event.target.value) event.target.value = normalized;
   }
   setStudentFieldError(event.target.name);
@@ -838,6 +1041,8 @@ studentEls.loginForm.addEventListener("focusout", (event) => {
     activation_code: studentLoginFields.activation_code.input.value,
   });
   event.target.value = normalized[event.target.name];
+  const fieldError = validateStudentLoginPayload(normalized)[event.target.name] || "";
+  setStudentFieldError(event.target.name, fieldError);
 });
 
 studentEls.submitChoice.addEventListener("click", () => {
@@ -859,6 +1064,7 @@ studentEls.confirmDialog.addEventListener("close", async () => {
       body: JSON.stringify({ group_id: groupId }),
       headers: { "X-Activity-ID": studentEls.confirmDialog.dataset.activityId },
     });
+    markStudentConnectionHealthy();
     renderStudentPayload(data);
     showStudentMessage("选择已由服务器确认", "success");
   } catch (error) {
@@ -892,11 +1098,42 @@ async function studentLogout() {
   setTimeout(() => window.location.reload(), reloadDelay);
 }
 
+function syncStudentViewportHeight() {
+  const viewportHeight = Math.round(window.visualViewport?.height || window.innerHeight || 0);
+  if (viewportHeight > 0) {
+    document.documentElement.style.setProperty("--student-app-height", `${viewportHeight}px`);
+  }
+  const layoutHeight = Math.round(document.documentElement.clientHeight || window.innerHeight || viewportHeight);
+  const keyboardInset = Math.max(0, layoutHeight - viewportHeight);
+  const loginFieldFocused = Boolean(document.activeElement?.closest?.("#student-login-form"));
+  const keyboardOpen = viewportHeight > 0
+    && viewportHeight <= 480
+    && (keyboardInset >= 100 || (Boolean(window.visualViewport) && loginFieldFocused));
+  document.body.classList.toggle("student-keyboard-open", keyboardOpen);
+}
+
+window.addEventListener("offline", () => {
+  const error = new Error("网络连接中断，页面会自动重试");
+  error.status = 0;
+  reportStudentConnectionIssue(error);
+});
+window.addEventListener("online", () => {
+  renderStudentServerClock();
+  showStudentMessage("网络已恢复，正在重新同步服务器状态", "info");
+});
+window.addEventListener("resize", syncStudentViewportHeight, { passive: true });
+window.visualViewport?.addEventListener("resize", syncStudentViewportHeight, { passive: true });
+studentEls.loginForm.addEventListener("focusin", () => requestAnimationFrame(syncStudentViewportHeight));
+studentEls.loginForm.addEventListener("focusout", () => setTimeout(syncStudentViewportHeight, 0));
+
 document.querySelector("#student-logout").addEventListener("click", studentLogout);
 document.querySelector("#waiting-logout").addEventListener("click", studentLogout);
 document.querySelector("#success-logout").addEventListener("click", studentLogout);
 studentEls.downloadResultCard.addEventListener("click", downloadStudentResultCard);
 
 studentState.countdownTimer = setInterval(tickStudentCountdown, 200);
+studentState.clockTimer = setInterval(renderStudentServerClock, 1000);
+syncStudentViewportHeight();
+renderStudentServerClock();
 loadPublicInfo();
 loadStudentSession();

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import csv
 import hashlib
 import hmac
 import io
@@ -10,9 +9,9 @@ import secrets
 import sqlite3
 import threading
 import time
-import unicodedata
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from http.cookies import CookieError, SimpleCookie
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -20,13 +19,11 @@ from typing import Annotated, Any, Literal
 import qrcode
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.worksheet.table import Table, TableStyleInfo
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, field_validator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Config, PROJECT_ROOT
+from .current_contract import clean_text, normalize_public_base_url
 from .database import (
     SCHEMA_VERSION,
     activity_snapshot,
@@ -35,6 +32,7 @@ from .database import (
     initialize_database,
     utc_now,
 )
+from .export_workbook import build_export_workbook
 from .roster import RosterParseError, parse_roster_files
 from .security import (
     activation_code_hash,
@@ -44,6 +42,7 @@ from .security import (
     new_csrf_token,
     new_session_token,
     session_token_hash,
+    verify_activation_ciphertext,
     verify_activation_code,
     verify_password,
 )
@@ -53,7 +52,6 @@ from .student_identity import (
     STUDENT_NAME_MIN_LENGTH,
     STUDENT_NUMBER_MAX_LENGTH,
     STUDENT_NUMBER_MIN_LENGTH,
-    StudentIdentityError,
     normalize_activation_code,
     normalize_student_name,
     normalize_student_number,
@@ -86,9 +84,11 @@ def session_utc_now() -> str:
 class ImportBodyLimitMiddleware:
     """Reject oversized roster uploads before multipart parsing begins."""
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, database_path: Path | None = None) -> None:
         self.app = app
+        self.database_path = database_path
         self._active_imports = 0
+        self._active_untrusted_imports = 0
         self._gate_lock = threading.Lock()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -96,12 +96,21 @@ class ImportBodyLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
+        authenticated_admin = await asyncio.to_thread(
+            self._has_authenticated_admin_session, scope
+        )
+        counter_name = (
+            "_active_imports"
+            if authenticated_admin
+            else "_active_untrusted_imports"
+        )
         rejected = False
         with self._gate_lock:
-            if self._active_imports >= MAX_CONCURRENT_IMPORTS:
+            active_imports = int(getattr(self, counter_name))
+            if active_imports >= MAX_CONCURRENT_IMPORTS:
                 rejected = True
             else:
-                self._active_imports += 1
+                setattr(self, counter_name, active_imports + 1)
         if rejected:
             await self._send_error(
                 send,
@@ -115,7 +124,45 @@ class ImportBodyLimitMiddleware:
             await self._handle_import(scope, receive, send)
         finally:
             with self._gate_lock:
-                self._active_imports -= 1
+                setattr(self, counter_name, int(getattr(self, counter_name)) - 1)
+
+    def _has_authenticated_admin_session(self, scope: Scope) -> bool:
+        if self.database_path is None:
+            return False
+        cookie_header = "; ".join(
+            value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+            if key.lower() == b"cookie"
+        )
+        if not cookie_header:
+            return False
+        cookies = SimpleCookie()
+        try:
+            cookies.load(cookie_header)
+        except CookieError:
+            return False
+        morsel = cookies.get(ADMIN_COOKIE)
+        if morsel is None or not morsel.value:
+            return False
+        connection = None
+        try:
+            connection = connect(self.database_path)
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM sessions se
+                JOIN admin_users au ON au.id = se.subject_id
+                WHERE se.token_hash = ? AND se.role = 'admin'
+                  AND se.expires_at > ?
+                """,
+                (session_token_hash(morsel.value), session_utc_now()),
+            ).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return False
+        finally:
+            if connection is not None:
+                connection.close()
 
     async def _handle_import(
         self, scope: Scope, receive: Receive, send: Send
@@ -196,10 +243,6 @@ class ImportBodyLimitMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
-def clean_text(value: str) -> str:
-    return " ".join(value.strip().split())
-
-
 def resolve_client_host(request: Request, trusted_proxy_ips: tuple[str, ...]) -> str:
     direct_host = request.client.host if request.client else "unknown"
     if direct_host not in trusted_proxy_ips:
@@ -219,6 +262,11 @@ class StrictModel(BaseModel):
 class AdminLogin(StrictModel):
     username: str = Field(min_length=1, max_length=80)
     password: str = Field(min_length=1, max_length=256)
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def normalize_username(cls, value: Any) -> Any:
+        return clean_text(value) if isinstance(value, str) else value
 
 
 class StudentLogin(StrictModel):
@@ -251,37 +299,6 @@ class StudentLogin(StrictModel):
         return normalize_activation_code(value)
 
 
-class StudentLoginRequest(StrictModel):
-    """Safe historical envelope; the endpoint applies the strict shared contract.
-
-    Releases before the shared contract admitted student numbers up to 40
-    characters and arbitrary names up to 80 characters.  Keeping this narrow
-    envelope lets an exact, already-stored legacy identity authenticate without
-    rewriting the student number that binds its encrypted activation code.
-    """
-
-    student_no: str = Field(min_length=1, max_length=40)
-    name: str = Field(min_length=1, max_length=STUDENT_NAME_MAX_LENGTH)
-    activation_code: str = Field(
-        min_length=ACTIVATION_CODE_LENGTH,
-        max_length=ACTIVATION_CODE_LENGTH,
-    )
-
-    @field_validator("student_no", "name", mode="before")
-    @classmethod
-    def normalize_legacy_identity_text(cls, value: Any) -> Any:
-        if not isinstance(value, str):
-            return value
-        if any(unicodedata.category(character).startswith("C") for character in value):
-            raise ValueError("身份信息不能包含控制字符")
-        return clean_text(value)
-
-    @field_validator("activation_code", mode="before")
-    @classmethod
-    def normalize_request_activation_code(cls, value: Any) -> str:
-        return normalize_activation_code(value)
-
-
 class StatusUpdate(StrictModel):
     status: Literal["closed", "open"]
 
@@ -300,10 +317,7 @@ class SettingsUpdate(StrictModel):
     def validate_base_url(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        value = value.strip().rstrip("/")
-        if value and not value.startswith(("http://", "https://")):
-            raise ValueError("访问地址必须以 http:// 或 https:// 开头")
-        return value
+        return normalize_public_base_url(value)
 
 
 class ActivityCreate(StrictModel):
@@ -498,7 +512,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         openapi_url=None if config.environment == "production" else "/api/openapi.json",
     )
     app.state.config = config
-    app.add_middleware(ImportBodyLimitMiddleware)
+    app.add_middleware(
+        ImportBodyLimitMiddleware,
+        database_path=config.database_path,
+    )
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -782,7 +799,13 @@ def create_app(config: Config | None = None) -> FastAPI:
             )
             return []
 
-        weights = [int(row["capacity"]) for row in rows]
+        # A disabled major cannot receive newly available seats. Preserve only
+        # its already-selected hard floor and distribute the remainder among
+        # active majors.
+        weights = [
+            int(row["capacity"]) if bool(row["active"]) else 0
+            for row in rows
+        ]
         if not any(weights):
             weights = [
                 int(row["student_count"]) if bool(row["active"]) else 0
@@ -790,16 +813,22 @@ def create_app(config: Config | None = None) -> FastAPI:
             ]
         if not any(weights):
             weights = [1 if bool(row["active"]) else 0 for row in rows]
-        if not any(weights):
-            weights = [1 for _ in rows]
 
         remaining = total_capacity - selected_total
         weight_total = sum(weights)
-        shares = [remaining * weight // weight_total for weight in weights]
-        remainders = [remaining * weight % weight_total for weight in weights]
+        shares = (
+            [remaining * weight // weight_total for weight in weights]
+            if weight_total
+            else [0 for _ in rows]
+        )
+        remainders = (
+            [remaining * weight % weight_total for weight in weights]
+            if weight_total
+            else [0 for _ in rows]
+        )
         undistributed = remaining - sum(shares)
         remainder_order = sorted(
-            range(len(rows)),
+            (index for index, weight in enumerate(weights) if weight > 0),
             key=lambda index: (
                 -remainders[index],
                 int(rows[index]["sort_order"]),
@@ -1033,6 +1062,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         student = connection.execute(
             """
             SELECT s.id, s.student_no, s.name, s.active, s.major_id,
+                   s.activation_ciphertext,
                    m.name AS major_name, m.active AS major_active
             FROM students s JOIN majors m ON m.id = s.major_id
             WHERE s.id = ?
@@ -1041,6 +1071,11 @@ def create_app(config: Config | None = None) -> FastAPI:
         ).fetchone()
         if not student or not student["active"]:
             raise HTTPException(status_code=403, detail="学生账号已停用")
+        if not student["activation_ciphertext"]:
+            raise HTTPException(
+                status_code=403,
+                detail="学生登录凭据不完整，请联系老师重新导入当前名单",
+            )
         selection = connection.execute(
             """
             SELECT se.group_id, se.selected_at, g.name AS group_name
@@ -1262,56 +1297,32 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/api/student/login")
     def student_login(
-        payload: StudentLoginRequest, request: Request, response: Response
+        payload: StudentLogin, request: Request, response: Response
     ):
-        strict_payload: StudentLogin | None = None
-        try:
-            strict_payload = StudentLogin.model_validate(payload.model_dump())
-        except ValidationError:
-            strict_payload = None
-
         ip_key = client_key(request, "student-login-ip")
         student_ip_limiter.check(ip_key, limit=500, window_seconds=300)
         connection = connect(config.database_path)
         token = new_session_token()
         csrf_token = new_csrf_token()
         now_dt = datetime.now(UTC)
+        family_key = student_login_principal_key(
+            "student-login-account-family", payload.student_no
+        )
+        id_key = None
         try:
             connection.execute("BEGIN IMMEDIATE")
-            exact_candidate = connection.execute(
+            row = connection.execute(
                 """
-                SELECT id, student_no, name, activation_hash, active
-                FROM students WHERE student_no = ?
+            SELECT id, student_no, name, activation_hash,
+                   activation_ciphertext, active
+            FROM students WHERE student_no = ?
                 """,
                 (payload.student_no,),
             ).fetchone()
 
-            canonical_candidate = None
-            if (
-                exact_candidate is None
-                and strict_payload is not None
-                and strict_payload.student_no != payload.student_no
-            ):
-                canonical_candidate = connection.execute(
-                    """
-                    SELECT id, student_no, name, activation_hash, active
-                    FROM students WHERE student_no = ?
-                    """,
-                    (strict_payload.student_no,),
-                ).fetchone()
-
-            resolved_candidate = exact_candidate or canonical_candidate
-            try:
-                family_identity = normalize_student_number(payload.student_no)
-            except StudentIdentityError:
-                family_identity = payload.student_no
-            family_key = student_login_principal_key(
-                "student-login-account-family", family_identity
-            )
-            id_key = None
-            if resolved_candidate is not None:
+            if row is not None:
                 id_key = student_login_principal_key(
-                    "student-login-account-id", str(resolved_candidate["id"])
+                    "student-login-account-id", str(row["id"])
                 )
                 if student_id_limiter.is_limited(
                     id_key, limit=10, window_seconds=300
@@ -1327,59 +1338,21 @@ def create_app(config: Config | None = None) -> FastAPI:
                             else "学号、姓名或激活码不正确"
                         ),
                     )
-            row = None
-            if exact_candidate is not None:
-                try:
-                    stored_identity_is_current = (
-                        normalize_student_number(exact_candidate["student_no"])
-                        == exact_candidate["student_no"]
-                        and normalize_student_name(exact_candidate["name"])
-                        == exact_candidate["name"]
-                    )
-                except StudentIdentityError:
-                    stored_identity_is_current = False
-                current_identity_match = bool(
-                    stored_identity_is_current
-                    and strict_payload
-                    and exact_candidate["name"] == strict_payload.name
-                )
-                legacy_identity_match = bool(
-                    not stored_identity_is_current
-                    and exact_candidate["name"] == payload.name
-                )
-                if (
-                    exact_candidate["active"]
-                    and (current_identity_match or legacy_identity_match)
-                    and verify_activation_code(
-                        config.app_secret,
-                        payload.activation_code,
-                        exact_candidate["activation_hash"],
-                    )
-                ):
-                    row = exact_candidate
-            elif canonical_candidate is not None:
-                try:
-                    canonical_record_is_current = (
-                        normalize_student_number(canonical_candidate["student_no"])
-                        == canonical_candidate["student_no"]
-                        and normalize_student_name(canonical_candidate["name"])
-                        == canonical_candidate["name"]
-                    )
-                except StudentIdentityError:
-                    canonical_record_is_current = False
-                if (
-                    canonical_record_is_current
-                    and canonical_candidate["active"]
-                    and canonical_candidate["name"] == strict_payload.name
-                    and verify_activation_code(
-                        config.app_secret,
-                        payload.activation_code,
-                        canonical_candidate["activation_hash"],
-                    )
-                ):
-                    row = canonical_candidate
 
-            if row is None:
+            authenticated = bool(
+                row is not None
+                and row["active"]
+                and bool(row["activation_ciphertext"])
+                and row["name"] == payload.name
+                and verify_activation_ciphertext(
+                    config.app_secret,
+                    row["student_no"],
+                    row["activation_ciphertext"],
+                    row["activation_hash"],
+                    payload.activation_code,
+                )
+            )
+            if not authenticated:
                 family_was_limited = student_family_limiter.record_failure(
                     family_key, limit=10, window_seconds=300
                 )
@@ -1391,7 +1364,10 @@ def create_app(config: Config | None = None) -> FastAPI:
                     raise HTTPException(
                         status_code=429, detail="尝试次数过多，请稍后再试"
                     )
-                raise HTTPException(status_code=401, detail="学号、姓名或激活码不正确")
+                raise HTTPException(
+                    status_code=401, detail="学号、姓名或激活码不正确"
+                )
+
             student_id = int(row["id"])
             student_data = student_payload_from_connection(connection, student_id)
             persist_session(
@@ -1702,6 +1678,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             students = connection.execute(
                 """
                 SELECT s.id, s.student_no, s.name, m.name AS major_name, s.active,
+                       s.activation_hash, s.activation_ciphertext,
                        g.name AS group_name, se.selected_at,
                        CASE WHEN EXISTS (
                            SELECT 1 FROM sessions ss
@@ -1717,6 +1694,30 @@ def create_app(config: Config | None = None) -> FastAPI:
                 """,
                 (session_utc_now(), presence_cutoff),
             ).fetchall()
+            student_payloads: list[dict[str, Any]] = []
+            for row in students:
+                student = {
+                    key: row[key]
+                    for key in (
+                        "id",
+                        "student_no",
+                        "name",
+                        "major_name",
+                        "active",
+                        "group_name",
+                        "selected_at",
+                        "entered",
+                    )
+                }
+                student["activation_code_revealable"] = (
+                    verify_activation_ciphertext(
+                        config.app_secret,
+                        row["student_no"],
+                        row["activation_ciphertext"],
+                        row["activation_hash"],
+                    )
+                )
+                student_payloads.append(student)
             presence_rows = connection.execute(
                 """
                 SELECT s.id, s.student_no, s.name, m.name AS major_name,
@@ -1749,7 +1750,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "quotas": [dict(row) for row in quotas],
                 "unselected_students": [dict(row) for row in unselected],
                 "recent_selections": [dict(row) for row in recent],
-                "students": [dict(row) for row in students],
+                "students": student_payloads,
                 "presence": {
                     "total": len(presence_rows),
                     "online_count": len(online_students),
@@ -1820,13 +1821,11 @@ def create_app(config: Config | None = None) -> FastAPI:
                 request, connection, identity=identity
             )
             old = activity["status"]
-            if payload.status == "open" and old != "open":
-                readiness = activity_readiness(connection)
-                if not readiness["ready"]:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="开放前检查未通过：" + "；".join(readiness["blockers"]),
-                    )
+            if payload.status == "open":
+                raise HTTPException(
+                    status_code=409,
+                    detail="开放抢选必须使用统一 10 秒倒计时",
+                )
             now = utc_now()
             connection.execute(
                 """
@@ -1876,7 +1875,6 @@ def create_app(config: Config | None = None) -> FastAPI:
         return {"status": payload.status}
 
     @app.post("/api/admin/countdown")
-    @app.post("/api/admin/start-countdown")
     def start_countdown(request: Request):
         identity = require_session(request, "admin", csrf=True)
         connection = connect(config.database_path)
@@ -2655,19 +2653,20 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/api/admin/students/import")
     async def import_students(
         request: Request,
-        file: Annotated[
-            UploadFile | None,
-            File(description="兼容旧客户端的单个 CSV、XLS 或 XLSX 名单"),
-        ] = None,
         files: Annotated[
             list[UploadFile] | None,
             File(description="可重复提交的 CSV、XLS 或 XLSX 名单集合"),
         ] = None,
         mode: Literal["merge", "sync"] = "merge",
-        regenerate_existing: bool = False,
     ):
         identity = require_session(request, "admin", csrf=True)
-        uploads = ([file] if file is not None else []) + list(files or [])
+        unknown_query = sorted(set(request.query_params.keys()) - {"mode"})
+        if unknown_query or len(request.query_params.getlist("mode")) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="名单导入只接受唯一的 mode 参数",
+            )
+        uploads = list(files or [])
         if not uploads:
             raise HTTPException(status_code=400, detail="请至少上传一个名单文件")
         if len(uploads) > MAX_IMPORT_FILES:
@@ -2741,17 +2740,6 @@ def create_app(config: Config | None = None) -> FastAPI:
             students_by_number = {
                 candidate["student_no"]: candidate for candidate in stored_students
             }
-            students_by_canonical_number: dict[str, list[sqlite3.Row]] = {}
-            for candidate in stored_students:
-                try:
-                    canonical_number = normalize_student_number(
-                        candidate["student_no"]
-                    )
-                except StudentIdentityError:
-                    continue
-                students_by_canonical_number.setdefault(canonical_number, []).append(
-                    candidate
-                )
             for row in rows:
                 student_no = row.student_no
                 name = row.name
@@ -2765,21 +2753,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                             f"“{major_name}”不存在或已停用"
                         ),
                     )
-                existing = students_by_number.get(row.source_student_no)
-                if existing is None:
-                    legacy_candidates = students_by_canonical_number.get(
-                        student_no, []
-                    )
-                    if len(legacy_candidates) > 1:
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                f"学号 {student_no} 对应多条旧格式学生记录；"
-                                "请先人工核对并清理重复记录"
-                            ),
-                        )
-                    if legacy_candidates:
-                        existing = legacy_candidates[0]
+                existing = students_by_number.get(student_no)
                 if existing:
                     stored_student_no = existing["student_no"]
                     active_selection = connection.execute(
@@ -2919,32 +2893,6 @@ def create_app(config: Config | None = None) -> FastAPI:
             "activation_code_policy": "normalized_document_number_last_6",
         }
 
-    @app.post("/api/admin/students/{student_id}/activation-code")
-    def reset_student_activation_code(student_id: int, request: Request):
-        identity = require_session(request, "admin", csrf=True)
-        connection = connect(config.database_path)
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            require_expected_activity(request, connection, identity=identity)
-            student = connection.execute(
-                "SELECT id FROM students WHERE id = ?",
-                (student_id,),
-            ).fetchone()
-            if not student:
-                raise HTTPException(status_code=404, detail="学生不存在")
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "激活码只能由证件号规范化后的末 6 位生成；"
-                    "请重新导入包含证件号的名单以更新该学生凭据"
-                ),
-            )
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
     @app.post("/api/admin/students/{student_id}/activation-code/reveal")
     def reveal_student_activation_code(student_id: int, request: Request):
         identity = require_session(request, "admin", csrf=True)
@@ -2971,32 +2919,23 @@ def create_app(config: Config | None = None) -> FastAPI:
             if not student["activation_ciphertext"]:
                 raise HTTPException(
                     status_code=409,
-                    detail=(
-                        "该学生为历史哈希凭据，原激活码无法显示；"
-                        "请重新导入包含证件号的名单"
-                    ),
+                    detail="该学生缺少可显示的激活码，请重新导入当前规范名单",
                 )
-            try:
-                code = decrypt_activation_code(
-                    config.app_secret,
-                    student["student_no"],
-                    student["activation_ciphertext"],
-                )
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="激活码密文无法校验，请重新导入包含证件号的名单",
-                ) from exc
-            if not verify_activation_code(
-                config.app_secret, code, student["activation_hash"]
+            if not verify_activation_ciphertext(
+                config.app_secret,
+                student["student_no"],
+                student["activation_ciphertext"],
+                student["activation_hash"],
             ):
                 raise HTTPException(
                     status_code=409,
-                    detail=(
-                        "激活码密文与登录凭据不一致；"
-                        "请重新导入包含证件号的名单"
-                    ),
+                    detail="激活码密文无法校验，请重新导入当前规范名单",
                 )
+            code = decrypt_activation_code(
+                config.app_secret,
+                student["student_no"],
+                student["activation_ciphertext"],
+            )
             audit(
                 connection,
                 actor_type="admin",
@@ -3083,135 +3022,15 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.close()
         return {"ok": True}
 
-    def spreadsheet_safe_cell(value: Any) -> str:
-        text = "" if value is None else str(value)
-        visible = text.lstrip(" \t\r\n")
-        if text.startswith(("\t", "\r", "\n")) or visible.startswith(("=", "+", "-", "@")):
-            return "'" + text
-        return text
-
-    def csv_response(filename: str, headers: list[str], rows: list[list[Any]]):
-        buffer = io.StringIO()
-        writer = csv.writer(buffer, lineterminator="\n")
-        writer.writerow(headers)
-        writer.writerows(
-            [[spreadsheet_safe_cell(value) for value in row] for row in rows]
-        )
-        content = "\ufeff" + buffer.getvalue()
-        return StreamingResponse(
-            iter([content.encode("utf-8")]),
-            media_type="text/csv; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
-
-    @app.get("/api/admin/export/selections.csv")
-    def export_selections(request: Request, activity_id: int):
-        require_session(request, "admin")
+    def workbook_export_snapshot(activity_id: int) -> dict[str, Any]:
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN")
-            activity = current_activity(connection)
-            if int(activity["id"]) != activity_id:
-                raise HTTPException(status_code=409, detail="当前活动已经变化，请刷新页面后重试")
-            rows = connection.execute(
-                """
-                SELECT s.student_no, s.name, m.name AS major_name,
-                       g.name AS group_name, se.selected_at, se.source
-                FROM selections se
-                JOIN students s ON s.id = se.student_id
-                JOIN majors m ON m.id = s.major_id
-                JOIN teaching_groups g ON g.id = se.group_id
-                WHERE se.revoked_at IS NULL
-                ORDER BY m.sort_order, g.sort_order, s.student_no
-                """
-            ).fetchall()
-        finally:
-            connection.close()
-        return csv_response(
-            f"{activity['code']}-selections.csv",
-            ["学号", "姓名", "专业", "教学组", "选择时间", "来源"],
-            [[row[key] for key in row.keys()] for row in rows],
-        )
-
-    @app.get("/api/admin/export/unselected.csv")
-    def export_unselected(request: Request, activity_id: int):
-        require_session(request, "admin")
-        connection = connect(config.database_path)
-        try:
-            connection.execute("BEGIN")
-            activity = current_activity(connection)
-            if int(activity["id"]) != activity_id:
-                raise HTTPException(status_code=409, detail="当前活动已经变化，请刷新页面后重试")
-            rows = connection.execute(
-                """
-                SELECT s.student_no, s.name, m.name AS major_name
-                FROM students s JOIN majors m ON m.id = s.major_id
-                LEFT JOIN selections se ON se.student_id = s.id AND se.revoked_at IS NULL
-                WHERE s.active = 1 AND se.id IS NULL
-                ORDER BY m.sort_order, s.student_no
-                """
-            ).fetchall()
-        finally:
-            connection.close()
-        return csv_response(
-            f"{activity['code']}-unselected.csv",
-            ["学号", "姓名", "专业"],
-            [[row["student_no"], row["name"], row["major_name"]] for row in rows],
-        )
-
-    @app.get("/api/admin/export/results.csv")
-    def export_complete_results(request: Request, activity_id: int):
-        require_session(request, "admin")
-        connection = connect(config.database_path)
-        try:
-            connection.execute("BEGIN")
-            activity = current_activity(connection)
-            if int(activity["id"]) != activity_id:
-                raise HTTPException(status_code=409, detail="当前活动已经变化，请刷新页面后重试")
-            rows = connection.execute(
-                """
-                SELECT s.student_no, s.name, m.name AS major_name,
-                       CASE WHEN se.id IS NULL THEN '未选' ELSE '已选' END AS selection_status,
-                       g.name AS group_name, se.selected_at
-                FROM students s
-                JOIN majors m ON m.id = s.major_id
-                LEFT JOIN selections se
-                  ON se.student_id = s.id AND se.revoked_at IS NULL
-                LEFT JOIN teaching_groups g ON g.id = se.group_id
-                WHERE s.active = 1
-                ORDER BY m.sort_order, s.student_no
-                """
-            ).fetchall()
-        finally:
-            connection.close()
-        return csv_response(
-            f"{activity['code']}-results.csv",
-            ["学号", "姓名", "专业", "选择状态", "教学组", "选择时间"],
-            [
-                [
-                    row["student_no"],
-                    row["name"],
-                    row["major_name"],
-                    row["selection_status"],
-                    row["group_name"],
-                    row["selected_at"],
-                ]
-                for row in rows
-            ],
-        )
-
-    @app.get("/api/admin/export/results.xlsx")
-    def export_complete_results_xlsx(request: Request, activity_id: int):
-        """Export the complete roster and result in a WPS-friendly workbook."""
-
-        require_session(request, "admin")
-        connection = connect(config.database_path)
-        try:
-            connection.execute("BEGIN")
-            activity = current_activity(connection)
-            if int(activity["id"]) != activity_id:
+            activity_row = current_activity(connection)
+            if int(activity_row["id"]) != activity_id:
                 raise HTTPException(
-                    status_code=409, detail="当前活动已经变化，请刷新页面后重试"
+                    status_code=409,
+                    detail="当前活动已经变化，请刷新页面后重试",
                 )
             result_rows = connection.execute(
                 """
@@ -3226,6 +3045,18 @@ def create_app(config: Config | None = None) -> FastAPI:
                 LEFT JOIN teaching_groups g ON g.id = se.group_id
                 WHERE s.active = 1
                 ORDER BY m.sort_order, s.student_no
+                """
+            ).fetchall()
+            selection_rows = connection.execute(
+                """
+                SELECT s.student_no, s.name, m.name AS major_name,
+                       g.name AS group_name, se.selected_at, se.source
+                FROM selections se
+                JOIN students s ON s.id = se.student_id
+                JOIN majors m ON m.id = s.major_id
+                JOIN teaching_groups g ON g.id = se.group_id
+                WHERE se.revoked_at IS NULL AND s.active = 1
+                ORDER BY m.sort_order, g.sort_order, s.student_no
                 """
             ).fetchall()
             group_rows = connection.execute(
@@ -3257,214 +3088,103 @@ def create_app(config: Config | None = None) -> FastAPI:
                 ORDER BY m.sort_order, m.id
                 """
             ).fetchall()
+            result_data = [dict(row) for row in result_rows]
+            return {
+                "activity": dict(activity_row),
+                "results": result_data,
+                "selections": [dict(row) for row in selection_rows],
+                "unselected": [
+                    row
+                    for row in result_data
+                    if row["selection_status"] == "未选"
+                ],
+                "groups": [dict(row) for row in group_rows],
+                "majors": [dict(row) for row in major_rows],
+            }
         finally:
             connection.close()
 
-        workbook = Workbook()
-        workbook.iso_dates = True
-        results_sheet = workbook.active
-        results_sheet.title = "完整结果"
-        summary_sheet = workbook.create_sheet("汇总")
-
-        brand_fill = PatternFill("solid", fgColor="6E2432")
-        accent_fill = PatternFill("solid", fgColor="E8D6C5")
-        pale_fill = PatternFill("solid", fgColor="F7F1EC")
-        header_font = Font(name="等线", size=11, bold=True, color="FFFFFF")
-        body_font = Font(name="等线", size=11, color="2B2223")
-        title_font = Font(name="等线", size=18, bold=True, color="6E2432")
-        thin_side = Side(style="thin", color="D8C9C2")
-        cell_border = Border(
-            left=thin_side, right=thin_side, top=thin_side, bottom=thin_side
-        )
-        centered = Alignment(horizontal="center", vertical="center")
-
-        def xlsx_safe_text(value: Any) -> str:
-            """Keep user-controlled workbook text from becoming a formula."""
-
-            text = "" if value is None else str(value)
-            visible = text.lstrip(" \t\r\n")
-            if text.startswith(("\t", "\r", "\n")) or visible.startswith(
-                ("=", "+", "-", "@")
-            ):
-                return "'" + text
-            return text
-
-        def xlsx_timestamp(value: Any) -> Any:
-            if not value:
-                return ""
-            try:
-                parsed = datetime.fromisoformat(str(value))
-            except ValueError:
-                return xlsx_safe_text(value)
-            # Excel stores naive wall times.  Export Beijing local time because
-            # this classroom application and its operators are in that zone.
-            return parsed.astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None)
-
-        result_headers = ["学号", "姓名", "专业", "状态", "教学组", "选择时间"]
-        results_sheet.append(result_headers)
-        for row in result_rows:
-            results_sheet.append(
-                [
-                    xlsx_safe_text(row["student_no"]),
-                    xlsx_safe_text(row["name"]),
-                    xlsx_safe_text(row["major_name"]),
-                    row["selection_status"],
-                    xlsx_safe_text(row["group_name"]),
-                    xlsx_timestamp(row["selected_at"]),
-                ]
-            )
-        for cell in results_sheet[1]:
-            cell.fill = brand_fill
-            cell.font = header_font
-            cell.alignment = centered
-            cell.border = cell_border
-        for row in results_sheet.iter_rows(min_row=2):
-            for cell in row:
-                cell.font = body_font
-                cell.border = cell_border
-                cell.alignment = Alignment(vertical="center")
-            row[0].number_format = "@"
-            row[0].alignment = Alignment(horizontal="left", vertical="center")
-            row[3].alignment = centered
-            if isinstance(row[5].value, datetime):
-                row[5].number_format = "yyyy-mm-dd hh:mm:ss"
-        results_sheet.freeze_panes = "A2"
-        results_sheet.auto_filter.ref = f"A1:F{max(1, results_sheet.max_row)}"
-        results_sheet.sheet_view.showGridLines = False
-        results_sheet.row_dimensions[1].height = 26
-        for column, width in {
-            "A": 36,
-            "B": 20,
-            "C": 20,
-            "D": 12,
-            "E": 24,
-            "F": 28,
-        }.items():
-            results_sheet.column_dimensions[column].width = width
-        if result_rows:
-            table = Table(displayName="CompleteResults", ref=f"A1:F{results_sheet.max_row}")
-            table.tableStyleInfo = TableStyleInfo(
-                name="TableStyleMedium2",
-                showFirstColumn=False,
-                showLastColumn=False,
-                showRowStripes=True,
-                showColumnStripes=False,
-            )
-            results_sheet.add_table(table)
-
-        total_students = len(result_rows)
-        selected_students = sum(
-            1 for row in result_rows if row["selection_status"] == "已选"
-        )
-        summary_sheet.merge_cells("A1:D1")
-        summary_sheet["A1"] = "教学组抢选结果汇总"
-        summary_sheet["A1"].font = title_font
-        summary_sheet["A1"].alignment = Alignment(vertical="center")
-        summary_sheet.row_dimensions[1].height = 34
-        metadata = [
-            ("活动名称", xlsx_safe_text(activity["title"])),
-            ("活动编号", xlsx_safe_text(activity["code"])),
-            ("导出时间", xlsx_timestamp(utc_now())),
-        ]
-        for row_index, (label, value) in enumerate(metadata, start=3):
-            summary_sheet.cell(row_index, 1, label)
-            summary_sheet.cell(row_index, 2, value)
-            summary_sheet.cell(row_index, 1).fill = accent_fill
-            summary_sheet.cell(row_index, 1).font = Font(
-                name="等线", size=11, bold=True, color="6E2432"
-            )
-
-        summary_sheet.append([])
-        metric_header_row = 7
-        metrics = [
-            ("总学生", total_students),
-            ("已选", selected_students),
-            ("未选", total_students - selected_students),
-            (
-                "完成率",
-                selected_students / total_students if total_students else 0,
-            ),
-        ]
-        for column, (label, value) in enumerate(metrics, start=1):
-            label_cell = summary_sheet.cell(metric_header_row, column, label)
-            value_cell = summary_sheet.cell(metric_header_row + 1, column, value)
-            label_cell.fill = brand_fill
-            label_cell.font = header_font
-            label_cell.alignment = centered
-            value_cell.fill = pale_fill
-            value_cell.font = Font(name="等线", size=14, bold=True, color="6E2432")
-            value_cell.alignment = centered
-            if label == "完成率":
-                value_cell.number_format = "0.0%"
-
-        group_start = 11
-        summary_sheet.cell(group_start, 1, "教学组")
-        summary_sheet.cell(group_start, 2, "容量")
-        summary_sheet.cell(group_start, 3, "已选")
-        summary_sheet.cell(group_start, 4, "剩余")
-        for cell in summary_sheet[group_start]:
-            cell.fill = brand_fill
-            cell.font = header_font
-            cell.alignment = centered
-        for row_index, row in enumerate(group_rows, start=group_start + 1):
-            selected_count = int(row["selected_count"])
-            summary_sheet.append(
-                [
-                    xlsx_safe_text(row["name"]),
-                    int(row["total_capacity"]),
-                    selected_count,
-                    int(row["total_capacity"]) - selected_count,
-                ]
-            )
-
-        major_start = group_start + len(group_rows) + 3
-        for column, value in enumerate(["专业", "学生数", "已选", "未选"], start=1):
-            cell = summary_sheet.cell(major_start, column, value)
-            cell.fill = brand_fill
-            cell.font = header_font
-            cell.alignment = centered
-        for row_index, row in enumerate(major_rows, start=major_start + 1):
-            student_count = int(row["student_count"])
-            selected_count = int(row["selected_count"])
-            for column, value in enumerate(
-                [
-                    xlsx_safe_text(row["name"]),
-                    student_count,
-                    selected_count,
-                    student_count - selected_count,
-                ],
-                start=1,
-            ):
-                summary_sheet.cell(row_index, column, value)
-
-        for row in summary_sheet.iter_rows(
-            min_row=3, max_row=summary_sheet.max_row, min_col=1, max_col=4
-        ):
-            for cell in row:
-                if cell.value is not None:
-                    cell.border = cell_border
-                    if cell.font == Font():
-                        cell.font = body_font
-                    if cell.alignment == Alignment():
-                        cell.alignment = Alignment(vertical="center")
-        summary_sheet.freeze_panes = "A11"
-        summary_sheet.sheet_view.showGridLines = False
-        for column, width in {"A": 28, "B": 26, "C": 18, "D": 18}.items():
-            summary_sheet.column_dimensions[column].width = width
-
-        output = io.BytesIO()
-        workbook.save(output)
+    def xlsx_export_response(
+        *,
+        activity: dict[str, Any],
+        filename_suffix: str,
+        content: bytes,
+    ) -> Response:
         return Response(
-            content=output.getvalue(),
+            content=content,
             media_type=(
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             ),
             headers={
                 "Content-Disposition": (
-                    f'attachment; filename="{activity["code"]}-results.xlsx"'
+                    f'attachment; filename="{activity["code"]}-{filename_suffix}.xlsx"'
                 ),
                 "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
             },
+        )
+
+    @app.get("/api/admin/export/selections.xlsx")
+    def export_selections_xlsx(request: Request, activity_id: int):
+        """Export successful choices in the same print-ready workbook style."""
+
+        require_session(request, "admin")
+        snapshot = workbook_export_snapshot(activity_id)
+        content = build_export_workbook(
+            activity=snapshot["activity"],
+            exported_at=utc_now(),
+            kind="selections",
+            data_rows=snapshot["selections"],
+            result_rows=snapshot["results"],
+            group_rows=snapshot["groups"],
+            major_rows=snapshot["majors"],
+        )
+        return xlsx_export_response(
+            activity=snapshot["activity"],
+            filename_suffix="selections",
+            content=content,
+        )
+
+    @app.get("/api/admin/export/unselected.xlsx")
+    def export_unselected_xlsx(request: Request, activity_id: int):
+        """Export the current unselected roster in the print-ready style."""
+
+        require_session(request, "admin")
+        snapshot = workbook_export_snapshot(activity_id)
+        content = build_export_workbook(
+            activity=snapshot["activity"],
+            exported_at=utc_now(),
+            kind="unselected",
+            data_rows=snapshot["unselected"],
+            result_rows=snapshot["results"],
+            group_rows=snapshot["groups"],
+            major_rows=snapshot["majors"],
+        )
+        return xlsx_export_response(
+            activity=snapshot["activity"],
+            filename_suffix="unselected",
+            content=content,
+        )
+
+    @app.get("/api/admin/export/results.xlsx")
+    def export_complete_results_xlsx(request: Request, activity_id: int):
+        """Export the complete roster and result in a WPS-friendly workbook."""
+
+        require_session(request, "admin")
+        snapshot = workbook_export_snapshot(activity_id)
+        content = build_export_workbook(
+            activity=snapshot["activity"],
+            exported_at=utc_now(),
+            kind="complete",
+            data_rows=snapshot["results"],
+            result_rows=snapshot["results"],
+            group_rows=snapshot["groups"],
+            major_rows=snapshot["majors"],
+        )
+        return xlsx_export_response(
+            activity=snapshot["activity"],
+            filename_suffix="results",
+            content=content,
         )
 
     @app.get("/api/admin/audit")

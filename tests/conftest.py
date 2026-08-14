@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from server.config import Config
+from server.database import connect
 from server.main import create_app
 
 
@@ -58,6 +59,32 @@ def admin_login(client: TestClient) -> str:
     )
     assert response.status_code == 200, response.text
     return response.json()["csrf_token"]
+
+
+def open_selection_now(
+    client: TestClient, admin_headers: dict[str, str]
+) -> dict[str, object]:
+    """Start through the public countdown contract, then advance test storage."""
+
+    started = client.post("/api/admin/countdown", headers=admin_headers)
+    assert started.status_code == 200, started.text
+    payload = started.json()
+    server_now = str(payload["server_now"])
+    activity_id = int(admin_headers["X-Activity-ID"])
+    connection = connect(client.app.state.config.database_path)
+    try:
+        connection.execute(
+            """
+            UPDATE activities
+            SET selection_opens_at = ?, opened_at = ?
+            WHERE id = ?
+            """,
+            (server_now, server_now, activity_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return payload
 
 
 @pytest.fixture()

@@ -80,9 +80,9 @@ cleanup_preflight() {
     local resolved
     resolved="$(readlink -f "${PREFLIGHT_DIR}" 2>/dev/null || true)"
     case "${resolved}" in
-      "${DATA_DIR}"/.migration-preflight-*) rm -rf -- "${resolved}" ;;
+      "${DATA_DIR}"/.release-preflight-*) rm -rf -- "${resolved}" ;;
       "") ;;
-      *) log "拒绝清理非预期迁移临时目录：${resolved}" ;;
+      *) log "拒绝清理非预期发布预检临时目录：${resolved}" ;;
     esac
   fi
 }
@@ -195,7 +195,7 @@ on_exit() {
           systemctl start cloudflared.service || true
         fi
         ;;
-      ROLLBACK_READY|MIGRATING|DB_MIGRATED)
+      ROLLBACK_READY|VALIDATING|DB_VALIDATED)
         restore_old_release || true
         ;;
       LOCAL_HEALTHY)
@@ -262,7 +262,7 @@ ROLLBACK_TAG="teaching-group-choice:rollback-${OLD_COMMIT}"
 docker image tag "${OLD_IMAGE_ID}" "${ROLLBACK_TAG}"
 install -m 0600 "${ENV_FILE}" "${RELEASE_DIR}/env.before"
 
-log "创建迁移预演源备份"
+log "创建发布预检源备份"
 BACKUP_CONTAINER="$("${COMPOSE[@]}" exec -T app \
   python -m server.maintenance backup --retain 30 | tail -n 1)"
 if [[ ! "${BACKUP_CONTAINER}" =~ ^/data/backups/teaching-choice-[0-9]{8}T[0-9]{6}([0-9]{6})?Z\.db$ ]]; then
@@ -299,19 +299,19 @@ printf 'old_commit=%s\nold_image=%s\nnew_commit=%s\nnew_image=%s\nbackup=%s\n' \
   "${OLD_COMMIT}" "${OLD_IMAGE_ID}" "${NEW_COMMIT}" "${NEW_IMAGE_ID}" \
   "${RELEASE_DIR}/pre-upgrade.db" > "${RELEASE_DIR}/manifest"
 
-PREFLIGHT_DIR="$(mktemp -d "${DATA_DIR}/.migration-preflight-${STAMP}.XXXXXX")"
+PREFLIGHT_DIR="$(mktemp -d "${DATA_DIR}/.release-preflight-${STAMP}.XXXXXX")"
 chown 10001:10001 "${PREFLIGHT_DIR}"
 chmod 0700 "${PREFLIGHT_DIR}"
 install -o 10001 -g 10001 -m 0640 \
   "${RELEASE_DIR}/preflight-source.db" "${PREFLIGHT_DIR}/teaching-choice.db"
-log "在隔离备份副本上演练数据库迁移"
+log "在隔离备份副本上校验当前数据库版本与业务数据"
 docker run --rm --env-file "${ENV_FILE}" \
   -e DATA_DIR=/work \
   -e DATABASE_PATH=/work/teaching-choice.db \
   -e SEED_DEMO_STRUCTURE=false \
   -e ADMIN_INITIAL_PASSWORD= \
   --mount "type=bind,src=${PREFLIGHT_DIR},dst=/work" \
-  "${NEW_IMAGE}" python -m server.maintenance migrate-check \
+  "${NEW_IMAGE}" python -m server.maintenance release-check \
   | tee "${RELEASE_DIR}/preflight.log"
 PHASE="PREFLIGHT_OK"
 
@@ -321,7 +321,7 @@ set_env APP_VERSION "${NEW_COMMIT}"
 PHASE="ENV_READY"
 
 PHASE="QUIESCING"
-log "进入维护窗并迁移正式数据库"
+log "进入维护窗并校验正式数据库"
 systemctl stop cloudflared.service
 "${COMPOSE[@]}" stop -t 30 app
 FINAL_STATUS="$(docker run --rm --env-file "${ENV_FILE}" \
@@ -329,7 +329,7 @@ FINAL_STATUS="$(docker run --rm --env-file "${ENV_FILE}" \
   --mount "type=bind,src=${DATA_DIR},dst=/work" "${ROLLBACK_TAG}" python -c \
   'from server.config import Config; from server.database import connect; c=connect(Config.from_env().database_path); print(c.execute("SELECT status FROM settings WHERE id=1").fetchone()[0]); c.close()')"
 if [[ "${FINAL_STATUS}" != "closed" ]]; then
-  echo "维护窗开始前活动状态已经变化，拒绝迁移" >&2
+  echo "维护窗开始前活动状态已经变化，拒绝发布" >&2
   exit 1
 fi
 log "从静止数据库生成最终回滚备份"
@@ -348,22 +348,22 @@ sha256sum "${RELEASE_DIR}/pre-upgrade.db" > "${RELEASE_DIR}/pre-upgrade.db.sha25
 sha256sum -c "${RELEASE_DIR}/pre-upgrade.db.sha256"
 FINAL_BACKUP_READY=1
 PHASE="ROLLBACK_READY"
-PHASE="MIGRATING"
+PHASE="VALIDATING"
 docker run --rm --env-file "${ENV_FILE}" \
   -e DATA_DIR=/work \
   -e DATABASE_PATH=/work/teaching-choice.db \
   -e SEED_DEMO_STRUCTURE=false \
   -e ADMIN_INITIAL_PASSWORD= \
   --mount "type=bind,src=${DATA_DIR},dst=/work" \
-  "${NEW_IMAGE}" python -m server.maintenance migrate-check \
-  | tee "${RELEASE_DIR}/production-migration.log"
-PHASE="DB_MIGRATED"
+  "${NEW_IMAGE}" python -m server.maintenance release-check \
+  | tee "${RELEASE_DIR}/production-release-check.log"
+PHASE="DB_VALIDATED"
 
 "${COMPOSE[@]}" up -d --no-build --wait --wait-timeout 180 app
 RUNNING_CONTAINER_ID="$("${COMPOSE[@]}" ps -q app)"
 RUNNING_IMAGE_ID="$(docker inspect -f '{{.Image}}' "${RUNNING_CONTAINER_ID}")"
 if [[ "${RUNNING_IMAGE_ID}" != "${NEW_IMAGE_ID}" ]]; then
-  echo "实际运行镜像与迁移演练镜像不一致" >&2
+  echo "实际运行镜像与发布预检镜像不一致" >&2
   exit 1
 fi
 "${COMPOSE[@]}" exec -T app python -m server.maintenance check

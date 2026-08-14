@@ -1,0 +1,363 @@
+from __future__ import annotations
+
+from html.parser import HTMLParser
+import json
+from pathlib import Path
+import subprocess
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class _StudentDomParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.by_id: dict[str, dict[str, str]] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = {key: value or "" for key, value in attrs}
+        element_id = attributes.get("id")
+        if element_id:
+            self.by_id[element_id] = {"tag": tag, **attributes}
+
+
+def _student_sources() -> tuple[_StudentDomParser, str, str]:
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
+    parser = _StudentDomParser()
+    parser.feed(html)
+    return parser, html, javascript
+
+
+def _run_node(script: str) -> dict[str, object]:
+    execution = subprocess.run(
+        ["node", "-e", script, str(ROOT / "web" / "student.js")],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert execution.returncode == 0, execution.stderr
+    return json.loads(execution.stdout)
+
+
+def test_student_login_contract_is_explicit_and_mobile_friendly() -> None:
+    parser, html, _ = _student_sources()
+
+    student_no = parser.by_id["student-no"]
+    assert student_no["inputmode"] == "numeric"
+    assert student_no["minlength"] == student_no["maxlength"] == "11"
+    assert student_no["pattern"] == "[0-9]{11}"
+    assert "student-no-help" in student_no["aria-describedby"]
+    assert "11 位数字" in html
+
+    name = parser.by_id["student-name"]
+    assert name["maxlength"] == "40"
+    assert "A-Za-z" in name["pattern"]
+    assert "·•・" in name["pattern"]
+    assert "student-name-help" in name["aria-describedby"]
+    assert "中文、英文字母、空格或姓名中点" in html
+
+    activation = parser.by_id["activation-code"]
+    assert activation["minlength"] == activation["maxlength"] == "6"
+    assert activation["pattern"] == "[A-Za-z0-9]{6}"
+
+
+def test_student_login_normalization_and_validation_execute_in_node() -> None:
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8").split("const studentState =", 1)[0];
+eval(source + `
+  const normalized = normalizeStudentLoginPayload({
+    student_no: " ２０２６１２３４５６７ ",
+    name: " 张 三·Alice ",
+    activation_code: " ａ1ｂ2ｃ3 ",
+  });
+  const codeWithInnerSpace = normalizeStudentLoginPayload({
+    student_no: "20261234567", name: "张三", activation_code: " A1 B2C ",
+  });
+  process.stdout.write(JSON.stringify({
+    normalized,
+    codeWithInnerSpace: codeWithInnerSpace.activation_code,
+    codeWithInnerSpaceErrors: validateStudentLoginPayload(codeWithInnerSpace),
+    valid: validateStudentLoginPayload(normalized),
+    badStudentNumbers: ["2026123456", "202612345678", "20261A34567"].map((student_no) =>
+      validateStudentLoginPayload({student_no, name: "张三", activation_code: "A1B2C3"})
+    ),
+    badNames: ["张三2", "张三🙂", "O'Connor", "张\\u0007三"].map((name) =>
+      validateStudentLoginPayload({student_no: "20261234567", name, activation_code: "A1B2C3"})
+    ),
+    badCodes: ["12345", "1234567", "12*456", "A1 B2C"].map((activation_code) =>
+      validateStudentLoginPayload({student_no: "20261234567", name: "张三", activation_code})
+    ),
+    badges: [
+      professionalBadge("建筑学（五年制）"),
+      professionalBadge("城乡规划"),
+      professionalBadge("风景园林"),
+      professionalBadge("环境设计"),
+      professionalBadge("室内空间设计实验班"),
+    ],
+  }));
+`);
+"""
+    result = _run_node(script)
+    assert result["normalized"] == {
+        "student_no": "20261234567",
+        "name": "张 三·Alice",
+        "activation_code": "A1B2C3",
+    }
+    assert result["valid"] == {}
+    assert result["codeWithInnerSpace"] == "A1 B2C"
+    assert set(result["codeWithInnerSpaceErrors"]) == {"activation_code"}
+    assert all(set(item) == {"student_no"} for item in result["badStudentNumbers"])
+    assert all(set(item) == {"name"} for item in result["badNames"])
+    assert all(set(item) == {"activation_code"} for item in result["badCodes"])
+    assert result["badges"] == ["建筑学", "城乡规划", "风景园林", "环境设计", "室内空间设计…"]
+
+
+def test_server_clock_uses_server_epoch_and_local_monotonic_elapsed_time() -> None:
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const stateBody = source.match(/const studentState = (\{[\s\S]*?[\r\n]+\});[\r\n]+const studentEls/);
+if (!stateBody) throw new Error("studentState block not found");
+const timingBlock = "const STUDENT_CLOCK_SYNC_PATHS" + source.split("const STUDENT_CLOCK_SYNC_PATHS", 2)[1].split("const studentState =", 1)[0];
+const clockBlock = "function studentField" + source.split("function studentField", 2)[1].split("function studentPhase", 1)[0];
+let monotonic = 1000;
+Object.defineProperty(globalThis, "performance", {value: {now: () => monotonic}, configurable: true});
+const element = () => ({dataset: {}, textContent: "", title: "", removeAttribute() {}, setAttribute(key, value) { this[key] = value; }});
+eval(`
+  ${timingBlock}
+  const studentState = ${stateBody[1]};
+  const studentEls = {clock: element(), clockStatus: element(), clockTime: element()};
+  ${clockBlock}
+  synchronizeStudentClock({server_now: "2026-08-14T06:00:00+00:00"});
+  const atSync = currentStudentServerTimeMs();
+  monotonic = 3500;
+  renderStudentServerClock();
+  const after = currentStudentServerTimeMs();
+  studentState.connectionInterrupted = true;
+  renderStudentServerClock();
+  process.stdout.write(JSON.stringify({
+    atSync,
+    after,
+    text: studentEls.clockTime.textContent,
+    syncStatus: studentEls.clock.dataset.syncStatus,
+    statusText: studentEls.clockStatus.textContent,
+  }));
+`);
+"""
+    result = _run_node(script)
+    assert result["after"] - result["atSync"] == 2500
+    assert result["text"] == "14:00:02"
+    assert result["syncStatus"] == "interrupted"
+    assert result["statusText"] == "同步中断"
+
+
+def test_server_clock_compensates_800ms_rtt_and_never_moves_backward() -> None:
+    _, _, javascript = _student_sources()
+    api_block = javascript.split("async function studentApi", 1)[1].split(
+        "function showStudentMessage", 1
+    )[0]
+    assert "beginStudentClockRequestTiming(path)" in api_block
+    assert "finishStudentClockRequestTiming(clockRequestTiming)" in api_block
+    assert "rememberStudentResponseClockTiming(data, clockResponseTiming)" in api_block
+
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const stateBody = source.match(/const studentState = (\{[\s\S]*?[\r\n]+\});[\r\n]+const studentEls/);
+if (!stateBody) throw new Error("studentState block not found");
+const timingBlock = "const STUDENT_CLOCK_SYNC_PATHS" + source.split("const STUDENT_CLOCK_SYNC_PATHS", 2)[1].split("const studentState =", 1)[0];
+const clockBlock = "function studentField" + source.split("function studentField", 2)[1].split("function studentPhase", 1)[0];
+const baseServerMs = Date.parse("2026-08-14T06:00:00.000Z");
+let monotonic = 0;
+let wall = Date.parse("2026-08-14T05:59:58.000Z");
+Object.defineProperty(globalThis, "performance", {value: {now: () => monotonic}, configurable: true});
+Date.now = () => wall;
+const element = () => ({dataset: {}, textContent: "", title: "", removeAttribute() {}, setAttribute(key, value) { this[key] = value; }});
+eval(`
+  ${timingBlock}
+  const studentState = ${stateBody[1]};
+  const studentEls = {clock: element(), clockStatus: element(), clockTime: element()};
+  ${clockBlock}
+  const request = beginStudentClockRequestTiming("/api/student/me");
+  monotonic = 800;
+  wall += 800;
+  const response = finishStudentClockRequestTiming(request);
+  const payload = {server_now: new Date(baseServerMs).toISOString()};
+  rememberStudentResponseClockTiming(payload, response);
+  synchronizeStudentClock(payload);
+  const compensatedAtResponse = currentStudentServerTimeMs();
+
+  monotonic = 1600;
+  wall += 800;
+  const afterElapsed = currentStudentServerTimeMs();
+
+  const staleRequest = beginStudentClockRequestTiming("/api/public/info");
+  monotonic = 2400;
+  wall += 800;
+  const staleResponse = finishStudentClockRequestTiming(staleRequest);
+  const stalePayload = {server_now: new Date(baseServerMs + 500).toISOString()};
+  rememberStudentResponseClockTiming(stalePayload, staleResponse);
+  const beforeStaleSync = currentStudentServerTimeMs();
+  synchronizeStudentClock(stalePayload);
+  const afterStaleSync = currentStudentServerTimeMs();
+  process.stdout.write(JSON.stringify({
+    compensatedMs: compensatedAtResponse - baseServerMs,
+    elapsedMs: afterElapsed - compensatedAtResponse,
+    rttMs: studentState.serverClockLastSampleRttMs,
+    monotonicAfterStale: afterStaleSync >= beforeStaleSync,
+    paths: [...STUDENT_CLOCK_SYNC_PATHS],
+  }));
+`);
+"""
+    result = _run_node(script)
+    assert result["compensatedMs"] == 400
+    assert result["elapsedMs"] == 800
+    assert result["rttMs"] == 800
+    assert result["monotonicAfterStale"] is True
+    assert result["paths"] == [
+        "/api/public/info",
+        "/api/student/login",
+        "/api/student/me",
+    ]
+
+
+def test_keyboard_sized_visual_viewport_uses_internal_form_scroll_only() -> None:
+    parser, _, javascript = _student_sources()
+    css = (ROOT / "web" / "app.css").read_text(encoding="utf-8")
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const viewportBlock = "function syncStudentViewportHeight" + source.split("function syncStudentViewportHeight", 2)[1].split('window.addEventListener("offline"', 1)[0];
+const classes = new Set();
+let visualHeight = 844;
+let focused = false;
+global.window = {innerHeight: 844, visualViewport: {get height() { return visualHeight; }}};
+global.document = {
+  activeElement: {closest: () => focused ? {} : null},
+  documentElement: {clientHeight: 844, style: {value: "", setProperty(name, value) { if (name === "--student-app-height") this.value = value; }}},
+  body: {classList: {toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); }}},
+};
+eval(`${viewportBlock}
+  syncStudentViewportHeight();
+  const normal = {height: document.documentElement.style.value, keyboard: classes.has("student-keyboard-open")};
+  visualHeight = 360;
+  focused = true;
+  syncStudentViewportHeight();
+  const keyboard = {height: document.documentElement.style.value, keyboard: classes.has("student-keyboard-open")};
+  process.stdout.write(JSON.stringify({normal, keyboard}));
+`);
+"""
+    result = _run_node(script)
+
+    assert parser.by_id["login-view"]["tag"] == "section"
+    assert parser.by_id["student-login-form"]["tag"] == "form"
+    assert result["normal"] == {"height": "844px", "keyboard": False}
+    assert result["keyboard"] == {"height": "360px", "keyboard": True}
+    assert ".student-body.student-keyboard-open #student-login-form" in css
+    keyboard_css = css.split(
+        ".student-body.student-keyboard-open #student-login-form {", 1
+    )[1].split("}", 1)[0]
+    assert "overflow-y: auto" in keyboard_css
+    assert "overscroll-behavior: contain" in keyboard_css
+    assert ".student-body.student-keyboard-open .student-hero" in css
+    assert ".student-body.student-keyboard-open .site-footer--student" in css
+    assert ".student-body.student-keyboard-open" in css and "overflow: hidden" in css
+    error_focus = javascript.split("function focusFirstStudentFieldError", 1)[1].split(
+        "function validationField", 1
+    )[0]
+    assert 'field.input.focus({ preventScroll: true })' in error_focus
+    assert "document.activeElement === field.input" in error_focus
+    assert 'field.input.scrollIntoView({ block: "center", inline: "nearest", behavior: "auto" })' in error_focus
+
+
+def test_result_receipt_and_professional_labels_are_clear_and_secret_free() -> None:
+    parser, html, javascript = _student_sources()
+
+    assert parser.by_id["student-clock"]["data-sync-status"] == "syncing"
+    assert parser.by_id["student-server-clock"]["tag"] == "time"
+    assert parser.by_id["success-major-badge"]["role"] == "img"
+    assert "下载抢选结果凭证" in html
+    assert "请下载并妥善保存「抢选结果凭证」" in html
+
+    card_source = javascript.split("async function createResultCardBlob", 1)[1].split(
+        "async function downloadStudentResultCard", 1
+    )[0]
+    assert "canvas.width = 1080" in card_source
+    assert "canvas.height = 1350" in card_source
+    assert "抢选结果凭证" in card_source
+    assert "核验提示" in card_source
+    assert "payload.settings.activity_title" in card_source
+    assert "payload.student.name" in card_source
+    assert "payload.student.student_no" in card_source
+    assert "payload.student.major_name" in card_source
+    assert "payload.selection.group_name" in card_source
+    assert 'label === "姓名" || label === "专业"' in card_source
+    assert "drawFittedCardText(context, payload.selection.group_name" in card_source
+    assert "payload.selection.selected_at" in card_source
+    assert '"/brand/college-wordmark-official.png"' in javascript
+    assert "activation_code" not in card_source
+    assert "个人激活码" not in card_source
+    assert "--student-app-height" in javascript
+
+
+@pytest.mark.parametrize(
+    ("length", "max_width", "max_font_size"),
+    [(40, 360, 33), (80, 360, 33), (80, 800, 42)],
+)
+def test_result_receipt_preserves_full_boundary_text_in_two_lines(
+    length: int, max_width: int, max_font_size: int
+) -> None:
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const helperBlock = "function fittedCardTextLines" + source.split("function fittedCardTextLines", 2)[1].split("function loadResultCardLogo", 1)[0];
+const drawn = [];
+let currentFontSize = 0;
+const context = {
+  set font(value) {
+    this._font = value;
+    currentFontSize = Number(value.match(/(\d+)px/)[1]);
+  },
+  get font() { return this._font; },
+  measureText(value) { return {width: Array.from(value).length * currentFontSize}; },
+  fillText(value, x, y) { drawn.push({value, x, y}); },
+};
+eval(`${helperBlock}
+  const name = "超".repeat(__LENGTH__);
+  const result = drawFittedCardText(context, name, 132, 900, __MAX_WIDTH__, __MAX_FONT_SIZE__, 2);
+  process.stdout.write(JSON.stringify({name, drawn, result}));
+`);
+"""
+    script = (
+        script.replace("__LENGTH__", str(length))
+        .replace("__MAX_WIDTH__", str(max_width))
+        .replace("__MAX_FONT_SIZE__", str(max_font_size))
+    )
+    result = _run_node(script)
+
+    assert "".join(line["value"] for line in result["drawn"]) == result["name"]
+    assert result["result"]["lineCount"] == 2
+    assert result["result"]["fontSize"] >= 1
+    assert all("…" not in line["value"] for line in result["drawn"])
+
+
+def test_success_view_keeps_syncing_for_administrator_revocation() -> None:
+    _, _, javascript = _student_sources()
+    render_block = javascript.split("function renderStudentPayload", 1)[1].split(
+        "async function loadPublicInfo", 1
+    )[0]
+    polling_block = javascript.split("function startStudentPolling", 1)[1].split(
+        "function tickStudentCountdown", 1
+    )[0]
+
+    assert "clearInterval(studentState.pollTimer)" not in render_block
+    assert "if (studentState.payload?.selection) return" not in polling_block
+    assert "const hadSelection = Boolean(studentState.payload?.selection)" in polling_block
+    assert "pollStartedAt - studentState.lastSelectedSyncAt < 5000" in polling_block
+    assert "hadSelection && !data.selection" in polling_block
+    assert "原选择已被管理员撤销" in polling_block

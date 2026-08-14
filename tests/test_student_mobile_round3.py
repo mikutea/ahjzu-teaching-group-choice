@@ -42,19 +42,21 @@ def test_student_login_fields_have_strict_mobile_and_accessibility_contracts() -
     parser, _ = _student_dom()
 
     student_no = parser.by_id["student-no"]
-    assert student_no["minlength"] == "4"
-    assert student_no["maxlength"] == "32"
-    assert student_no["pattern"] == "[A-Za-z0-9_-]{4,32}"
+    assert student_no["inputmode"] == "numeric"
+    assert student_no["minlength"] == student_no["maxlength"] == "11"
+    assert student_no["pattern"] == "[0-9]{11}"
     assert student_no["autocomplete"] == "username"
     assert student_no["autocorrect"] == "off"
-    assert student_no["aria-describedby"] == "student-no-error"
+    assert "student-no-help" in student_no["aria-describedby"]
+    assert "student-no-error" in student_no["aria-describedby"]
 
     name = parser.by_id["student-name"]
-    assert name["maxlength"] == "80"
-    assert "·" in name["pattern"]
-    assert "’" in name["pattern"]
+    assert name["maxlength"] == "40"
+    assert "A-Za-z" in name["pattern"]
+    assert "·•・" in name["pattern"]
     assert name["autocomplete"] == "name"
-    assert name["aria-describedby"] == "student-name-error"
+    assert "student-name-help" in name["aria-describedby"]
+    assert "student-name-error" in name["aria-describedby"]
 
     activation = parser.by_id["activation-code"]
     assert activation["minlength"] == activation["maxlength"] == "6"
@@ -83,8 +85,8 @@ const fs = require("fs");
 const source = fs.readFileSync(process.argv[1], "utf8").split("const studentState =", 1)[0];
 eval(source + `
   const normalized = normalizeStudentLoginPayload({
-    student_no: "  ＡＢＣ＿１２  ",
-    name: "  O’Connor  ·  李  ",
+    student_no: " ２０２６１２３４５６７ ",
+    name: "  张 三·Alice  ",
     activation_code: " ａ1ｂ2ｃ3 ",
   });
   const result = {
@@ -93,22 +95,22 @@ eval(source + `
     invalid: validateStudentLoginPayload({
       student_no: "12<script>", name: "张三🙂", activation_code: "12*456"
     }),
-    legacy: [
-      {student_no: "LEGACY.2026.001", name: "旧版兼容学生", activation_code: "A1B2C3"},
-      {student_no: "L".repeat(35), name: "=Legacy Name", activation_code: "A1B2C3"},
+    invalidNumbers: [
+      {student_no: "2026123456", name: "正常姓名", activation_code: "A1B2C3"},
+      {student_no: "202612345678", name: "正常姓名", activation_code: "A1B2C3"},
     ].map((payload) => validateStudentLoginPayload(payload)),
     unsafeEnvelope: {
       studentNoControl: validateStudentLoginPayload({
         student_no: "bad\\nnumber", name: "正常姓名", activation_code: "A1B2C3"
       }),
       nameControl: validateStudentLoginPayload({
-        student_no: "20260001", name: "坏\\u0007姓名", activation_code: "A1B2C3"
+        student_no: "20261234567", name: "坏\\u0007姓名", activation_code: "A1B2C3"
       }),
       studentNoTooLong: validateStudentLoginPayload({
         student_no: "L".repeat(41), name: "正常姓名", activation_code: "A1B2C3"
       }),
       nameTooLong: validateStudentLoginPayload({
-        student_no: "20260001", name: "名".repeat(81), activation_code: "A1B2C3"
+        student_no: "20261234567", name: "名".repeat(81), activation_code: "A1B2C3"
       }),
     },
     badges: [
@@ -118,8 +120,8 @@ eval(source + `
       professionalBadge("室内设计"),
       professionalBadge(""),
     ],
-    supportedNames: ["陳·嘉敏", "O’Connor", "Ana-María", "王 小明"].map((name) =>
-      Object.keys(validateStudentLoginPayload({student_no: "AHJZU_01", name, activation_code: "A1B2C3"})).length
+    supportedNames: ["陳·嘉敏", "Alice Smith", "AnaMaria", "王 小明"].map((name) =>
+      Object.keys(validateStudentLoginPayload({student_no: "20261234567", name, activation_code: "A1B2C3"})).length
     ),
   };
   process.stdout.write(JSON.stringify(result));
@@ -135,18 +137,18 @@ eval(source + `
     assert execution.returncode == 0, execution.stderr
     result = json.loads(execution.stdout)
     assert result["normalized"] == {
-        "student_no": "ＡＢＣ＿１２",
-        "name": "O’Connor · 李",
+        "student_no": "20261234567",
+        "name": "张 三·Alice",
         "activation_code": "A1B2C3",
     }
     assert result["valid"] == {}
-    assert set(result["invalid"]) == {"activation_code"}
-    assert result["legacy"] == [{}, {}]
+    assert set(result["invalid"]) == {"student_no", "name", "activation_code"}
+    assert all(set(item) == {"student_no"} for item in result["invalidNumbers"])
     assert set(result["unsafeEnvelope"]["studentNoControl"]) == {"student_no"}
     assert set(result["unsafeEnvelope"]["nameControl"]) == {"name"}
     assert set(result["unsafeEnvelope"]["studentNoTooLong"]) == {"student_no"}
     assert set(result["unsafeEnvelope"]["nameTooLong"]) == {"name"}
-    assert result["badges"] == ["建", "规", "景", "室", "专"]
+    assert result["badges"] == ["建筑学", "城乡规划", "风景园林", "室内设计", "专业"]
     assert result["supportedNames"] == [0, 0, 0, 0]
 
 
@@ -154,10 +156,11 @@ def test_major_badges_and_standardized_result_card_are_exposed_without_secrets()
     parser, html = _student_dom()
     student_js = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
 
-    assert "studentLoginFields.student_no.input.minLength = 1" in student_js
-    assert "studentLoginFields.student_no.input.maxLength = STUDENT_NO_MAX_INPUT_LENGTH" in student_js
-    assert 'studentLoginFields.student_no.input.removeAttribute("pattern")' in student_js
-    assert 'studentLoginFields.name.input.removeAttribute("pattern")' in student_js
+    assert "const STUDENT_NO_INPUT_LENGTH = 11" in student_js
+    assert "const STUDENT_NAME_MAX_INPUT_LENGTH = 40" in student_js
+    assert '.replace(/\\D/g, "").slice(0, STUDENT_NO_INPUT_LENGTH)' in student_js
+    assert 'studentLoginFields.student_no.input.removeAttribute("pattern")' not in student_js
+    assert 'studentLoginFields.name.input.removeAttribute("pattern")' not in student_js
 
     for badge_id in ("student-major-badge", "waiting-major-badge"):
         badge = parser.by_id[badge_id]
@@ -169,16 +172,16 @@ def test_major_badges_and_standardized_result_card_are_exposed_without_secrets()
     download = parser.by_id["download-result-card"]
     assert download["tag"] == "button"
     assert download["type"] == "button"
-    assert "下载统一结果卡" in parser.text_by_id["download-result-card"]
+    assert "下载抢选结果凭证" in parser.text_by_id["download-result-card"]
 
     card_source = student_js.split("async function createResultCardBlob", 1)[1].split(
         "async function downloadStudentResultCard", 1
     )[0]
     assert "canvas.width = 1080" in card_source
-    assert "canvas.height = 1440" in card_source
+    assert "canvas.height = 1350" in card_source
     assert '"/brand/college-wordmark-official.png"' in student_js
-    assert "context.fillRect(54, 66, 972, 250)" in card_source
-    assert card_source.index("context.fillRect(54, 66, 972, 250)") < card_source.index(
+    assert "context.fillRect(48, 40, 984, 274)" in card_source
+    assert card_source.index("context.fillRect(48, 40, 984, 274)") < card_source.index(
         "context.drawImage(logo"
     )
     assert "安徽建筑大学 · 建筑与空间规划学院  制作：Mikutea" in card_source

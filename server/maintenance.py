@@ -11,39 +11,37 @@ from pathlib import Path
 from uuid import uuid4
 
 from .config import Config
-from .database import SCHEMA_VERSION, connect, initialize_database
+from .database import (
+    REQUIRED_CURRENT_INDEXES,
+    REQUIRED_CURRENT_TRIGGERS,
+    SCHEMA_VERSION,
+    connect,
+    initialize_database,
+    validate_current_business_values,
+    validate_current_schema_fingerprint,
+)
+from .security import verify_activation_ciphertext
 
 
-MIGRATION_DIGEST_QUERIES = {
-    "settings": (
-        "SELECT id, activity_title, status, "
-        "public_base_url, created_at, updated_at FROM settings ORDER BY id"
-    ),
+RELEASE_DIGEST_QUERIES = {
+    "settings": "SELECT * FROM settings ORDER BY id",
+    "activities": "SELECT * FROM activities ORDER BY id",
     "majors": "SELECT * FROM majors ORDER BY id",
     "teaching_groups": "SELECT * FROM teaching_groups ORDER BY id",
     "quotas": "SELECT * FROM quotas ORDER BY major_id, group_id",
-    "students": (
-        "SELECT id, student_no, name, major_id, activation_hash, active, "
-        "created_at, updated_at FROM students ORDER BY id"
-    ),
+    "students": "SELECT * FROM students ORDER BY id",
     "selections": "SELECT * FROM selections ORDER BY id",
     "admin_users": "SELECT * FROM admin_users ORDER BY id",
-    "sessions": (
-        "SELECT token_hash, role, subject_id, csrf_token, created_at, expires_at "
-        "FROM sessions ORDER BY token_hash"
-    ),
-    "audit_logs": (
-        "SELECT id, occurred_at, actor_type, actor_id, action, entity_type, "
-        "entity_id, details_json FROM audit_logs ORDER BY id"
-    ),
+    "sessions": "SELECT * FROM sessions ORDER BY token_hash",
+    "audit_logs": "SELECT * FROM audit_logs ORDER BY id",
 }
 
 
-def migration_business_digest(database_path: Path) -> dict[str, str]:
+def release_business_digest(database_path: Path) -> dict[str, str]:
     connection = connect(database_path)
     try:
         digests: dict[str, str] = {}
-        for name, query in MIGRATION_DIGEST_QUERIES.items():
+        for name, query in RELEASE_DIGEST_QUERIES.items():
             rows = [dict(row) for row in connection.execute(query).fetchall()]
             encoded = json.dumps(
                 rows,
@@ -57,20 +55,25 @@ def migration_business_digest(database_path: Path) -> dict[str, str]:
         connection.close()
 
 
-def migrate_and_check(config: Config) -> str:
-    before = migration_business_digest(config.database_path)
+def release_check(config: Config) -> str:
+    before = release_business_digest(config.database_path)
     initialize_database(config)
-    after = migration_business_digest(config.database_path)
+    after = release_business_digest(config.database_path)
     if before != after:
         changed = sorted(name for name in before if before[name] != after[name])
-        raise RuntimeError(f"迁移改变了旧版业务数据：{', '.join(changed)}")
-    result = check_database(config.database_path)
+        raise RuntimeError(f"发布校验改变了业务数据：{', '.join(changed)}")
+    result = check_database(config.database_path, config.app_secret)
     if result != "ok":
-        raise RuntimeError(f"迁移后数据库检查失败：{result}")
-    return "MIGRATION_CHECK_OK"
+        raise RuntimeError(f"发布数据库检查失败：{result}")
+    return "RELEASE_CHECK_OK"
 
 
-def create_backup(database_path: Path, backup_dir: Path, retain: int = 30) -> Path:
+def create_backup(
+    database_path: Path,
+    backup_dir: Path,
+    app_secret: str,
+    retain: int = 30,
+) -> Path:
     if not database_path.is_file() or database_path.stat().st_size == 0:
         raise RuntimeError(f"数据库不存在或为空：{database_path}")
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -94,7 +97,7 @@ def create_backup(database_path: Path, backup_dir: Path, retain: int = 30) -> Pa
             target_connection = None
             source_connection = None
 
-        result = check_database(partial)
+        result = check_database(partial, app_secret)
         if result != "ok":
             raise RuntimeError(f"备份深度检查失败：{result}")
         os.replace(partial, target)
@@ -111,7 +114,7 @@ def create_backup(database_path: Path, backup_dir: Path, retain: int = 30) -> Pa
     return target
 
 
-def check_database(database_path: Path) -> str:
+def check_database(database_path: Path, app_secret: str) -> str:
     if not database_path.is_file() or database_path.stat().st_size == 0:
         raise RuntimeError(f"数据库不存在或为空：{database_path}")
     connection = sqlite3.connect(str(database_path), timeout=15)
@@ -143,28 +146,77 @@ def check_database(database_path: Path) -> str:
             raise RuntimeError(
                 f"数据库版本不受支持：{version}（应用要求 {SCHEMA_VERSION}）"
             )
+        required_columns = {
+            "activities": {"selection_opens_at"},
+            "students": {"activation_ciphertext"},
+            "sessions": {"last_seen_at"},
+        }
+        for table, expected_columns in required_columns.items():
+            table_columns = connection.execute(f"PRAGMA table_info({table})").fetchall()
+            actual_columns = {str(row[1]) for row in table_columns}
+            if not expected_columns <= actual_columns:
+                raise RuntimeError(f"数据库表 {table} 缺少当前版本字段")
+            if table == "students":
+                ciphertext_column = next(
+                    row for row in table_columns if str(row[1]) == "activation_ciphertext"
+                )
+                if int(ciphertext_column[3]) != 1:
+                    raise RuntimeError("学生激活码密文字段缺少 NOT NULL 约束")
+        students_sql_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'students'"
+        ).fetchone()
+        normalized_students_sql = "".join(str(students_sql_row[0]).lower().split())
+        if "check(length(trim(activation_ciphertext))>0)" not in normalized_students_sql:
+            raise RuntimeError("学生激活码密文字段缺少非空检查约束")
+        incomplete_credentials = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM students
+                WHERE activation_ciphertext IS NULL
+                   OR length(trim(activation_ciphertext)) = 0
+                """
+            ).fetchone()[0]
+        )
+        if incomplete_credentials:
+            raise RuntimeError(
+                f"数据库有 {incomplete_credentials} 名学生缺少激活码密文"
+            )
+        validate_current_business_values(connection)
+        invalid_credentials = 0
+        for student_no, activation_hash, activation_ciphertext in connection.execute(
+            """
+            SELECT student_no, activation_hash, activation_ciphertext
+            FROM students
+            """
+        ).fetchall():
+            if not verify_activation_ciphertext(
+                app_secret,
+                str(student_no),
+                str(activation_ciphertext),
+                str(activation_hash),
+            ):
+                invalid_credentials += 1
+        if invalid_credentials:
+            raise RuntimeError(
+                f"数据库有 {invalid_credentials} 名学生的激活码密文无效或与摘要不一致"
+            )
         triggers = {
             str(row[0])
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'trigger'"
             ).fetchall()
         }
-        required_triggers = {
-            "selection_capacity_guard",
-            "selection_capacity_guard_update",
-            "quota_group_capacity_guard_insert",
-            "quota_group_capacity_guard_update",
-            "group_total_capacity_guard_update",
-            "sync_activity_title_to_settings",
-            "sync_activity_status_to_settings",
-            "sync_settings_title_to_activity",
-            "sync_settings_status_to_activity",
-            "assign_current_activity_to_audit",
-            "copyright_settings_guard_update",
-            "copyright_settings_guard_insert",
+        if not REQUIRED_CURRENT_TRIGGERS <= triggers:
+            raise RuntimeError("数据库缺少关键约束触发器")
+        indexes = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
         }
-        if not required_triggers <= triggers:
-            raise RuntimeError("数据库缺少名额约束触发器")
+        if not REQUIRED_CURRENT_INDEXES <= indexes:
+            raise RuntimeError("数据库缺少关键索引")
+        validate_current_schema_fingerprint(connection)
         copyright_row = connection.execute(
             "SELECT organization_name, owner_name FROM settings WHERE id = 1"
         ).fetchone()
@@ -174,18 +226,6 @@ def check_database(database_path: Path) -> str:
             or str(copyright_row[1]) != "Mikutea"
         ):
             raise RuntimeError("数据库版权信息与固定发布信息不一致")
-        required_columns = {
-            "activities": {"selection_opens_at"},
-            "students": {"activation_ciphertext"},
-            "sessions": {"last_seen_at"},
-        }
-        for table, expected_columns in required_columns.items():
-            actual_columns = {
-                str(row[1])
-                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
-            }
-            if not expected_columns <= actual_columns:
-                raise RuntimeError(f"数据库表 {table} 缺少新版本字段")
         live_activities = connection.execute(
             "SELECT id FROM activities WHERE status <> 'archived'"
         ).fetchall()
@@ -196,6 +236,15 @@ def check_database(database_path: Path) -> str:
         ).fetchone()
         if not current or int(current[0]) != int(live_activities[0][0]):
             raise RuntimeError("系统设置指向的当前活动不正确")
+        unassigned_audits = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM audit_logs WHERE activity_id IS NULL"
+            ).fetchone()[0]
+        )
+        if unassigned_audits:
+            raise RuntimeError(
+                f"数据库有 {unassigned_audits} 条审计日志未归属活动"
+            )
         live = connection.execute(
             """
             SELECT id, status, opened_at, closed_at, selection_opens_at
@@ -341,20 +390,25 @@ def main() -> None:
     backup = subparsers.add_parser("backup")
     backup.add_argument("--retain", type=int, default=30)
     subparsers.add_parser("check")
-    subparsers.add_parser("migrate-check")
+    subparsers.add_parser("release-check")
     args = parser.parse_args()
     config = Config.from_env()
 
     if args.command == "backup":
-        target = create_backup(config.database_path, config.database_path.parent / "backups", args.retain)
+        target = create_backup(
+            config.database_path,
+            config.database_path.parent / "backups",
+            config.app_secret,
+            args.retain,
+        )
         print(target)
     elif args.command == "check":
-        result = check_database(config.database_path)
+        result = check_database(config.database_path, config.app_secret)
         print(result)
         if result != "ok":
             raise SystemExit(1)
-    elif args.command == "migrate-check":
-        print(migrate_and_check(config))
+    elif args.command == "release-check":
+        print(release_check(config))
 
 
 if __name__ == "__main__":

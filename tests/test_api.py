@@ -4,7 +4,6 @@ import hashlib
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,13 +12,12 @@ from .conftest import (
     admin_login,
     fictional_activation_code,
     fictional_document_number,
+    open_selection_now,
 )
-from server.database import SCHEMA_VERSION, connect, initialize_database
+from server.database import connect, initialize_database
 from server.maintenance import (
     check_database,
     create_backup,
-    migrate_and_check,
-    migration_business_digest,
 )
 
 
@@ -80,18 +78,18 @@ def test_structure_is_locked_while_open(client: TestClient, admin_headers: dict[
         "/api/admin/students/import",
         headers=admin_headers,
         files={
-            "file": (
+            "files": (
                 "student.csv",
                 (
                     "学号,姓名,专业,证件号\n"
-                    f"20260000,结构锁测试,{major_name},{fictional_document_number('20260000')}\n"
+                    f"20260000000,结构锁测试,{major_name},{fictional_document_number('20260000000')}\n"
                 ).encode("utf-8"),
                 "text/csv",
             )
         },
     )
     assert imported.status_code == 200, imported.text
-    assert client.post("/api/admin/status", headers=admin_headers, json={"status": "open"}).status_code == 200
+    open_selection_now(client, admin_headers)
     blocked = client.post("/api/admin/majors", headers=admin_headers, json={"name": "不可新增"})
     assert blocked.status_code == 409
     assert "关闭抢选" in blocked.json()["detail"]
@@ -113,9 +111,14 @@ def test_admin_qr_is_generated_from_configured_public_url(
 
 
 def test_online_backup_passes_integrity_check(app, app_config, tmp_path):
-    backup = create_backup(app_config.database_path, tmp_path / "backups", retain=3)
+    backup = create_backup(
+        app_config.database_path,
+        tmp_path / "backups",
+        app_config.app_secret,
+        retain=3,
+    )
     assert backup.exists()
-    assert check_database(backup) == "ok"
+    assert check_database(backup, app_config.app_secret) == "ok"
 
 
 def test_new_activity_archives_history_and_resets_roster(
@@ -127,21 +130,21 @@ def test_new_activity_archives_history_and_resets_roster(
     group = dashboard["groups"][0]
     csv_text = (
         "学号,姓名,专业,证件号\n"
-        f"20260099,归档测试,{major['name']},{fictional_document_number('20260099')}\n"
+        f"20260000099,归档测试,{major['name']},{fictional_document_number('20260000099')}\n"
     )
     imported = client.post(
         "/api/admin/students/import",
         headers=admin_headers,
-        files={"file": ("students.csv", csv_text.encode("utf-8"), "text/csv")},
+        files={"files": ("students.csv", csv_text.encode("utf-8"), "text/csv")},
     )
     assert imported.status_code == 200, imported.text
     old_student_client = TestClient(client.app)
     old_login = old_student_client.post(
         "/api/student/login",
         json={
-            "student_no": "20260099",
+            "student_no": "20260000099",
             "name": "归档测试",
-            "activation_code": fictional_activation_code("20260099"),
+            "activation_code": fictional_activation_code("20260000099"),
         },
     )
     assert old_login.status_code == 200, old_login.text
@@ -177,7 +180,7 @@ def test_new_activity_archives_history_and_resets_roster(
     archive = client.get(f"/api/admin/activities/{first_activity}/archive.json")
     assert archive.status_code == 200
     archive_data = archive.json()
-    assert archive_data["students"][0]["student_no"] == "20260099"
+    assert archive_data["students"][0]["student_no"] == "20260000099"
     assert archive_data["selections"][0]["group_name"] == group["name"]
     assert len(archive.headers["X-Archive-SHA256"]) == 64
     assert hashlib.sha256(archive.content).hexdigest() == archive.headers["X-Archive-SHA256"]
@@ -189,11 +192,11 @@ def test_new_activity_archives_history_and_resets_roster(
             "X-Activity-ID": str(current["settings"]["activity_id"]),
         },
         files={
-            "file": (
+            "files": (
                 "students.csv",
                 (
                     "学号,姓名,专业,证件号\n"
-                    f"20260099,新活动同学,{major['name']},{fictional_document_number('next-20260099')}\n"
+                    f"20260000099,新活动同学,{major['name']},{fictional_document_number('next-20260000099')}\n"
                 ).encode("utf-8"),
                 "text/csv",
             )
@@ -213,7 +216,7 @@ def test_new_activity_archives_history_and_resets_roster(
     finally:
         tamper.close()
     with pytest.raises(RuntimeError, match="SHA-256"):
-        check_database(app_config.database_path)
+        check_database(app_config.database_path, app_config.app_secret)
 
 
 def test_new_activity_requires_current_activity_closed(client: TestClient, admin_headers: dict[str, str]):
@@ -223,21 +226,19 @@ def test_new_activity_requires_current_activity_closed(client: TestClient, admin
         "/api/admin/students/import",
         headers=admin_headers,
         files={
-            "file": (
+            "files": (
                 "student.csv",
                 (
                     "学号,姓名,专业,证件号\n"
-                    f"20260000,活动状态测试,{dashboard['majors'][0]['name']},"
-                    f"{fictional_document_number('activity-20260000')}\n"
+                    f"20260000000,活动状态测试,{dashboard['majors'][0]['name']},"
+                    f"{fictional_document_number('activity-20260000000')}\n"
                 ).encode("utf-8"),
                 "text/csv",
             )
         },
     )
     assert imported.status_code == 200, imported.text
-    assert client.post(
-        "/api/admin/status", headers=admin_headers, json={"status": "open"}
-    ).status_code == 200
+    open_selection_now(client, admin_headers)
     blocked = client.post(
         "/api/admin/activities",
         headers=admin_headers,
@@ -336,170 +337,16 @@ def test_activity_mutation_requires_valid_activity_header(client: TestClient):
     assert client.get("/api/admin/dashboard").json()["settings"]["status"] == "closed"
 
 
-def test_check_database_rejects_missing_or_empty_database(tmp_path):
+def test_check_database_rejects_missing_or_empty_database(tmp_path, app_config):
     missing = tmp_path / "missing.db"
     with pytest.raises(RuntimeError, match="不存在或为空"):
-        check_database(missing)
+        check_database(missing, app_config.app_secret)
     assert not missing.exists()
 
     empty = tmp_path / "empty.db"
     empty.touch()
     with pytest.raises(RuntimeError, match="不存在或为空"):
-        check_database(empty)
-
-
-def test_existing_single_activity_database_migrates_without_losing_settings(app_config):
-    database_path = app_config.database_path
-    connection = sqlite3.connect(database_path)
-    connection.executescript(
-        """
-        CREATE TABLE settings (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            activity_title TEXT NOT NULL,
-            organization_name TEXT NOT NULL,
-            owner_name TEXT NOT NULL,
-            status TEXT NOT NULL CHECK (status IN ('closed', 'open')),
-            public_base_url TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            occurred_at TEXT NOT NULL,
-            actor_type TEXT NOT NULL,
-            actor_id TEXT NOT NULL,
-            action TEXT NOT NULL,
-            entity_type TEXT NOT NULL,
-            entity_id TEXT NOT NULL,
-            details_json TEXT NOT NULL
-        );
-        INSERT INTO settings VALUES (
-            1, '旧版活动', '安徽建筑大学 · 建筑与空间规划学院', 'Mikutea',
-            'closed', 'https://choice.example.com', '2026-01-01T00:00:00+00:00',
-            '2026-01-01T00:00:00+00:00'
-        );
-        INSERT INTO audit_logs
-            (occurred_at, actor_type, actor_id, action, entity_type, entity_id, details_json)
-        VALUES ('2026-01-01T00:00:00+00:00', 'admin', '1', 'legacy.event', 'settings', '1', '{}');
-        """
-    )
-    connection.close()
-
-    initialize_database(app_config)
-    migrated = connect(database_path)
-    try:
-        activity = migrated.execute(
-            """
-            SELECT a.id, a.title, a.status, a.created_at, a.closed_at FROM activities a
-            JOIN settings s ON s.current_activity_id = a.id WHERE s.id = 1
-            """
-        ).fetchone()
-        assert dict(activity) == {
-            "id": 1,
-            "title": "旧版活动",
-            "status": "closed",
-            "created_at": "2026-01-01T00:00:00+00:00",
-            "closed_at": "2026-01-01T00:00:00+00:00",
-        }
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
-        assert migrated.execute(
-            "SELECT activity_id FROM audit_logs WHERE action = 'legacy.event'"
-        ).fetchone()[0] == 1
-        assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-    finally:
-        migrated.close()
-
-
-def test_complete_v0_database_migrates_without_changing_business_rows(app_config):
-    database_path = app_config.database_path
-    schema_path = Path(__file__).parent / "fixtures" / "schema_v0.sql"
-    connection = sqlite3.connect(database_path)
-    connection.executescript(schema_path.read_text(encoding="utf-8"))
-    connection.executescript(
-        """
-        INSERT INTO settings VALUES (
-            1, '完整旧库', '安徽建筑大学 · 建筑与空间规划学院', 'Mikutea',
-            'closed', 'https://choice.example.com', '2026-01-01T00:00:00+00:00',
-            '2026-01-01T00:00:00+00:00'
-        );
-        INSERT INTO majors VALUES (
-            1, 'major-1', '建筑学', 1, 10,
-            '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
-        );
-        INSERT INTO teaching_groups VALUES (
-            1, 'group-1', '第一教学组', 1, 1, 10,
-            '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
-        );
-        INSERT INTO quotas VALUES (1, 1, 1, '2026-01-01T00:00:00+00:00');
-        INSERT INTO students VALUES (
-            1, '20260001', '旧库学生', 1, 'activation-hash', 1,
-            '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
-        );
-        INSERT INTO selections VALUES (
-            1, 1, 1, '2026-01-01T00:00:00+00:00', 'student', '1', NULL, NULL
-        );
-        INSERT INTO admin_users VALUES (
-            1, 'admin', 'password-hash',
-            '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
-        );
-        INSERT INTO sessions VALUES (
-            'token-hash', 'student', 1, 'csrf',
-            '2026-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00'
-        );
-        INSERT INTO audit_logs
-            (occurred_at, actor_type, actor_id, action, entity_type, entity_id, details_json)
-        VALUES (
-            '2026-01-01T00:00:00+00:00', 'student', '1',
-            'selection.create', 'selection', '1', '{}'
-        );
-        """
-    )
-    connection.close()
-
-    before = migration_business_digest(database_path)
-    assert migrate_and_check(app_config) == "MIGRATION_CHECK_OK"
-    assert migration_business_digest(database_path) == before
-    migrated = connect(database_path)
-    try:
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
-        assert migrated.execute("SELECT COUNT(*) FROM activities").fetchone()[0] == 1
-        assert migrated.execute("SELECT COUNT(*) FROM selections").fetchone()[0] == 1
-        assert migrated.execute("SELECT activity_id FROM audit_logs").fetchone()[0] == 1
-    finally:
-        migrated.close()
-
-
-def test_legacy_v0_writes_stay_synchronized_after_migration(app_config):
-    initialize_database(app_config)
-    connection = connect(app_config.database_path)
-    try:
-        connection.execute(
-            """
-            UPDATE settings SET activity_title = '旧镜像改名', status = 'open',
-                updated_at = '2030-01-02T03:04:05+00:00' WHERE id = 1
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO audit_logs
-                (occurred_at, actor_type, actor_id, action, entity_type, entity_id, details_json)
-            VALUES (
-                '2026-08-13T00:00:00+00:00', 'admin', '1', 'legacy.write',
-                'settings', '1', '{}'
-            )
-            """
-        )
-        activity = connection.execute(
-            "SELECT id, title, status, opened_at FROM activities WHERE status <> 'archived'"
-        ).fetchone()
-        assert activity["title"] == "旧镜像改名"
-        assert activity["status"] == "open"
-        assert activity["opened_at"] == "2030-01-02T03:04:05+00:00"
-        assert connection.execute(
-            "SELECT activity_id FROM audit_logs WHERE action = 'legacy.write'"
-        ).fetchone()[0] == activity["id"]
-    finally:
-        connection.close()
+        check_database(empty, app_config.app_secret)
 
 
 def test_future_database_version_is_rejected_without_downgrade(app_config):
@@ -519,11 +366,35 @@ def test_future_database_version_is_rejected_without_downgrade(app_config):
         connection.close()
 
 
-def test_backup_rejects_missing_source_without_creating_files(tmp_path):
+def test_older_nonempty_database_is_rejected_without_migration(app_config):
+    connection = sqlite3.connect(app_config.database_path)
+    try:
+        connection.execute("CREATE TABLE old_schema_marker (id INTEGER PRIMARY KEY)")
+        connection.execute("INSERT INTO old_schema_marker (id) VALUES (1)")
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="不再支持旧数据库版本 2"):
+        initialize_database(app_config)
+
+    connection = sqlite3.connect(app_config.database_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("SELECT id FROM old_schema_marker").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_backup_rejects_missing_source_without_creating_files(tmp_path, app_config):
     source = tmp_path / "missing.db"
     backup_dir = tmp_path / "backups"
     with pytest.raises(RuntimeError, match="不存在或为空"):
-        create_backup(source, backup_dir)
+        create_backup(source, backup_dir, app_config.app_secret)
     assert not source.exists()
     assert not backup_dir.exists()
 
@@ -548,36 +419,34 @@ def test_two_students_competing_for_last_seat_yields_one_success(app):
 
         csv_text = (
             "学号,姓名,专业,证件号\n"
-            f"20260001,测试甲,{major['name']},{fictional_document_number('20260001')}\n"
-            f"20260002,测试乙,{major['name']},{fictional_document_number('20260002')}\n"
+            f"20260000001,测试甲,{major['name']},{fictional_document_number('20260000001')}\n"
+            f"20260000002,测试乙,{major['name']},{fictional_document_number('20260000002')}\n"
         )
         imported = admin_client.post(
             "/api/admin/students/import",
             headers=admin_headers,
-            files={"file": ("students.csv", csv_text.encode("utf-8"), "text/csv")},
+            files={"files": ("students.csv", csv_text.encode("utf-8"), "text/csv")},
         )
         assert imported.status_code == 200, imported.text
         assert imported.json()["created"] == 2
-        assert admin_client.post(
-            "/api/admin/status", headers=admin_headers, json={"status": "open"}
-        ).status_code == 200
+        open_selection_now(admin_client, admin_headers)
 
         first = TestClient(app)
         second = TestClient(app)
         first_login = first.post(
             "/api/student/login",
             json={
-                "student_no": "20260001",
+                "student_no": "20260000001",
                 "name": "测试甲",
-                "activation_code": fictional_activation_code("20260001"),
+                "activation_code": fictional_activation_code("20260000001"),
             },
         )
         second_login = second.post(
             "/api/student/login",
             json={
-                "student_no": "20260002",
+                "student_no": "20260000002",
                 "name": "测试乙",
-                "activation_code": fictional_activation_code("20260002"),
+                "activation_code": fictional_activation_code("20260000002"),
             },
         )
         assert first_login.status_code == second_login.status_code == 200
@@ -624,19 +493,19 @@ def test_database_trigger_blocks_direct_capacity_bypass(
     ).status_code == 200
     csv_text = (
         "学号,姓名,专业,证件号\n"
-        f"20269999,约束测试,{major['name']},{fictional_document_number('20269999')}\n"
+        f"20260009999,约束测试,{major['name']},{fictional_document_number('20260009999')}\n"
     )
     imported = client.post(
         "/api/admin/students/import",
         headers=admin_headers,
-        files={"file": ("students.csv", csv_text.encode("utf-8"), "text/csv")},
+        files={"files": ("students.csv", csv_text.encode("utf-8"), "text/csv")},
     )
     assert imported.status_code == 200, imported.text
 
     connection = connect(app_config.database_path)
     try:
         student_id = connection.execute(
-            "SELECT id FROM students WHERE student_no = '20269999'"
+            "SELECT id FROM students WHERE student_no = '20260009999'"
         ).fetchone()["id"]
         with pytest.raises(sqlite3.IntegrityError, match="major quota exceeded"):
             connection.execute(
@@ -698,20 +567,18 @@ def test_one_hundred_fifty_students_competing_for_thirty_seats_never_oversells(a
             ).status_code == 200
         rows = ["学号,姓名,专业,证件号"]
         for index in range(150):
-            student_no = f"2027{index:04d}"
+            student_no = f"2027000{index:04d}"
             rows.append(
-                f"{student_no},并发{index:03d},{major['name']},"
+                f"{student_no},并发学生,{major['name']},"
                 f"{fictional_document_number(student_no)}"
             )
         imported = admin_client.post(
             "/api/admin/students/import",
             headers=admin_headers,
-            files={"file": ("students.csv", ("\n".join(rows) + "\n").encode("utf-8"), "text/csv")},
+            files={"files": ("students.csv", ("\n".join(rows) + "\n").encode("utf-8"), "text/csv")},
         )
         assert imported.status_code == 200, imported.text
-        assert admin_client.post(
-            "/api/admin/status", headers=admin_headers, json={"status": "open"}
-        ).status_code == 200
+        open_selection_now(admin_client, admin_headers)
 
         clients: list[TestClient] = []
         csrf_tokens: list[str] = []
@@ -720,9 +587,9 @@ def test_one_hundred_fifty_students_competing_for_thirty_seats_never_oversells(a
             login = student_client.post(
                 "/api/student/login",
                 json={
-                    "student_no": f"2027{index:04d}",
-                    "name": f"并发{index:03d}",
-                    "activation_code": fictional_activation_code(f"2027{index:04d}"),
+                    "student_no": f"2027000{index:04d}",
+                    "name": "并发学生",
+                    "activation_code": fictional_activation_code(f"2027000{index:04d}"),
                 },
             )
             assert login.status_code == 200, login.text
