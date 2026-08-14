@@ -498,11 +498,27 @@ function mergeDashboardStatusSnapshot(snapshot) {
     && cachedActivityId !== snapshotActivityId
   ) {
     clearAllRevealedActivationCodes();
+    const presence = adminState.dashboard.presence;
+    adminState.dashboard = {
+      ...adminState.dashboard,
+      students: [],
+      unselected_students: [],
+      recent_selections: [],
+      absent_students: [],
+      presence: presence && typeof presence === "object"
+        ? { ...presence, absent_students: [] }
+        : presence,
+    };
+    adminEls.assignmentBody.replaceChildren();
+    adminEls.rosterBody.replaceChildren();
+    delete adminEls.assignmentBody.dataset.activityId;
+    delete adminEls.rosterBody.dataset.activityId;
+    adminEls.rosterCount.textContent = "活动已切换，正在同步新名单…";
     adminEls.statusBadge.className = "status-badge status-badge--closed";
     adminEls.statusBadge.textContent = "活动已切换";
-    adminEls.statusButton.textContent = "请返回大屏刷新";
+    adminEls.statusButton.textContent = "正在同步新活动";
     adminEls.statusButton.disabled = true;
-    adminEls.statusButton.title = "另一管理端已切换当前活动，请返回实时大屏完成同步";
+    adminEls.statusButton.title = "另一管理端已切换当前活动，正在同步新名单";
     return null;
   }
   const settings = {
@@ -534,7 +550,10 @@ async function loadDashboardStatusSnapshot({ quiet = false } = {}) {
     synchronizeServerClock(snapshot);
     if (!adminState.csrf || document.hidden || adminState.currentView !== "students" || !mobileAdminQuery.matches) return;
     const mergedDashboard = mergeDashboardStatusSnapshot(snapshot);
-    if (!mergedDashboard) return;
+    if (!mergedDashboard) {
+      await loadDashboard({ quiet: true });
+      return;
+    }
     adminState.dashboard = mergedDashboard;
     renderDashboardPhaseStatus(mergedDashboard);
     adminEls.lastRefresh.textContent = `状态同步于 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;

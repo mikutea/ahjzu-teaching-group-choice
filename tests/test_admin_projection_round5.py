@@ -208,6 +208,139 @@ def test_phone_activation_lookup_polls_only_public_phase_status() -> None:
     assert 'adminState.currentView === "overview"' in polling
 
 
+def test_mobile_activity_switch_scrubs_old_roster_and_reloads_dashboard_once() -> None:
+    _, javascript, _ = _sources()
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const statusFunctions = "function mergeDashboardStatusSnapshot" + source
+  .split("function mergeDashboardStatusSnapshot", 2)[1]
+  .split("function startAdminPolling", 1)[0];
+let publicLoads = 0;
+let dashboardLoads = 0;
+let clearCalls = 0;
+let phaseRenders = 0;
+let observedBeforeReload = null;
+const adminState = {
+  csrf: "qa",
+  currentView: "students",
+  dashboard: {
+    status: "waiting",
+    phase: "waiting",
+    settings: {activity_id: 41, status: "waiting", phase: "waiting"},
+    students: [{id: 11, name: "旧名单学生"}],
+    unselected_students: [{id: 11, name: "旧名单学生"}],
+    recent_selections: [{student_id: 11}],
+    absent_students: [{id: 11}],
+    presence: {absent_students: [{id: 11}]},
+  },
+  dashboardClockSample: null,
+  statusSyncLoading: false,
+  loading: false,
+  revealedActivationCodes: new Map([["41:11", "A1B2C3"]]),
+  activationHideTimers: new Map([["41:11", 1234]]),
+  connectionInterrupted: false,
+  lastBackgroundErrorAt: 0,
+};
+const adminEls = {
+  assignmentBody: {
+    dataset: {activityId: "41"},
+    replaceChildren() { this.cleared = true; },
+  },
+  rosterBody: {
+    dataset: {activityId: "41"},
+    replaceChildren() { this.cleared = true; },
+  },
+  rosterCount: {textContent: "1 人"},
+  statusBadge: {className: "", textContent: ""},
+  statusButton: {textContent: "", disabled: false, title: ""},
+  lastRefresh: {textContent: ""},
+};
+const mobileAdminQuery = {matches: true};
+const document = {hidden: false};
+const synchronizeServerClock = () => {};
+const renderDashboardPhaseStatus = () => { phaseRenders += 1; };
+const showAdminToast = () => {};
+const clearAllRevealedActivationCodes = () => {
+  clearCalls += 1;
+  adminState.revealedActivationCodes.clear();
+  adminState.activationHideTimers.clear();
+};
+async function adminApi(path) {
+  if (path !== "/api/public/status") throw new Error(`unexpected API ${path}`);
+  publicLoads += 1;
+  return {activity_id: 42, status: "waiting", phase: "waiting", server_now: "2026-08-14T12:00:00+08:00"};
+}
+async function loadDashboard() {
+  dashboardLoads += 1;
+  observedBeforeReload = {
+    students: adminState.dashboard.students.length,
+    unselected: adminState.dashboard.unselected_students.length,
+    recent: adminState.dashboard.recent_selections.length,
+    absent: adminState.dashboard.absent_students.length,
+    presenceAbsent: adminState.dashboard.presence.absent_students.length,
+    assignmentCleared: adminEls.assignmentBody.cleared === true,
+    rosterCleared: adminEls.rosterBody.cleared === true,
+    assignmentHasActivityId: Object.hasOwn(adminEls.assignmentBody.dataset, "activityId"),
+    rosterHasActivityId: Object.hasOwn(adminEls.rosterBody.dataset, "activityId"),
+    revealedCodes: adminState.revealedActivationCodes.size,
+  };
+  adminState.dashboard = {
+    status: "waiting",
+    phase: "waiting",
+    settings: {activity_id: 42, status: "waiting", phase: "waiting"},
+    students: [{id: 22, name: "新名单学生"}],
+    unselected_students: [{id: 22, name: "新名单学生"}],
+    recent_selections: [],
+    absent_students: [],
+    presence: {absent_students: []},
+  };
+}
+eval(`
+  (async () => {
+    ${statusFunctions}
+    await loadDashboardStatusSnapshot({quiet: true});
+    await loadDashboardStatusSnapshot({quiet: true});
+    process.stdout.write(JSON.stringify({
+      publicLoads,
+      dashboardLoads,
+      clearCalls,
+      phaseRenders,
+      observedBeforeReload,
+      currentActivityId: adminState.dashboard.settings.activity_id,
+    }));
+  })().catch((error) => { console.error(error); process.exitCode = 1; });
+`);
+"""
+    execution = subprocess.run(
+        ["node", "-e", script, str(ROOT / "web" / "admin.js")],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert execution.returncode == 0, execution.stderr
+    assert json.loads(execution.stdout) == {
+        "publicLoads": 2,
+        "dashboardLoads": 1,
+        "clearCalls": 1,
+        "phaseRenders": 1,
+        "observedBeforeReload": {
+            "students": 0,
+            "unselected": 0,
+            "recent": 0,
+            "absent": 0,
+            "presenceAbsent": 0,
+            "assignmentCleared": True,
+            "rosterCleared": True,
+            "assignmentHasActivityId": False,
+            "rosterHasActivityId": False,
+            "revealedCodes": 0,
+        },
+        "currentActivityId": 42,
+    }
+
+
 def test_backgrounding_admin_scrubs_activation_codes_immediately() -> None:
     _, javascript, _ = _sources()
     script = r"""
