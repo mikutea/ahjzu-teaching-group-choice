@@ -117,7 +117,14 @@
         <span>系统记录时间</span>
         <strong id="success-time"></strong>
       </div>
-      <p class="success-card__tip"><strong>请下载并妥善保存「抢选结果凭证」</strong>，便于后续核对。最终安排以学院正式发布结果为准。</p>
+      <figure class="result-card-preview" aria-labelledby="result-card-preview-caption">
+        <div class="result-card-preview__frame">
+          <img id="result-card-preview-image" alt="抢选结果凭证预览" width="1080" height="1920" hidden>
+          <p id="result-card-preview-status" class="result-card-preview__status" role="status">正在生成凭证预览…</p>
+        </div>
+        <figcaption id="result-card-preview-caption">9:16 手机竖版预览 · 下载文件为 1080 × 1920 PNG</figcaption>
+      </figure>
+      <p class="success-card__tip"><strong>请下载并妥善保存「抢选结果凭证」，以便后续核对。</strong><br><span>请注意：最终安排以学院正式发布结果为准。</span></p>
       <div class="success-card__actions">
         <button id="download-result-card" class="button button--primary button--wide" type="button">下载抢选结果凭证</button>
         <button id="success-logout" class="button button--secondary button--wide" type="button">安全退出</button>

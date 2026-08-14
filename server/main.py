@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import io
@@ -15,6 +16,7 @@ from http.cookies import CookieError, SimpleCookie
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import quote
 
 import qrcode
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
@@ -74,6 +76,10 @@ COUNTDOWN_SECONDS = 10
 PRESENCE_FRESH_SECONDS = 35
 HEARTBEAT_WRITE_INTERVAL_SECONDS = 15
 MAX_ADMIN_SESSIONS_PER_USER = 8
+RECEIPT_RATE_WINDOW_SECONDS = 300
+RECEIPT_TOKEN_VERIFY_LIMIT = 30
+RECEIPT_SHARED_IP_DISTINCT_LIMIT = 500
+RECEIPT_INVALID_IP_LIMIT = 5_000
 
 def session_utc_now() -> str:
     """Wall clock for credential expiry, intentionally separate from event test clocks."""
@@ -382,6 +388,10 @@ class StudentSelect(StrictModel):
     group_id: int = Field(gt=0)
 
 
+class ReceiptVerify(StrictModel):
+    token: str = Field(min_length=1, max_length=512)
+
+
 class AdminAssign(StrictModel):
     student_id: int = Field(gt=0)
     group_id: int = Field(gt=0)
@@ -496,6 +506,68 @@ class RateLimiter:
             self._events.pop(key, None)
 
 
+class DistinctRateLimiter:
+    """Bound one shared principal by distinct values without charging repeats."""
+
+    def __init__(self, *, max_keys: int = 4_096) -> None:
+        if max_keys < 1:
+            raise ValueError("max_keys must be positive")
+        self._events: dict[str, dict[str, float]] = {}
+        self._lock = threading.Lock()
+        self._max_keys = max_keys
+        self._last_cleanup = 0.0
+
+    def _cleanup(self, now: float, cutoff: float) -> None:
+        if now - self._last_cleanup < 60:
+            return
+        next_events: dict[str, dict[str, float]] = {}
+        for key, values in self._events.items():
+            current = {
+                value: recorded_at
+                for value, recorded_at in values.items()
+                if recorded_at >= cutoff
+            }
+            if current:
+                next_events[key] = current
+        self._events = next_events
+        self._last_cleanup = now
+
+    def record_distinct(
+        self,
+        key: str,
+        value: str,
+        *,
+        limit: int,
+        window_seconds: int,
+    ) -> bool:
+        """Record a new value and return whether the principal was already full."""
+
+        now = time.monotonic()
+        cutoff = now - window_seconds
+        with self._lock:
+            self._cleanup(now, cutoff)
+            values = {
+                existing_value: recorded_at
+                for existing_value, recorded_at in self._events.get(key, {}).items()
+                if recorded_at >= cutoff
+            }
+            if value in values:
+                self._events[key] = values
+                return False
+            if len(values) >= limit:
+                self._events[key] = values
+                return True
+            if key not in self._events and len(self._events) >= self._max_keys:
+                oldest_key = min(
+                    self._events,
+                    key=lambda existing_key: max(self._events[existing_key].values()),
+                )
+                self._events.pop(oldest_key, None)
+            values[value] = now
+            self._events[key] = values
+            return False
+
+
 def create_app(config: Config | None = None) -> FastAPI:
     config = config or Config.from_env()
     initialize_database(config)
@@ -505,6 +577,10 @@ def create_app(config: Config | None = None) -> FastAPI:
     admin_ip_limiter = RateLimiter()
     admin_account_limiter = RateLimiter()
     activation_reveal_limiter = RateLimiter()
+    receipt_verify_token_limiter = RateLimiter()
+    receipt_verify_ip_limiter = DistinctRateLimiter()
+    receipt_invalid_limiter = RateLimiter()
+    receipt_qr_limiter = RateLimiter()
     app = FastAPI(
         title="教学组抢选系统",
         docs_url=None if config.environment == "production" else "/api/docs",
@@ -520,9 +596,18 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
         response = await call_next(request)
+        receipt_resource = request.url.path in {
+            "/receipt",
+            "/api/public/receipts/verify",
+            "/api/student/receipt/qr.png",
+        }
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "same-origin"
+        response.headers["Referrer-Policy"] = (
+            "no-referrer" if receipt_resource else "same-origin"
+        )
+        if receipt_resource:
+            response.headers["Cache-Control"] = "no-store"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; img-src 'self' data:; style-src 'self'; "
@@ -577,6 +662,149 @@ def create_app(config: Config | None = None) -> FastAPI:
             hashlib.sha256,
         ).hexdigest()
         return f"{namespace}:{digest[:24]}"
+
+    def receipt_rate_key(token: str) -> str:
+        digest = hmac.new(
+            config.app_secret.encode("utf-8"),
+            b"receipt-verify-rate\0" + token.encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        return f"receipt-token:{digest}"
+
+    def enforce_receipt_rate_limit(
+        limiter: RateLimiter,
+        key: str,
+        *,
+        limit: int,
+        window_seconds: int = RECEIPT_RATE_WINDOW_SECONDS,
+    ) -> None:
+        if limiter.record_failure(
+            key,
+            limit=limit,
+            window_seconds=window_seconds,
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail="核验请求过于频繁，请稍后再试",
+                headers={"Retry-After": str(window_seconds)},
+            )
+
+    def enforce_receipt_distinct_limit(
+        key: str,
+        token_key: str,
+        *,
+        limit: int = RECEIPT_SHARED_IP_DISTINCT_LIMIT,
+        window_seconds: int = RECEIPT_RATE_WINDOW_SECONDS,
+    ) -> None:
+        if receipt_verify_ip_limiter.record_distinct(
+            key,
+            token_key,
+            limit=limit,
+            window_seconds=window_seconds,
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail="核验请求过于频繁，请稍后再试",
+                headers={"Retry-After": str(window_seconds)},
+            )
+
+    def receipt_signature(payload_segment: str) -> bytes:
+        return hmac.new(
+            config.app_secret.encode("utf-8"),
+            b"selection-receipt-v1\0" + payload_segment.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+
+    def encode_receipt_segment(value: bytes) -> str:
+        return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+    def decode_receipt_segment(value: str) -> bytes:
+        if not value or len(value) > 384:
+            raise ValueError("invalid receipt segment")
+        padding = "=" * (-len(value) % 4)
+        decoded = base64.b64decode(
+            value + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        if encode_receipt_segment(decoded) != value:
+            raise ValueError("non-canonical receipt segment")
+        return decoded
+
+    def receipt_verification_code(signature: bytes) -> str:
+        compact = base64.b32encode(signature).decode("ascii")[:12]
+        return "-".join(compact[index : index + 4] for index in range(0, 12, 4))
+
+    def build_selection_receipt(
+        *,
+        settings: dict[str, Any],
+        selection_id: int,
+        student_id: int,
+        group_id: int,
+        selected_at: str,
+    ) -> dict[str, str]:
+        claims = {
+            "activity_id": int(settings["activity_id"]),
+            "selection_id": int(selection_id),
+            "student_id": int(student_id),
+            "group_id": int(group_id),
+            "selected_at": str(selected_at),
+        }
+        encoded_claims = encode_receipt_segment(
+            json.dumps(
+                claims,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        signature = receipt_signature(encoded_claims)
+        token = f"v1.{encoded_claims}.{encode_receipt_segment(signature)}"
+        verify_path = "/receipt#token=" + quote(token, safe="")
+        qr_path = "/api/student/receipt/qr.png"
+        base_url = str(settings.get("public_base_url") or config.public_base_url).rstrip("/")
+        return {
+            "version": "v1",
+            "token": token,
+            "verification_code": receipt_verification_code(signature),
+            "verify_url": f"{base_url}{verify_path}" if base_url else verify_path,
+            "qr_image_url": f"{base_url}{qr_path}" if base_url else qr_path,
+        }
+
+    def parse_selection_receipt(token: str) -> tuple[dict[str, Any], str]:
+        if not isinstance(token, str) or len(token) < 40 or len(token) > 512:
+            raise HTTPException(status_code=400, detail="凭证无效或已损坏")
+        try:
+            version, encoded_claims, encoded_signature = token.split(".")
+            if version != "v1":
+                raise ValueError("unsupported receipt version")
+            supplied_signature = decode_receipt_segment(encoded_signature)
+            expected_signature = receipt_signature(encoded_claims)
+            if len(supplied_signature) != len(expected_signature) or not hmac.compare_digest(
+                supplied_signature, expected_signature
+            ):
+                raise ValueError("invalid receipt signature")
+            claims = json.loads(decode_receipt_segment(encoded_claims).decode("utf-8"))
+            if not isinstance(claims, dict) or set(claims) != {
+                "activity_id",
+                "selection_id",
+                "student_id",
+                "group_id",
+                "selected_at",
+            }:
+                raise ValueError("invalid receipt claims")
+            for key in ("activity_id", "selection_id", "student_id", "group_id"):
+                if isinstance(claims[key], bool) or not isinstance(claims[key], int) or claims[key] <= 0:
+                    raise ValueError("invalid receipt identifier")
+            selected_at = claims["selected_at"]
+            if not isinstance(selected_at, str) or len(selected_at) > 64:
+                raise ValueError("invalid receipt timestamp")
+            selected_dt = datetime.fromisoformat(selected_at)
+            if selected_dt.utcoffset() is None:
+                raise ValueError("invalid receipt timestamp")
+        except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="凭证无效或已损坏") from exc
+        return claims, receipt_verification_code(expected_signature)
 
     def require_session_from_connection(
         request: Request,
@@ -1078,7 +1306,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             )
         selection = connection.execute(
             """
-            SELECT se.group_id, se.selected_at, g.name AS group_name
+            SELECT se.id, se.group_id, se.selected_at, g.name AS group_name
             FROM selections se
             JOIN teaching_groups g ON g.id = se.group_id
             WHERE se.student_id = ? AND se.revoked_at IS NULL
@@ -1103,6 +1331,26 @@ def create_app(config: Config | None = None) -> FastAPI:
             (student["major_id"], student["major_id"]),
         ).fetchall()
         settings = setting_dict(connection)
+        selection_payload = (
+            {
+                "group_id": selection["group_id"],
+                "selected_at": selection["selected_at"],
+                "group_name": selection["group_name"],
+            }
+            if selection
+            else None
+        )
+        receipt = (
+            build_selection_receipt(
+                settings=settings,
+                selection_id=int(selection["id"]),
+                student_id=int(student["id"]),
+                group_id=int(selection["group_id"]),
+                selected_at=str(selection["selected_at"]),
+            )
+            if selection
+            else None
+        )
         return {
             "server_now": settings["server_now"],
             "selection_opens_at": settings["selection_opens_at"],
@@ -1116,7 +1364,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "major_id": student["major_id"],
                 "major_name": student["major_name"],
             },
-            "selection": dict(selection) if selection else None,
+            "selection": selection_payload,
+            "receipt": receipt,
             "groups": [
                 {
                     "id": row["id"],
@@ -1291,6 +1540,188 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "selection_opens_at": settings["selection_opens_at"],
                 "student_login_allowed": settings["student_login_allowed"],
                 "status_message": settings["status_message"],
+            }
+        finally:
+            connection.close()
+
+    @app.get("/api/student/receipt/qr.png")
+    def selection_receipt_qr(request: Request):
+        connection = connect(config.database_path)
+        try:
+            connection.execute("BEGIN")
+            identity = require_session_from_connection(request, "student", connection)
+            payload = student_payload_from_connection(connection, identity.subject_id)
+            receipt = payload.get("receipt")
+            if not receipt:
+                raise HTTPException(status_code=404, detail="当前没有可生成凭证的抢选记录")
+        finally:
+            connection.close()
+        enforce_receipt_rate_limit(
+            receipt_qr_limiter,
+            f"receipt-qr-student:{identity.subject_id}",
+            limit=120,
+        )
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_Q,
+            box_size=8,
+            border=4,
+        )
+        qr.add_data(receipt["verify_url"])
+        qr.make(fit=True)
+        image = qr.make_image(fill_color="#241a1c", back_color="#ffffff")
+        output = io.BytesIO()
+        image.save(output, format="PNG")
+        output.seek(0)
+        return StreamingResponse(
+            output,
+            media_type="image/png",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/public/receipts/verify")
+    def verify_selection_receipt(
+        payload: ReceiptVerify,
+        request: Request,
+        response: Response,
+    ):
+        try:
+            claims, verification_code = parse_selection_receipt(payload.token)
+        except HTTPException:
+            enforce_receipt_rate_limit(
+                receipt_invalid_limiter,
+                client_key(request, "receipt-verify-invalid"),
+                limit=RECEIPT_INVALID_IP_LIMIT,
+            )
+            raise
+        token_key = receipt_rate_key(payload.token)
+        enforce_receipt_rate_limit(
+            receipt_verify_token_limiter,
+            token_key,
+            limit=RECEIPT_TOKEN_VERIFY_LIMIT,
+        )
+        enforce_receipt_distinct_limit(
+            client_key(request, "receipt-verify"),
+            token_key,
+        )
+        connection = connect(config.database_path)
+        try:
+            connection.execute("BEGIN")
+            activity = connection.execute(
+                """
+                SELECT id, code, title, status, snapshot_json, snapshot_sha256
+                FROM activities WHERE id = ?
+                """,
+                (claims["activity_id"],),
+            ).fetchone()
+            response.headers["Cache-Control"] = "no-store"
+            if not activity:
+                return {
+                    "valid": False,
+                    "revoked": False,
+                    "verification_code": verification_code,
+                }
+
+            current_id = int(
+                connection.execute(
+                    "SELECT current_activity_id FROM settings WHERE id = 1"
+                ).fetchone()[0]
+            )
+            record: dict[str, Any] | None = None
+            if int(activity["id"]) == current_id:
+                row = connection.execute(
+                    """
+                    SELECT se.id AS selection_id, se.student_id, se.group_id,
+                           se.selected_at, se.revoked_at,
+                           s.student_no, s.name AS student_name,
+                           m.name AS major_name, g.name AS group_name
+                    FROM selections se
+                    JOIN students s ON s.id = se.student_id
+                    JOIN majors m ON m.id = s.major_id
+                    JOIN teaching_groups g ON g.id = se.group_id
+                    WHERE se.id = ?
+                    """,
+                    (claims["selection_id"],),
+                ).fetchone()
+                if row:
+                    record = dict(row)
+            elif activity["status"] == "archived":
+                snapshot_json = activity["snapshot_json"]
+                snapshot_sha256 = activity["snapshot_sha256"]
+                if not snapshot_json or not snapshot_sha256:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="凭证核验数据暂不可用，请联系管理员",
+                    )
+                actual_digest = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+                if not hmac.compare_digest(actual_digest, str(snapshot_sha256)):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="凭证核验数据暂不可用，请联系管理员",
+                    )
+                try:
+                    snapshot = json.loads(snapshot_json)
+                    snapshot_activity = snapshot["activity"]
+                    if int(snapshot_activity["id"]) != int(activity["id"]):
+                        raise ValueError("archive activity mismatch")
+                    archived_selection = next(
+                        (
+                            candidate
+                            for candidate in snapshot["selections"]
+                            if int(candidate["id"]) == claims["selection_id"]
+                        ),
+                        None,
+                    )
+                    if archived_selection:
+                        record = {
+                            "selection_id": archived_selection["id"],
+                            "student_id": archived_selection["student_id"],
+                            "group_id": archived_selection["group_id"],
+                            "selected_at": archived_selection["selected_at"],
+                            "revoked_at": archived_selection["revoked_at"],
+                            "student_no": archived_selection["student_no"],
+                            "student_name": archived_selection["student_name"],
+                            "major_name": archived_selection["major_name"],
+                            "group_name": archived_selection["group_name"],
+                        }
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="凭证核验数据暂不可用，请联系管理员",
+                    ) from exc
+
+            matches = bool(
+                record
+                and int(record["selection_id"]) == claims["selection_id"]
+                and int(record["student_id"]) == claims["student_id"]
+                and int(record["group_id"]) == claims["group_id"]
+                and str(record["selected_at"]) == claims["selected_at"]
+            )
+            if not matches:
+                return {
+                    "valid": False,
+                    "revoked": False,
+                    "verification_code": verification_code,
+                }
+
+            student_no = str(record["student_no"])
+            revoked = record["revoked_at"] is not None
+            return {
+                "valid": not revoked,
+                "revoked": revoked,
+                "verification_code": verification_code,
+                "activity": {
+                    "code": activity["code"],
+                    "title": activity["title"],
+                },
+                "student": {
+                    "student_no_masked": "*" * max(0, len(student_no) - 4)
+                    + student_no[-4:],
+                    "name": record["student_name"],
+                    "major_name": record["major_name"],
+                },
+                "group": {"name": record["group_name"]},
+                "selected_at": record["selected_at"],
             }
         finally:
             connection.close()
@@ -2719,17 +3150,83 @@ def create_app(config: Config | None = None) -> FastAPI:
         updated = 0
         deactivated = 0
         rotated = 0
+        created_major_names: list[str] = []
+        reactivated_major_names: list[str] = []
         seen_student_ids: set[int] = set()
         try:
             connection.execute("BEGIN IMMEDIATE")
             require_expected_activity(request, connection, identity=identity)
             ensure_closed(connection)
-            major_map = {
-                row["name"]: int(row["id"])
+            stored_majors = {
+                row["name"]: row
                 for row in connection.execute(
-                    "SELECT id, name FROM majors WHERE active = 1"
+                    "SELECT id, name, active FROM majors"
                 ).fetchall()
             }
+            major_map: dict[str, int] = {}
+            max_major_sort = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sort_order), 0) FROM majors"
+                ).fetchone()[0]
+            )
+            now = utc_now()
+            for roster_row in rows:
+                major_name = roster_row.major_name
+                if major_name in major_map:
+                    continue
+                stored_major = stored_majors.get(major_name)
+                if stored_major is None:
+                    max_major_sort += 10
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO majors
+                            (code, name, active, sort_order, created_at, updated_at)
+                        VALUES (?, ?, 1, ?, ?, ?)
+                        """,
+                        (
+                            f"major-{secrets.token_hex(4)}",
+                            major_name,
+                            max_major_sort,
+                            now,
+                            now,
+                        ),
+                    )
+                    major_id = int(cursor.lastrowid)
+                    connection.execute(
+                        """
+                        INSERT INTO quotas (major_id, group_id, capacity, updated_at)
+                        SELECT ?, id, 0, ? FROM teaching_groups
+                        """,
+                        (major_id, now),
+                    )
+                    audit(
+                        connection,
+                        actor_type="admin",
+                        actor_id=identity.subject_id,
+                        action="major.create.import",
+                        entity_type="major",
+                        entity_id=major_id,
+                        details={"name": major_name, "source": "student_roster"},
+                    )
+                    created_major_names.append(major_name)
+                else:
+                    major_id = int(stored_major["id"])
+                    if not bool(stored_major["active"]):
+                        connection.execute(
+                            "UPDATE majors SET active = 1, updated_at = ? WHERE id = ?",
+                            (now, major_id),
+                        )
+                        audit(
+                            connection,
+                            actor_type="admin",
+                            actor_id=identity.subject_id,
+                            action="major.reactivate.import",
+                            entity_type="major",
+                            entity_id=major_id,
+                            details={"name": major_name, "source": "student_roster"},
+                        )
+                        reactivated_major_names.append(major_name)
+                major_map[major_name] = major_id
             stored_students = connection.execute(
                 """
                 SELECT id, student_no, name, major_id, activation_hash,
@@ -2745,14 +3242,6 @@ def create_app(config: Config | None = None) -> FastAPI:
                 name = row.name
                 major_name = row.major_name
                 code = row.activation_code
-                if major_name not in major_map:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"第 {row.file_index} 个文件第 {row.line_number} 行的专业"
-                            f"“{major_name}”不存在或已停用"
-                        ),
-                    )
                 existing = students_by_number.get(student_no)
                 if existing:
                     stored_student_no = existing["student_no"]
@@ -2875,6 +3364,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                     "file_count": len(uploads),
                     "row_count": len(rows),
                     "credential_source": "document_number_suffix",
+                    "majors_created": created_major_names,
+                    "majors_reactivated": reactivated_major_names,
                 },
             )
             connection.commit()
@@ -2890,6 +3381,8 @@ def create_app(config: Config | None = None) -> FastAPI:
             "rotated": rotated,
             "file_count": len(uploads),
             "row_count": len(rows),
+            "majors_created": created_major_names,
+            "majors_reactivated": reactivated_major_names,
             "activation_code_policy": "normalized_document_number_last_6",
         }
 
@@ -3252,6 +3745,34 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.get("/assets/admin.js", include_in_schema=False)
     def admin_script():
         return FileResponse(WEB_ROOT / "admin.js", media_type="text/javascript")
+
+    @app.get("/assets/receipt.js", include_in_schema=False)
+    def receipt_script():
+        return FileResponse(
+            WEB_ROOT / "receipt.js",
+            media_type="text/javascript",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/assets/receipt.css", include_in_schema=False)
+    def receipt_styles():
+        return FileResponse(
+            WEB_ROOT / "receipt.css",
+            media_type="text/css",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/receipt", include_in_schema=False)
+    def receipt_page():
+        return FileResponse(
+            WEB_ROOT / "receipt.html",
+            media_type="text/html",
+            headers={
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+                "X-Frame-Options": "DENY",
+            },
+        )
 
     @app.get("/admin", include_in_schema=False)
     def admin_page():
