@@ -80,6 +80,9 @@ RECEIPT_RATE_WINDOW_SECONDS = 300
 RECEIPT_TOKEN_VERIFY_LIMIT = 30
 RECEIPT_SHARED_IP_DISTINCT_LIMIT = 500
 RECEIPT_INVALID_IP_LIMIT = 5_000
+RECEIPT_TOKEN_VERSION = "v2"
+RECEIPT_SNAPSHOT_VERSION = 1
+
 
 def session_utc_now() -> str:
     """Wall clock for credential expiry, intentionally separate from event test clocks."""
@@ -711,7 +714,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     def receipt_signature(payload_segment: str) -> bytes:
         return hmac.new(
             config.app_secret.encode("utf-8"),
-            b"selection-receipt-v1\0" + payload_segment.encode("ascii"),
+            b"selection-receipt-v2\0" + payload_segment.encode("ascii"),
             hashlib.sha256,
         ).digest()
 
@@ -734,6 +737,38 @@ def create_app(config: Config | None = None) -> FastAPI:
     def receipt_verification_code(signature: bytes) -> str:
         compact = base64.b32encode(signature).decode("ascii")[:12]
         return "-".join(compact[index : index + 4] for index in range(0, 12, 4))
+
+    def selection_receipt_snapshot_hmac_sha256(
+        *,
+        activity_code: str,
+        activity_title: str,
+        student_no: str,
+        student_name: str,
+        major_name: str,
+        group_name: str,
+        selected_at: str,
+    ) -> str:
+        snapshot = {
+            "version": RECEIPT_SNAPSHOT_VERSION,
+            "activity_code": str(activity_code),
+            "activity_title": str(activity_title),
+            "student_no": str(student_no),
+            "student_name": str(student_name),
+            "major_name": str(major_name),
+            "group_name": str(group_name),
+            "selected_at": str(selected_at),
+        }
+        encoded = json.dumps(
+            snapshot,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hmac.new(
+            config.app_secret.encode("utf-8"),
+            b"selection-receipt-snapshot-v1\0" + encoded,
+            hashlib.sha256,
+        ).hexdigest()
 
     def selection_receipt_public_origin(settings: dict[str, Any]) -> str:
         configured_origin = settings.get("public_base_url") or config.public_base_url
@@ -761,6 +796,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         student_id: int,
         group_id: int,
         selected_at: str,
+        student_no: str,
+        student_name: str,
+        major_name: str,
+        group_name: str,
     ) -> dict[str, str]:
         claims = {
             "activity_id": int(settings["activity_id"]),
@@ -768,6 +807,16 @@ def create_app(config: Config | None = None) -> FastAPI:
             "student_id": int(student_id),
             "group_id": int(group_id),
             "selected_at": str(selected_at),
+            "snapshot_version": RECEIPT_SNAPSHOT_VERSION,
+            "snapshot_hmac_sha256": selection_receipt_snapshot_hmac_sha256(
+                activity_code=str(settings["activity_code"]),
+                activity_title=str(settings["activity_title"]),
+                student_no=student_no,
+                student_name=student_name,
+                major_name=major_name,
+                group_name=group_name,
+                selected_at=selected_at,
+            ),
         }
         encoded_claims = encode_receipt_segment(
             json.dumps(
@@ -778,11 +827,14 @@ def create_app(config: Config | None = None) -> FastAPI:
             ).encode("utf-8")
         )
         signature = receipt_signature(encoded_claims)
-        token = f"v1.{encoded_claims}.{encode_receipt_segment(signature)}"
+        token = (
+            f"{RECEIPT_TOKEN_VERSION}.{encoded_claims}."
+            f"{encode_receipt_segment(signature)}"
+        )
         qr_path = "/api/student/receipt/qr.png"
         base_url = selection_receipt_public_origin(settings)
         return {
-            "version": "v1",
+            "version": RECEIPT_TOKEN_VERSION,
             "token": token,
             "verification_code": receipt_verification_code(signature),
             "verify_url": selection_receipt_verify_url(token, settings),
@@ -794,7 +846,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="凭证无效或已损坏")
         try:
             version, encoded_claims, encoded_signature = token.split(".")
-            if version != "v1":
+            if version != RECEIPT_TOKEN_VERSION:
                 raise ValueError("unsupported receipt version")
             supplied_signature = decode_receipt_segment(encoded_signature)
             expected_signature = receipt_signature(encoded_claims)
@@ -809,6 +861,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "student_id",
                 "group_id",
                 "selected_at",
+                "snapshot_version",
+                "snapshot_hmac_sha256",
             }:
                 raise ValueError("invalid receipt claims")
             for key in ("activity_id", "selection_id", "student_id", "group_id"):
@@ -820,6 +874,22 @@ def create_app(config: Config | None = None) -> FastAPI:
             selected_dt = datetime.fromisoformat(selected_at)
             if selected_dt.utcoffset() is None:
                 raise ValueError("invalid receipt timestamp")
+            if (
+                not isinstance(claims["snapshot_version"], int)
+                or isinstance(claims["snapshot_version"], bool)
+                or claims["snapshot_version"] != RECEIPT_SNAPSHOT_VERSION
+            ):
+                raise ValueError("invalid receipt snapshot version")
+            snapshot_hmac_sha256 = claims["snapshot_hmac_sha256"]
+            if (
+                not isinstance(snapshot_hmac_sha256, str)
+                or len(snapshot_hmac_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in snapshot_hmac_sha256
+                )
+            ):
+                raise ValueError("invalid receipt snapshot commitment")
         except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail="凭证无效或已损坏") from exc
         return claims, receipt_verification_code(expected_signature)
@@ -1481,6 +1551,10 @@ def create_app(config: Config | None = None) -> FastAPI:
                 student_id=int(student["id"]),
                 group_id=int(selection["group_id"]),
                 selected_at=str(selection["selected_at"]),
+                student_no=str(student["student_no"]),
+                student_name=str(student["name"]),
+                major_name=str(student["major_name"]),
+                group_name=str(selection["group_name"]),
             )
             if selection
             else None
@@ -1822,6 +1896,18 @@ def create_app(config: Config | None = None) -> FastAPI:
                 and int(record["student_id"]) == claims["student_id"]
                 and int(record["group_id"]) == claims["group_id"]
                 and str(record["selected_at"]) == claims["selected_at"]
+                and hmac.compare_digest(
+                    selection_receipt_snapshot_hmac_sha256(
+                        activity_code=str(activity["code"]),
+                        activity_title=str(activity["title"]),
+                        student_no=str(record["student_no"]),
+                        student_name=str(record["student_name"]),
+                        major_name=str(record["major_name"]),
+                        group_name=str(record["group_name"]),
+                        selected_at=str(record["selected_at"]),
+                    ),
+                    claims["snapshot_hmac_sha256"],
+                )
             )
             if not matches:
                 return {

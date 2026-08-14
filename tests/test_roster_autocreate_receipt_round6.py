@@ -22,6 +22,31 @@ from .conftest import (
 
 
 def signed_receipt_token(secret: str, claims: dict[str, object]) -> str:
+    complete_claims = {
+        "snapshot_version": 1,
+        "snapshot_hmac_sha256": "0" * 64,
+        **claims,
+    }
+    encoded_claims = base64.urlsafe_b64encode(
+        json.dumps(
+            complete_claims,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        b"selection-receipt-v2\0" + encoded_claims.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    encoded_signature = (
+        base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+    )
+    return f"v2.{encoded_claims}.{encoded_signature}"
+
+
+def legacy_signed_receipt_token(secret: str, claims: dict[str, object]) -> str:
     encoded_claims = base64.urlsafe_b64encode(
         json.dumps(
             claims,
@@ -35,7 +60,9 @@ def signed_receipt_token(secret: str, claims: dict[str, object]) -> str:
         b"selection-receipt-v1\0" + encoded_claims.encode("ascii"),
         hashlib.sha256,
     ).digest()
-    encoded_signature = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+    encoded_signature = (
+        base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+    )
     return f"v1.{encoded_claims}.{encoded_signature}"
 
 
@@ -437,7 +464,7 @@ def test_signed_receipt_verifies_and_tampering_or_revocation_invalidates_it(
         student_name="凭证核验学生",
     )
     receipt = selected["receipt"]
-    assert receipt["version"] == "v1"
+    assert receipt["version"] == "v2"
     assert receipt["verify_url"].startswith(
         "http://127.0.0.1:8765/receipt#token="
     )
@@ -483,6 +510,90 @@ def test_signed_receipt_verifies_and_tampering_or_revocation_invalidates_it(
     claims = json.loads(
         base64.urlsafe_b64decode(encoded_claims + "=" * (-len(encoded_claims) % 4))
     )
+    assert set(claims) == {
+        "activity_id",
+        "selection_id",
+        "student_id",
+        "group_id",
+        "selected_at",
+        "snapshot_version",
+        "snapshot_hmac_sha256",
+    }
+    assert claims["snapshot_version"] == 1
+    assert len(claims["snapshot_hmac_sha256"]) == 64
+    assert "student_name" not in claims
+    assert "student_no" not in claims
+    assert len(encoded_claims) <= 384
+    assert len(receipt["token"]) <= 512
+
+    def encoded_snapshot(candidate_student_no: str) -> bytes:
+        return json.dumps(
+            {
+                "version": 1,
+                "activity_code": selected["settings"]["activity_code"],
+                "activity_title": selected["settings"]["activity_title"],
+                "student_no": candidate_student_no,
+                "student_name": "凭证核验学生",
+                "major_name": selected["student"]["major_name"],
+                "group_name": group["name"],
+                "selected_at": selected["selection"]["selected_at"],
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    raw_sha256_dictionary = {
+        hashlib.sha256(
+            b"selection-receipt-snapshot-v1\0"
+            + encoded_snapshot(f"202{candidate:04d}0008")
+        ).hexdigest()
+        for candidate in range(6500, 7500)
+    }
+    assert claims["snapshot_hmac_sha256"] not in raw_sha256_dictionary
+    expected_snapshot_hmac = hmac.new(
+        client.app.state.config.app_secret.encode("utf-8"),
+        b"selection-receipt-snapshot-v1\0" + encoded_snapshot("20268000008"),
+        hashlib.sha256,
+    ).hexdigest()
+    assert hmac.compare_digest(
+        claims["snapshot_hmac_sha256"], expected_snapshot_hmac
+    )
+    assert "20268000008" not in receipt["token"]
+    assert "凭证核验学生" not in receipt["token"]
+
+    legacy_receipt = legacy_signed_receipt_token(
+        client.app.state.config.app_secret,
+        {
+            key: claims[key]
+            for key in (
+                "activity_id",
+                "selection_id",
+                "student_id",
+                "group_id",
+                "selected_at",
+            )
+        },
+    )
+    legacy_rejected = client.post(
+        "/api/public/receipts/verify", json={"token": legacy_receipt}
+    )
+    assert legacy_rejected.status_code == 400
+    assert legacy_rejected.json()["detail"] == "凭证无效或已损坏"
+
+    mismatched_snapshot_claims = dict(claims)
+    mismatched_snapshot_claims["snapshot_hmac_sha256"] = "0" * 64
+    mismatched_snapshot_receipt = signed_receipt_token(
+        client.app.state.config.app_secret,
+        mismatched_snapshot_claims,
+    )
+    mismatched_snapshot = client.post(
+        "/api/public/receipts/verify",
+        json={"token": mismatched_snapshot_receipt},
+    )
+    assert mismatched_snapshot.status_code == 200, mismatched_snapshot.text
+    assert mismatched_snapshot.json()["valid"] is False
+
     claims["student_id"] += 1
     other_student_receipt = signed_receipt_token(
         client.app.state.config.app_secret, claims
@@ -552,6 +663,95 @@ def test_signed_receipt_verifies_and_tampering_or_revocation_invalidates_it(
     assert after_revoke.status_code == 200, after_revoke.text
     assert after_revoke.json()["valid"] is False
     assert after_revoke.json()["revoked"] is True
+
+
+def test_current_receipt_signature_binds_every_rendered_mutable_field(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    app_config,
+):
+    selected, group = select_one_student(
+        client,
+        admin_headers,
+        student_no="20268000031",
+        student_name="字段绑定学生",
+    )
+    receipt = selected["receipt"]
+    closed = client.post(
+        "/api/admin/status",
+        headers=admin_headers,
+        json={"status": "closed"},
+    )
+    assert closed.status_code == 200, closed.text
+
+    baseline = client.post(
+        "/api/public/receipts/verify", json={"token": receipt["token"]}
+    )
+    assert baseline.status_code == 200, baseline.text
+    assert baseline.json()["valid"] is True
+
+    activity_id = int(admin_headers["X-Activity-ID"])
+    student_id = int(selected["student"]["id"])
+    major_id = int(selected["student"]["major_id"])
+    group_id = int(group["id"])
+    mutations = [
+        ("activities", "title", activity_id, "已修改活动标题"),
+        ("activities", "code", activity_id, "receipt-mutated-code"),
+        ("students", "name", student_id, "已修改学生姓名"),
+        ("students", "student_no", student_id, "20268000032"),
+        ("majors", "name", major_id, "已修改专业名称"),
+        ("teaching_groups", "name", group_id, "已修改教学组名称"),
+    ]
+    for table, column, record_id, replacement in mutations:
+        connection = connect(app_config.database_path)
+        try:
+            original = connection.execute(
+                f"SELECT {column} FROM {table} WHERE id = ?", (record_id,)
+            ).fetchone()[0]
+            connection.execute(
+                f"UPDATE {table} SET {column} = ? WHERE id = ?",
+                (replacement, record_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        changed = client.post(
+            "/api/public/receipts/verify", json={"token": receipt["token"]}
+        )
+        assert changed.status_code == 200, (table, column, changed.text)
+        assert changed.json()["valid"] is False, (table, column, changed.json())
+
+        refreshed = client.get("/api/student/me")
+        assert refreshed.status_code == 200, (table, column, refreshed.text)
+        refreshed_receipt = refreshed.json()["receipt"]
+        assert refreshed_receipt["token"] != receipt["token"]
+        refreshed_verified = client.post(
+            "/api/public/receipts/verify",
+            json={"token": refreshed_receipt["token"]},
+        )
+        assert refreshed_verified.status_code == 200, (
+            table,
+            column,
+            refreshed_verified.text,
+        )
+        assert refreshed_verified.json()["valid"] is True
+
+        connection = connect(app_config.database_path)
+        try:
+            connection.execute(
+                f"UPDATE {table} SET {column} = ? WHERE id = ?",
+                (original, record_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        restored = client.post(
+            "/api/public/receipts/verify", json={"token": receipt["token"]}
+        )
+        assert restored.status_code == 200, (table, column, restored.text)
+        assert restored.json()["valid"] is True, (table, column, restored.json())
 
 
 def test_receipt_generation_and_qr_require_a_trusted_absolute_public_origin(
@@ -730,8 +930,9 @@ def test_receipt_qr_is_bound_to_rendered_token_during_revoke_reselect_race(
 def test_signed_receipt_remains_verifiable_from_integrity_checked_archive(
     client: TestClient,
     admin_headers: dict[str, str],
+    app_config,
 ):
-    selected, _ = select_one_student(
+    selected, group = select_one_student(
         client,
         admin_headers,
         student_no="20268000009",
@@ -764,6 +965,31 @@ def test_signed_receipt_remains_verifiable_from_integrity_checked_archive(
     assert verified.json()["valid"] is True
     assert verified.json()["revoked"] is False
     assert verified.json()["student"]["student_no_masked"] == "*******0009"
+
+    archived_payload = verified.json()
+    connection = connect(app_config.database_path)
+    try:
+        connection.execute(
+            "UPDATE students SET name = ? WHERE id = ?",
+            ("新活动学生姓名", selected["student"]["id"]),
+        )
+        connection.execute(
+            "UPDATE majors SET name = ? WHERE id = ?",
+            ("新活动专业名称", selected["student"]["major_id"]),
+        )
+        connection.execute(
+            "UPDATE teaching_groups SET name = ? WHERE id = ?",
+            ("新活动教学组名称", group["id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    after_live_structure_changes = client.post(
+        "/api/public/receipts/verify", json={"token": receipt["token"]}
+    )
+    assert after_live_structure_changes.status_code == 200
+    assert after_live_structure_changes.json() == archived_payload
 
 
 def test_archived_receipt_verification_rejects_every_outer_archive_mismatch(
@@ -895,7 +1121,7 @@ def test_receipt_verification_rate_limits_exact_tokens_without_exhausting_classr
     for index in range(500):
         rejected = client.post(
             "/api/public/receipts/verify",
-            json={"token": f"v1.invalid-{index}.invalid-signature"},
+            json={"token": f"v2.invalid-{index}.invalid-signature"},
         )
         assert rejected.status_code == 400
 
@@ -927,7 +1153,7 @@ def test_receipt_verification_rate_limits_exact_tokens_without_exhausting_classr
 def test_receipt_verification_rejects_non_ascii_claim_segment_as_invalid(
     client: TestClient,
 ):
-    malformed = "v1.\N{LATIN SMALL LETTER E WITH ACUTE}." + ("A" * 43)
+    malformed = "v2.\N{LATIN SMALL LETTER E WITH ACUTE}." + ("A" * 43)
     with TestClient(client.app, raise_server_exceptions=False) as isolated_client:
         response = isolated_client.post(
             "/api/public/receipts/verify",

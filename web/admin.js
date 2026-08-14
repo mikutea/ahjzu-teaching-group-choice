@@ -1129,7 +1129,10 @@ function setupWaitingFeedLoop(previousOffset) {
 
 function renderWaitingStudentFeed(rows, { force = false } = {}) {
   const students = Array.isArray(rows) ? rows : [];
-  const fingerprint = JSON.stringify(students.map((student) => [student.id, student.name, student.major_name]));
+  const fingerprint = JSON.stringify([
+    boardDisplayMode(),
+    ...students.map((student) => [student.id, student.name, student.major_name]),
+  ]);
   if (!force && fingerprint === adminState.waitingFeedFingerprint) return;
   const previousOffset = captureWaitingFeedScrollOffset();
   adminState.waitingFeedFingerprint = fingerprint;
@@ -2045,12 +2048,21 @@ async function persistEntityRow(row, { refreshAfter = false, includeCapacity = f
   }
 
   const id = Number(row.dataset.id);
-  const activityId = Number(
-    (row.dataset.entityKind === "major" ? adminEls.majorEditor : adminEls.groupEditor).dataset.activityId,
-  );
+  const editor = row.dataset.entityKind === "major" ? adminEls.majorEditor : adminEls.groupEditor;
+  const activityId = Number(editor.dataset.activityId);
+  const uiHasMovedFromRequestActivity = () => {
+    const dashboardActivityId = Number(adminState.dashboard?.settings?.activity_id);
+    const editorActivityId = Number(editor.dataset.activityId);
+    return Number.isInteger(dashboardActivityId)
+      && Number.isInteger(editorActivityId)
+      && dashboardActivityId !== activityId
+      && editorActivityId !== activityId;
+  };
   const payload = {};
   if (nameChanged) payload.name = submittedName;
   if (capacityChanged) payload.total_capacity = submittedCapacity;
+  let activityCasConflict = false;
+  let activityCasRequiresRefresh = false;
   row.dataset.saving = "true";
   row.setAttribute("aria-busy", "true");
   setEntitySaveState(row, "saving", "保存中…");
@@ -2068,17 +2080,36 @@ async function persistEntityRow(row, { refreshAfter = false, includeCapacity = f
     }
     await loadDashboard({ quiet: true, afterMutation: true });
   } catch (error) {
-    if (nameChanged && row._nameInput.value.trim() === submittedName) row._nameInput.value = row.dataset.originalName;
-    if (
-      capacityChanged
-      && Number(row._capacityInput.value) === submittedCapacity
-    ) row._capacityInput.value = row.dataset.originalCapacity;
+    activityCasConflict = error.status === 409 && error.message.includes("当前活动已经变化");
+    if (activityCasConflict) {
+      activityCasRequiresRefresh = !uiHasMovedFromRequestActivity();
+      if (activityCasRequiresRefresh) {
+        for (const timer of adminState.entitySaveTimers.values()) clearTimeout(timer);
+        adminState.entitySaveTimers.clear();
+      }
+      delete row.dataset.saveQueued;
+      delete row.dataset.saveQueuedCapacity;
+      delete row.dataset.saveQueuedRefresh;
+      row._nameInput.value = row.dataset.originalName;
+      if (row.dataset.entityKind === "group") row._capacityInput.value = row.dataset.originalCapacity;
+    } else {
+      if (nameChanged && row._nameInput.value.trim() === submittedName) row._nameInput.value = row.dataset.originalName;
+      if (
+        capacityChanged
+        && Number(row._capacityInput.value) === submittedCapacity
+      ) row._capacityInput.value = row.dataset.originalCapacity;
+    }
     setEntitySaveState(row, "error", "保存失败 · 已还原");
     showAdminToast(`自动保存失败：${error.message}`, "error");
+    if (activityCasRequiresRefresh) {
+      await loadDashboard({ quiet: true, afterMutation: true });
+      if (uiHasMovedFromRequestActivity()) activityCasRequiresRefresh = false;
+    }
   } finally {
     delete row.dataset.saving;
     row.removeAttribute("aria-busy");
-    const queued = row.dataset.saveQueued === "true" || entityRowHasChanges(row, { includeCapacity: false });
+    const queued = !activityCasConflict
+      && (row.dataset.saveQueued === "true" || entityRowHasChanges(row, { includeCapacity: false }));
     const queuedCapacity = row.dataset.saveQueuedCapacity === "true";
     const queuedRefresh = refreshAfter || row.dataset.saveQueuedRefresh === "true";
     delete row.dataset.saveQueued;
@@ -2087,7 +2118,9 @@ async function persistEntityRow(row, { refreshAfter = false, includeCapacity = f
     if (queued && row.isConnected) {
       scheduleEntityRowSave(row, 0, { refreshAfter: queuedRefresh, includeCapacity: queuedCapacity });
     }
-    renderLatestStructureAfterAutosave();
+    if (!activityCasConflict || activityCasRequiresRefresh) {
+      renderLatestStructureAfterAutosave({ forceStructure: activityCasRequiresRefresh });
+    }
   }
 }
 
