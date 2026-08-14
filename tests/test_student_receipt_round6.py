@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -42,7 +43,7 @@ def test_student_result_receipt_is_mobile_portrait_and_never_contains_login_secr
     assert "canvas.height = 1920" in card_source
     assert "receipt.verification_code" in card_source
     assert "receipt.verify_url" in card_source
-    assert "payload?.receipt?.qr_image_url" in javascript
+    assert "receipt?.qr_image_url" in javascript
     assert "url.origin === window.location.origin" in javascript
     assert "扫码可核对服务端原始记录" in card_source
     assert "在线核验暂不可用" in card_source
@@ -71,6 +72,136 @@ def test_result_preview_is_cached_and_uses_csp_compatible_data_url() -> None:
     assert '.student-body[data-student-view="success"] .student-hero { display: none; }' in css
     assert '.student-body[data-student-view="success"] .result-card-preview { width: min(34vw, 120px);' in css
     assert '.student-body[data-student-view="success"] .success-card__actions { grid-template-columns: 1fr 1fr;' in css
+
+
+def test_signed_receipt_qr_failure_blocks_preview_cache_and_download() -> None:
+    javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
+    qr_loader_source = "function resultCardSameOriginImageUrl" + javascript.split(
+        "function resultCardSameOriginImageUrl", 1
+    )[1].split("function resultCardBlob", 1)[0]
+    result_flow_source = "function resultCardPreviewKey" + javascript.split(
+        "function resultCardPreviewKey", 1
+    )[1].split("function createGroupOption", 1)[0]
+
+    harness = r"""
+const assert = require("node:assert/strict");
+const window = {
+  location: {
+    href: "https://class.example/student",
+    origin: "https://class.example",
+  },
+};
+let imageRequests = 0;
+let imageShouldLoad = true;
+class Image {
+  set src(_value) {
+    imageRequests += 1;
+    queueMicrotask(() => imageShouldLoad
+      ? this.onload()
+      : this.onerror(new Error("network unavailable")));
+  }
+}
+
+const payload = {
+  settings: { activity_id: 9, activity_title: "测试活动" },
+  student: { student_no: "20268000008", name: "凭证学生", major_name: "城乡规划" },
+  selection: { group_id: 3, group_name: "第三教学组", selected_at: "2026-08-14T12:00:00Z" },
+  receipt: {
+    verification_code: "ABC-DEF-GHI",
+    verify_url: "https://class.example/receipt#token=signed",
+    qr_image_url: "https://class.example/api/student/receipt/qr.png",
+  },
+};
+const studentState = {
+  payload,
+  resultCardInFlight: false,
+  resultCardPreviewKey: null,
+  resultCardPreviewPendingKey: null,
+  resultCardPreviewUrl: null,
+};
+const studentEls = {
+  resultCardPreviewImage: { hidden: false, src: "" },
+  resultCardPreviewStatus: { hidden: true, textContent: "" },
+  downloadResultCard: { disabled: false, textContent: "下载抢选结果凭证" },
+};
+let dataUrlCalls = 0;
+let objectUrlCalls = 0;
+let anchorClicks = 0;
+let lastMessage = null;
+async function createResultCardBlob(value) {
+  await loadResultCardVerificationQr(value);
+  return { type: "image/png" };
+}
+async function resultCardDataUrl(_blob) {
+  dataUrlCalls += 1;
+  return "data:image/png;base64,unexpected";
+}
+function showStudentMessage(message, kind) {
+  lastMessage = { message, kind };
+}
+URL.createObjectURL = () => {
+  objectUrlCalls += 1;
+  return "blob:unexpected";
+};
+URL.revokeObjectURL = () => {};
+const document = {
+  createElement(tag) {
+    assert.equal(tag, "a");
+    return {
+      click() { anchorClicks += 1; },
+      remove() {},
+    };
+  },
+  body: { append() {} },
+};
+
+(async () => {
+  for (const incompleteReceipt of [
+    null,
+    {...payload.receipt, verification_code: ""},
+    {...payload.receipt, verify_url: "https://outside.example/receipt#token=signed"},
+    {...payload.receipt, qr_image_url: "https://outside.example/qr.png"},
+  ]) {
+    await assert.rejects(
+      loadResultCardVerificationQr({...payload, receipt: incompleteReceipt}),
+      /防伪核验信息不完整.*重试/,
+    );
+  }
+  assert.equal(imageRequests, 0, "核验信息缺失或非同源时不应请求二维码");
+
+  const validQr = await loadResultCardVerificationQr(payload);
+  assert.ok(validQr instanceof Image, "完整同源核验信息应正常加载二维码");
+  assert.equal(imageRequests, 1);
+
+  imageShouldLoad = false;
+  await ensureStudentResultCardPreview(payload);
+  assert.equal(studentState.resultCardPreviewKey, null, "二维码失败不能写入预览缓存键");
+  assert.equal(studentState.resultCardPreviewUrl, null, "二维码失败不能写入预览缓存内容");
+  assert.equal(studentState.resultCardPreviewPendingKey, null, "失败后必须释放 pending 状态以便重试");
+  assert.equal(dataUrlCalls, 0, "二维码失败不能继续生成可缓存 Data URL");
+  assert.equal(studentEls.resultCardPreviewImage.hidden, true);
+  assert.match(studentEls.resultCardPreviewStatus.textContent, /防伪二维码.*重试/);
+
+  await downloadStudentResultCard();
+  assert.equal(objectUrlCalls, 0, "二维码失败不能生成下载对象 URL");
+  assert.equal(anchorClicks, 0, "二维码失败不能触发缺少防伪二维码的下载");
+  assert.deepEqual(lastMessage, {
+    message: "防伪二维码加载失败，请检查网络后重试",
+    kind: "error",
+  });
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+    completed = subprocess.run(
+        ["node", "-e", "\n".join((qr_loader_source, result_flow_source, harness))],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 def test_public_receipt_page_does_not_persist_or_leak_the_signed_token() -> None:

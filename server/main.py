@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Config, PROJECT_ROOT
-from .current_contract import clean_text, normalize_public_base_url
+from .current_contract import clean_text, normalize_named_value, normalize_public_base_url
 from .database import (
     SCHEMA_VERSION,
     activity_snapshot,
@@ -805,6 +805,122 @@ def create_app(config: Config | None = None) -> FastAPI:
         except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail="凭证无效或已损坏") from exc
         return claims, receipt_verification_code(expected_signature)
+
+    def validated_activity_archive(
+        activity: sqlite3.Row,
+        *,
+        error_status: int,
+        error_detail: str,
+    ) -> dict[str, Any]:
+        """Return one archive only after its snapshot and outer row agree."""
+
+        try:
+            snapshot_json = activity["snapshot_json"]
+            summary_json = activity["summary_json"]
+            archived_at = activity["archived_at"]
+            snapshot_sha256 = activity["snapshot_sha256"]
+            if (
+                activity["status"] != "archived"
+                or not isinstance(snapshot_json, str)
+                or not snapshot_json
+                or not isinstance(summary_json, str)
+                or not summary_json
+                or not isinstance(archived_at, str)
+                or not archived_at
+                or not isinstance(snapshot_sha256, str)
+                or not snapshot_sha256
+            ):
+                raise ValueError("incomplete archive")
+
+            digest = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+            if not hmac.compare_digest(digest, snapshot_sha256):
+                raise ValueError("archive digest mismatch")
+
+            snapshot = json.loads(snapshot_json)
+            summary = json.loads(summary_json)
+            required_snapshot_keys = {
+                "schema_version",
+                "archived_at",
+                "activity",
+                "majors",
+                "teaching_groups",
+                "quotas",
+                "students",
+                "selections",
+                "audit_logs",
+            }
+            if (
+                not isinstance(snapshot, dict)
+                or not isinstance(summary, dict)
+                or not required_snapshot_keys <= snapshot.keys()
+                or snapshot["schema_version"] != 1
+                or any(
+                    not isinstance(snapshot[key], list)
+                    for key in (
+                        "majors",
+                        "teaching_groups",
+                        "quotas",
+                        "students",
+                        "selections",
+                        "audit_logs",
+                    )
+                )
+            ):
+                raise ValueError("invalid archive structure")
+
+            archived_datetime = datetime.fromisoformat(archived_at)
+            if (
+                archived_datetime.utcoffset() is None
+                or snapshot["archived_at"] != archived_at
+            ):
+                raise ValueError("archive timestamp mismatch")
+
+            archived_activity = snapshot["activity"]
+            expected_activity = {
+                "id": activity["id"],
+                "code": activity["code"],
+                "title": activity["title"],
+                "created_at": activity["created_at"],
+                "opened_at": activity["opened_at"],
+                "closed_at": activity["closed_at"],
+            }
+            if (
+                not isinstance(archived_activity, dict)
+                or archived_activity.get("status") != "closed"
+                or any(
+                    archived_activity.get(key) != value
+                    for key, value in expected_activity.items()
+                )
+            ):
+                raise ValueError("archive activity mismatch")
+
+            active_student_ids = {
+                int(student["id"])
+                for student in snapshot["students"]
+                if student.get("active")
+            }
+            expected_summary = {
+                "students": len(active_student_ids),
+                "selected": sum(
+                    1
+                    for selection in snapshot["selections"]
+                    if selection.get("revoked_at") is None
+                    and int(selection["student_id"]) in active_student_ids
+                ),
+            }
+            expected_summary["unselected"] = (
+                expected_summary["students"] - expected_summary["selected"]
+            )
+            if summary != expected_summary:
+                raise ValueError("archive summary mismatch")
+        except (
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise HTTPException(status_code=error_status, detail=error_detail) from exc
+        return snapshot
 
     def require_session_from_connection(
         request: Request,
@@ -1609,7 +1725,8 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.execute("BEGIN")
             activity = connection.execute(
                 """
-                SELECT id, code, title, status, snapshot_json, snapshot_sha256
+                SELECT id, code, title, status, created_at, opened_at, closed_at,
+                       archived_at, summary_json, snapshot_json, snapshot_sha256
                 FROM activities WHERE id = ?
                 """,
                 (claims["activity_id"],),
@@ -1646,24 +1763,12 @@ def create_app(config: Config | None = None) -> FastAPI:
                 if row:
                     record = dict(row)
             elif activity["status"] == "archived":
-                snapshot_json = activity["snapshot_json"]
-                snapshot_sha256 = activity["snapshot_sha256"]
-                if not snapshot_json or not snapshot_sha256:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="凭证核验数据暂不可用，请联系管理员",
-                    )
-                actual_digest = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
-                if not hmac.compare_digest(actual_digest, str(snapshot_sha256)):
-                    raise HTTPException(
-                        status_code=503,
-                        detail="凭证核验数据暂不可用，请联系管理员",
-                    )
+                snapshot = validated_activity_archive(
+                    activity,
+                    error_status=503,
+                    error_detail="凭证核验数据暂不可用，请联系管理员",
+                )
                 try:
-                    snapshot = json.loads(snapshot_json)
-                    snapshot_activity = snapshot["activity"]
-                    if int(snapshot_activity["id"]) != int(activity["id"]):
-                        raise ValueError("archive activity mismatch")
                     archived_selection = next(
                         (
                             candidate
@@ -2556,71 +2661,11 @@ def create_app(config: Config | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="活动不存在")
             if row["status"] != "archived":
                 raise HTTPException(status_code=409, detail="当前活动尚未归档")
-            if not row["archived_at"] or not row["snapshot_json"]:
-                raise HTTPException(
-                    status_code=500, detail="归档校验失败，请先运行数据库检查"
-                )
-            digest = hashlib.sha256(row["snapshot_json"].encode("utf-8")).hexdigest()
-            if not row["snapshot_sha256"] or not hmac.compare_digest(
-                digest, str(row["snapshot_sha256"])
-            ):
-                raise HTTPException(status_code=500, detail="归档校验失败，请先运行数据库检查")
-            try:
-                summary = json.loads(row["summary_json"])
-                snapshot = json.loads(row["snapshot_json"])
-                archived_activity = snapshot["activity"]
-                archived_at = datetime.fromisoformat(str(row["archived_at"]))
-            except (json.JSONDecodeError, KeyError, TypeError):
-                raise HTTPException(
-                    status_code=500, detail="归档校验失败，请先运行数据库检查"
-                )
-            except ValueError:
-                raise HTTPException(
-                    status_code=500, detail="归档校验失败，请先运行数据库检查"
-                )
-            if (
-                archived_at.utcoffset() is None
-                or snapshot.get("archived_at") != row["archived_at"]
-            ):
-                raise HTTPException(
-                    status_code=500, detail="归档校验失败，请先运行数据库检查"
-                )
-            expected_activity = {
-                "id": row["id"],
-                "code": row["code"],
-                "title": row["title"],
-                "created_at": row["created_at"],
-                "opened_at": row["opened_at"],
-                "closed_at": row["closed_at"],
-            }
-            if not isinstance(archived_activity, dict) or any(
-                archived_activity.get(key) != value
-                for key, value in expected_activity.items()
-            ):
-                raise HTTPException(
-                    status_code=500, detail="归档校验失败，请先运行数据库检查"
-                )
-            active_student_ids = {
-                int(student["id"])
-                for student in snapshot["students"]
-                if student.get("active")
-            }
-            expected_summary = {
-                "students": len(active_student_ids),
-                "selected": sum(
-                    1
-                    for selection in snapshot["selections"]
-                    if selection.get("revoked_at") is None
-                    and int(selection["student_id"]) in active_student_ids
-                ),
-            }
-            expected_summary["unselected"] = (
-                expected_summary["students"] - expected_summary["selected"]
+            validated_activity_archive(
+                row,
+                error_status=500,
+                error_detail="归档校验失败，请先运行数据库检查",
             )
-            if summary != expected_summary:
-                raise HTTPException(
-                    status_code=500, detail="归档校验失败，请先运行数据库检查"
-                )
             return Response(
                 content=row["snapshot_json"].encode("utf-8"),
                 media_type="application/json",
@@ -3129,6 +3174,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             )
 
         seen_numbers: set[str] = set()
+        validated_major_names: list[str] = []
         for row in rows:
             if row.student_no in seen_numbers:
                 raise HTTPException(
@@ -3139,11 +3185,22 @@ def create_app(config: Config | None = None) -> FastAPI:
                     ),
                 )
             seen_numbers.add(row.student_no)
-            if len(row.major_name) > 80:
+            try:
+                major_name = normalize_named_value(
+                    row.major_name,
+                    label="专业名称",
+                    minimum=1,
+                    maximum=80,
+                )
+            except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"第 {row.file_index} 个文件第 {row.line_number} 行字段长度超限",
-                )
+                    detail=(
+                        f"第 {row.file_index} 个文件第 {row.line_number} 行的"
+                        f"专业名称无效：{exc}"
+                    ),
+                ) from exc
+            validated_major_names.append(major_name)
 
         connection = connect(config.database_path)
         created = 0
@@ -3170,8 +3227,9 @@ def create_app(config: Config | None = None) -> FastAPI:
                 ).fetchone()[0]
             )
             now = utc_now()
-            for roster_row in rows:
-                major_name = roster_row.major_name
+            for roster_row, major_name in zip(
+                rows, validated_major_names, strict=True
+            ):
                 if major_name in major_map:
                     continue
                 stored_major = stored_majors.get(major_name)
@@ -3237,10 +3295,9 @@ def create_app(config: Config | None = None) -> FastAPI:
             students_by_number = {
                 candidate["student_no"]: candidate for candidate in stored_students
             }
-            for row in rows:
+            for row, major_name in zip(rows, validated_major_names, strict=True):
                 student_no = row.student_no
                 name = row.name
-                major_name = row.major_name
                 code = row.activation_code
                 existing = students_by_number.get(student_no)
                 if existing:

@@ -134,6 +134,67 @@ def test_import_auto_creates_missing_majors_once_across_files(
     assert actions.count("students.import") == 1
 
 
+def test_import_rejects_control_char_major_names_without_partial_writes(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    app_config,
+):
+    connection = connect(app_config.database_path)
+    try:
+        counts_before = tuple(
+            int(
+                connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            )
+            for table in ("majors", "students", "audit_logs")
+        )
+    finally:
+        connection.close()
+
+    rejected = import_rosters(
+        client,
+        admin_headers,
+        [
+            (
+                "control-character-major.csv",
+                [
+                    (
+                        "20268000020",
+                        "合法对照学生",
+                        "合法待创建专业",
+                        fictional_document_number("control-major-valid"),
+                    ),
+                    (
+                        "20268000021",
+                        "欺骗专业学生",
+                        "城乡规划\u202e实验班",
+                        fictional_document_number("control-major-invalid"),
+                    ),
+                ],
+            )
+        ],
+    )
+
+    assert rejected.status_code == 400, rejected.text
+    assert rejected.json()["detail"] == (
+        "第 1 个文件第 3 行的专业名称无效：文本不能包含控制字符"
+    )
+    connection = connect(app_config.database_path)
+    try:
+        counts_after = tuple(
+            int(
+                connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            )
+            for table in ("majors", "students", "audit_logs")
+        )
+        assert connection.execute(
+            "SELECT 1 FROM majors WHERE name IN (?, ?)",
+            ("合法待创建专业", "城乡规划\u202e实验班"),
+        ).fetchone() is None
+    finally:
+        connection.close()
+    assert counts_after == counts_before
+
+
 def test_import_reactivates_same_named_inactive_major_with_audit(
     client: TestClient,
     admin_headers: dict[str, str],
@@ -486,6 +547,105 @@ def test_signed_receipt_remains_verifiable_from_integrity_checked_archive(
     assert verified.json()["valid"] is True
     assert verified.json()["revoked"] is False
     assert verified.json()["student"]["student_no_masked"] == "*******0009"
+
+
+def test_archived_receipt_verification_rejects_every_outer_archive_mismatch(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    app_config,
+):
+    selected, _ = select_one_student(
+        client,
+        admin_headers,
+        student_no="20268000022",
+        student_name="归档绑定核验学生",
+    )
+    receipt = selected["receipt"]
+    closed = client.post(
+        "/api/admin/status",
+        headers=admin_headers,
+        json={"status": "closed"},
+    )
+    assert closed.status_code == 200, closed.text
+    activity_id = int(admin_headers["X-Activity-ID"])
+    archived = client.post(
+        "/api/admin/activities",
+        headers=admin_headers,
+        json={
+            "title": "归档绑定核验后续活动",
+            "code": "receipt-archive-binding-next",
+            "copy_structure": True,
+            "previous_activity_id": activity_id,
+        },
+    )
+    assert archived.status_code == 200, archived.text
+
+    intact = client.post(
+        "/api/public/receipts/verify", json={"token": receipt["token"]}
+    )
+    assert intact.status_code == 200, intact.text
+    assert intact.json()["valid"] is True
+
+    connection = connect(app_config.database_path)
+    try:
+        original = dict(
+            connection.execute(
+                """
+                SELECT code, title, created_at, opened_at, closed_at,
+                       archived_at, summary_json
+                FROM activities WHERE id = ?
+                """,
+                (activity_id,),
+            ).fetchone()
+        )
+    finally:
+        connection.close()
+
+    corruptions = {
+        "code": "tampered-archive-code",
+        "title": "已篡改归档标题",
+        "created_at": "2040-01-02T03:04:05+00:00",
+        "opened_at": "2040-01-02T03:04:06+00:00",
+        "closed_at": "2040-01-02T03:04:07+00:00",
+        "archived_at": "2040-01-02T03:04:08+00:00",
+        "summary_json": '{"students":999,"selected":0,"unselected":999}',
+    }
+    for column, tampered_value in corruptions.items():
+        connection = connect(app_config.database_path)
+        try:
+            connection.execute(
+                f"UPDATE activities SET {column} = ? WHERE id = ?",
+                (tampered_value, activity_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        rejected = client.post(
+            "/api/public/receipts/verify", json={"token": receipt["token"]}
+        )
+        assert rejected.status_code == 503, (column, rejected.text)
+        assert rejected.json()["detail"] == "凭证核验数据暂不可用，请联系管理员"
+        archive_download = client.get(
+            f"/api/admin/activities/{activity_id}/archive.json"
+        )
+        assert archive_download.status_code == 500, (column, archive_download.text)
+
+        connection = connect(app_config.database_path)
+        try:
+            connection.execute(
+                f"UPDATE activities SET {column} = ? WHERE id = ?",
+                (original[column], activity_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    restored = client.post(
+        "/api/public/receipts/verify", json={"token": receipt["token"]}
+    )
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["valid"] is True
 
 
 def test_receipt_verification_rate_limits_exact_tokens_without_exhausting_classroom_nat(
