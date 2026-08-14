@@ -118,6 +118,8 @@ def test_csv_xls_xlsx_sync_is_one_combined_roster_and_identity_never_persists(
         "rotated": 0,
         "file_count": 1,
         "row_count": 4,
+        "majors_created": [],
+        "majors_reactivated": [],
         "activation_code_policy": "normalized_document_number_last_6",
     }
 
@@ -164,6 +166,8 @@ def test_csv_xls_xlsx_sync_is_one_combined_roster_and_identity_never_persists(
         "rotated": 0,
         "file_count": 3,
         "row_count": 3,
+        "majors_created": [],
+        "majors_reactivated": [],
         "activation_code_policy": "normalized_document_number_last_6",
     }
     assert "credentials" not in synchronized.json()
@@ -572,8 +576,10 @@ def test_projection_and_roster_ui_dom_contract_and_guidance_copy():
     assert "fullscreenHost.append(adminEls.dangerDialog)" in admin_js
     assert "originalParent.append(adminEls.dangerDialog)" in admin_js
     board_logo_css = app_css.split(".college-wordmark--board {", 1)[1].split(".board-presentation-brand h1", 1)[0]
+    shared_logo_css = app_css.split(".college-wordmark img {", 1)[1].split(".college-wordmark--mobile", 1)[0]
     assert "background: transparent" in board_logo_css
-    assert "position: absolute" in board_logo_css
+    assert "position: absolute" in shared_logo_css
+    assert "width: 108.4623%" in shared_logo_css
 
     assert "实时选择流水" in admin_html
     assert "尚未进入候场" in admin_html

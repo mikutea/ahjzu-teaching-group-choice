@@ -44,6 +44,7 @@ jobs:
         run: |
           node --check web/admin.js
           node --check web/student.js
+          node --check web/receipt.js
           bash -n deploy/bootstrap.sh
           bash -n deploy/install-cloudflared.sh
           bash -n deploy/update.sh

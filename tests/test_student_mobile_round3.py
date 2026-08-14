@@ -178,13 +178,14 @@ def test_major_badges_and_standardized_result_card_are_exposed_without_secrets()
         "async function downloadStudentResultCard", 1
     )[0]
     assert "canvas.width = 1080" in card_source
-    assert "canvas.height = 1350" in card_source
+    assert "canvas.height = 1920" in card_source
     assert '"/brand/college-wordmark-official.png"' in student_js
-    assert "context.fillRect(48, 40, 984, 274)" in card_source
-    assert card_source.index("context.fillRect(48, 40, 984, 274)") < card_source.index(
+    assert "context.fillRect(52, 42, 976, 336)" in card_source
+    assert card_source.index("context.fillRect(52, 42, 976, 336)") < card_source.index(
         "context.drawImage(logo"
     )
-    assert "安徽建筑大学 · 建筑与空间规划学院  制作：Mikutea" in card_source
+    assert "安徽建筑大学 · 建筑与空间规划学院" in card_source
+    assert "制作：Mikutea" in card_source
     assert "activation_code" not in card_source
     assert "个人激活码" not in card_source
     assert "结果卡生成失败" in student_js

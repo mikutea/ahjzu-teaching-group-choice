@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#6f2028">
+  <meta name="referrer" content="no-referrer">
+  <title>抢选结果凭证核验</title>
+  <link rel="stylesheet" href="/assets/receipt.css">
+</head>
+<body data-verification-status="loading">
+  <div class="verification-grid" aria-hidden="true"></div>
+  <main class="verification-shell">
+    <header class="verification-brand">
+      <div class="verification-wordmark">
+        <img src="/brand/college-wordmark-official.png" alt="建筑与空间规划学院">
+      </div>
+      <p>教学组抢选 · 服务器记录核验</p>
+    </header>
+
+    <section class="verification-card" aria-labelledby="verification-title">
+      <div id="verification-mark" class="verification-mark" aria-hidden="true">核验中</div>
+      <p id="verification-eyebrow" class="verification-eyebrow">VERIFYING RECEIPT</p>
+      <h1 id="verification-title">正在核验凭证</h1>
+      <p id="verification-message" class="verification-message" role="status" aria-live="polite">正在读取服务器原始记录，请稍候。</p>
+      <button id="verification-retry" class="verification-retry" type="button" hidden>重新核验</button>
+
+      <dl id="verification-details" class="verification-details" hidden>
+        <div class="verification-details__wide">
+          <dt>活动</dt>
+          <dd id="verification-activity"></dd>
+        </div>
+        <div>
+          <dt>姓名</dt>
+          <dd id="verification-name"></dd>
+        </div>
+        <div>
+          <dt>学号</dt>
+          <dd id="verification-student-no"></dd>
+        </div>
+        <div>
+          <dt>专业</dt>
+          <dd id="verification-major"></dd>
+        </div>
+        <div>
+          <dt>教学组</dt>
+          <dd id="verification-group"></dd>
+        </div>
+        <div class="verification-details__wide">
+          <dt>系统记录时间</dt>
+          <dd id="verification-time"></dd>
+        </div>
+        <div class="verification-details__wide verification-code-row">
+          <dt>核验编号</dt>
+          <dd id="verification-code"></dd>
+        </div>
+      </dl>
+
+      <p class="verification-notice">本页面直接核对服务器原始记录，不以截图中的文字或样式作为判定依据。</p>
+      <a class="verification-home" href="/">返回学生端</a>
+    </section>
+  </main>
+
+  <footer>安徽建筑大学 · 建筑与空间规划学院 制作：Mikutea</footer>
+  <script src="/assets/receipt.js" defer></script>
+</body>
+</html>
