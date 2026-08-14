@@ -130,7 +130,7 @@ const payload = {
   student: { student_no: "20268000008", name: "凭证学生", major_name: "城乡规划" },
   selection: { group_id: 3, group_name: "第三教学组", selected_at: "2026-08-14T12:00:00Z" },
   receipt: {
-    token: "v1.signed.receipt-token",
+    token: "v2.signed.receipt-token",
     verification_code: "ABC-DEF-GHI",
     verify_url: "https://class.example/receipt#token=signed",
     qr_image_url: "https://class.example/api/student/receipt/qr.png",
@@ -312,7 +312,7 @@ const payload = {
   student: { student_no: "20268000008", name: "凭证学生", major_name: "城乡规划" },
   selection: { group_id: 3, group_name: "第三教学组", selected_at: "2026-08-14T12:00:00Z" },
   receipt: {
-    token: "v1.signed.receipt-token",
+    token: "v2.signed.receipt-token",
     verification_code: "ABC-DEF-GHI",
     verify_url: "https://class.example/receipt#token=signed",
     qr_image_url: "https://class.example/api/student/receipt/qr.png",
