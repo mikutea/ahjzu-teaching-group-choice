@@ -14,6 +14,10 @@
       <img src="/brand/college-wordmark-official.png" alt="建筑与空间规划学院">
     </a>
     <span class="student-brandbar__label">教学事务 · 在线服务</span>
+    <div id="student-clock" class="student-clock" data-sync-status="syncing" role="status" aria-live="off">
+      <span id="student-clock-status" class="student-clock__status">正在同步</span>
+      <time id="student-server-clock" class="student-clock__time">--:--:--</time>
+    </div>
   </header>
 
   <main class="student-main">
@@ -37,12 +41,14 @@
       <form id="student-login-form" class="form-stack" novalidate>
         <label class="field">
           <span>学号</span>
-          <input id="student-no" name="student_no" type="text" inputmode="text" autocomplete="username" autocapitalize="characters" autocorrect="off" spellcheck="false" enterkeyhint="next" minlength="4" maxlength="32" pattern="[A-Za-z0-9_-]{4,32}" required placeholder="请输入学号" aria-describedby="student-no-error">
+          <input id="student-no" name="student_no" type="text" inputmode="numeric" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="next" minlength="11" maxlength="11" pattern="[0-9]{11}" required placeholder="请输入 11 位数字学号" aria-describedby="student-no-help student-no-error">
+          <small id="student-no-help" class="field-help">学号须为恰好 11 位数字</small>
           <small id="student-no-error" class="form-error field-validation is-hidden" aria-live="polite"></small>
         </label>
         <label class="field">
           <span>姓名</span>
-          <input id="student-name" name="name" type="text" inputmode="text" autocomplete="name" autocapitalize="words" enterkeyhint="next" minlength="1" maxlength="80" pattern="[A-Za-zÀ-ɏ\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF·•・'’\-‐‑ ]{1,80}" required placeholder="请输入姓名" aria-describedby="student-name-error">
+          <input id="student-name" name="name" type="text" inputmode="text" autocomplete="name" autocapitalize="words" autocorrect="off" spellcheck="false" enterkeyhint="next" minlength="1" maxlength="40" pattern="[A-Za-z\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF·•・ ]{1,40}" required placeholder="请输入名单中的姓名" aria-describedby="student-name-help student-name-error">
+          <small id="student-name-help" class="field-help">仅支持中文、英文字母、空格或姓名中点</small>
           <small id="student-name-error" class="form-error field-validation is-hidden" aria-live="polite"></small>
         </label>
         <label class="field">
@@ -102,6 +108,7 @@
     </section>
 
     <section id="success-view" class="student-card success-card is-hidden" aria-labelledby="success-title">
+      <div id="success-major-badge" class="student-avatar student-avatar--success" role="img" aria-label="专业标识" title="专业标识">专业</div>
       <div class="success-mark" aria-hidden="true">✓</div>
       <p class="eyebrow">SUBMITTED</p>
       <h2 id="success-title">选择成功</h2>
@@ -110,9 +117,9 @@
         <span>系统记录时间</span>
         <strong id="success-time"></strong>
       </div>
-      <p class="success-card__tip">可下载学院统一尺寸的结果卡。最终安排以学院发布结果为准。</p>
+      <p class="success-card__tip"><strong>请下载并妥善保存「抢选结果凭证」</strong>，便于后续核对。最终安排以学院正式发布结果为准。</p>
       <div class="success-card__actions">
-        <button id="download-result-card" class="button button--primary button--wide" type="button">下载统一结果卡</button>
+        <button id="download-result-card" class="button button--primary button--wide" type="button">下载抢选结果凭证</button>
         <button id="success-logout" class="button button--secondary button--wide" type="button">安全退出</button>
       </div>
     </section>

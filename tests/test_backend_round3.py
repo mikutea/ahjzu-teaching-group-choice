@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from server.database import connect
 from server.main import StudentLogin
 from server.maintenance import check_database
+from server.security import activation_code_hash, encrypt_activation_code
 
 from .conftest import TEST_ADMIN_PASSWORD, admin_login, fictional_document_number
 
@@ -38,7 +39,7 @@ def import_students(
         "/api/admin/students/import",
         headers=headers,
         files={
-            "file": (
+            "files": (
                 "round3.csv",
                 ("\n".join(csv_rows) + "\n").encode("utf-8"),
                 "text/csv",
@@ -156,7 +157,7 @@ def test_archive_delete_requires_cas_confirmation_and_leaves_tombstone(
     assert deleted.json() == {"ok": True, "deleted_activity_id": archived_id}
     activities = client.get("/api/admin/activities").json()
     assert all(int(activity["id"]) != archived_id for activity in activities)
-    assert check_database(app_config.database_path) == "ok"
+    assert check_database(app_config.database_path, app_config.app_secret) == "ok"
 
     connection = connect(app_config.database_path)
     try:
@@ -196,7 +197,7 @@ def test_group_capacity_rebalances_quotas_and_honors_selection_floors(
 
     majors = after["majors"]
     roster_rows = [
-        (f"R3{index:04d}", f"容量学生{index}", major["name"])
+        (f"2026300{index:04d}", f"容量学生{'甲乙丙'[index - 1]}", major["name"])
         for index, major in enumerate(majors, start=1)
     ]
     students = import_students(client, admin_headers, roster_rows)
@@ -246,7 +247,7 @@ def test_group_rename_or_same_capacity_does_not_rebalance_quotas(
 
     first_major = dashboard["majors"][0]
     rows = [
-        (f"R3SAME{index:02d}", f"同容量学生{index}", first_major["name"])
+        (f"2026301{index:04d}", f"同容量学生{'甲乙丙'[index - 1]}", first_major["name"])
         for index in range(1, 4)
     ]
     students = import_students(client, admin_headers, rows)
@@ -286,8 +287,8 @@ def test_xlsx_export_contains_complete_roster_and_wps_safe_student_numbers(
     dashboard = client.get("/api/admin/dashboard").json()
     major_name = dashboard["majors"][0]["name"]
     rows = [
-        ("202600000000000000000001", "结果甲", major_name),
-        ("202600000000000000000002", "结果乙", major_name),
+        ("20263020001", "结果甲", major_name),
+        ("20263020002", "结果乙", major_name),
     ]
     students = import_students(client, admin_headers, rows)
     selected = client.post(
@@ -317,7 +318,7 @@ def test_xlsx_export_contains_complete_roster_and_wps_safe_student_numbers(
     assert results["A2"].value == rows[0][0]
     assert results["A2"].data_type == "s"
     assert results["A2"].number_format == "@"
-    assert results.column_dimensions["A"].width >= 36
+    assert results.column_dimensions["A"].width >= 14
     assert results.freeze_panes == "A2"
     assert results.auto_filter.ref == "A1:F3"
     assert {results["D2"].value, results["D3"].value} == {"已选", "未选"}
@@ -337,14 +338,23 @@ def test_xlsx_export_neutralizes_formula_like_roster_text(
         connection.execute("BEGIN IMMEDIATE")
         connection.execute("UPDATE majors SET name = '=1+1' WHERE id = ?", (major["id"],))
         now = "2026-08-13T00:00:00+00:00"
+        activation_code = fictional_document_number("formula-roster")[-6:]
         connection.execute(
             """
             INSERT INTO students
                 (student_no, name, major_id, activation_hash, activation_ciphertext,
                  active, created_at, updated_at)
-            VALUES ('=1+1', '@SUM(A1:A2)', ?, 'x', NULL, 1, ?, ?)
+            VALUES ('20263029999', '@SUM(A1:A2)', ?, ?, ?, 1, ?, ?)
             """,
-            (major["id"], now, now),
+            (
+                major["id"],
+                activation_code_hash(app_config.app_secret, activation_code),
+                encrypt_activation_code(
+                    app_config.app_secret, "20263029999", activation_code
+                ),
+                now,
+                now,
+            ),
         )
         connection.commit()
     finally:
@@ -356,7 +366,7 @@ def test_xlsx_export_neutralizes_formula_like_roster_text(
     assert exported.status_code == 200, exported.text
     workbook = load_workbook(io.BytesIO(exported.content), data_only=False)
     results = workbook["完整结果"]
-    assert results["A2"].value == "'=1+1"
+    assert results["A2"].value == "20263029999"
     assert results["A2"].data_type == "s"
     assert results["B2"].value == "'@SUM(A1:A2)"
     assert results["B2"].data_type == "s"
@@ -369,11 +379,11 @@ def test_xlsx_export_neutralizes_formula_like_roster_text(
     [
         {"student_no": "12", "name": "合法姓名", "activation_code": "123456"},
         {"student_no": "2026<script>", "name": "合法姓名", "activation_code": "123456"},
-        {"student_no": "20260001", "name": "<script>", "activation_code": "123456"},
-        {"student_no": "20260001", "name": "姓名🙂", "activation_code": "123456"},
-        {"student_no": "20260001", "name": "姓名\n注入", "activation_code": "123456"},
-        {"student_no": "20260001", "name": "合法姓名", "activation_code": "12-456"},
-        {"student_no": "20260001", "name": "合法姓名", "activation_code": "1234567"},
+        {"student_no": "20260000001", "name": "<script>", "activation_code": "123456"},
+        {"student_no": "20260000001", "name": "姓名🙂", "activation_code": "123456"},
+        {"student_no": "20260000001", "name": "姓名\n注入", "activation_code": "123456"},
+        {"student_no": "20260000001", "name": "合法姓名", "activation_code": "12-456"},
+        {"student_no": "20260000001", "name": "合法姓名", "activation_code": "1234567"},
     ],
 )
 def test_student_login_rejects_illegal_fields(payload: dict[str, str]):
@@ -381,9 +391,9 @@ def test_student_login_rejects_illegal_fields(payload: dict[str, str]):
         StudentLogin.model_validate(payload)
 
 
-@pytest.mark.parametrize("name", ["欧阳·子涵", "Ch'en Wei-Lun", "陳・美玲", "王小明"])
+@pytest.mark.parametrize("name", ["欧阳·子涵", "Chen Wei Lun", "陳・美玲", "王小明"])
 def test_student_login_accepts_supported_mainland_hk_macao_taiwan_names(name: str):
     model = StudentLogin.model_validate(
-        {"student_no": "HK_TW-2026", "name": name, "activation_code": "１２３ＡＢＣ"}
+        {"student_no": "20261234567", "name": name, "activation_code": "１２３ＡＢＣ"}
     )
     assert model.activation_code == "123ABC"

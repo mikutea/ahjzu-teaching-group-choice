@@ -43,10 +43,10 @@
         <img src="/brand/college-wordmark-official.png" alt="建筑与空间规划学院">
       </div>
       <nav class="admin-nav" aria-label="管理功能">
-        <button class="admin-nav__item is-active" data-view="overview" type="button"><span>◫</span>实时大屏</button>
-        <button class="admin-nav__item" data-view="structure" type="button"><span>⌘</span>专业与教学组</button>
-        <button class="admin-nav__item" data-view="students" type="button"><span>◎</span>学生与结果</button>
-        <button class="admin-nav__item" data-view="settings" type="button"><span>◇</span>系统设置</button>
+        <button class="admin-nav__item is-active" data-view="overview" data-mobile-label="实时大屏" type="button"><span aria-hidden="true">◫</span><b>实时大屏</b></button>
+        <button class="admin-nav__item" data-view="structure" type="button"><span aria-hidden="true">⌘</span><b>专业与教学组</b></button>
+        <button class="admin-nav__item" data-view="students" data-mobile-label="激活码查询" type="button"><span aria-hidden="true">◎</span><b>学生与结果</b></button>
+        <button class="admin-nav__item" data-view="settings" type="button"><span aria-hidden="true">◇</span><b>系统设置</b></button>
       </nav>
       <div class="admin-sidebar__footer">
         <span>安徽建筑大学 · 建筑与空间规划学院</span>
@@ -165,9 +165,13 @@
                 <span>未选</span><strong id="metric-unselected">0</strong><small>人</small>
               </article>
             </div>
-            <div class="overall-progress selection-only">
-              <div class="progress-label"><span>总体完成率</span><strong id="metric-rate">0%</strong></div>
-              <div class="progress-track"><span id="metric-rate-bar"></span></div>
+            <div class="overall-progress completion-progress selection-only">
+              <div class="completion-progress__header">
+                <div><span>总体完成率</span><strong id="metric-progress-count">0 / 0</strong><small>人已完成</small></div>
+                <strong id="metric-rate">0%</strong>
+              </div>
+              <div id="metric-rate-track" class="progress-track completion-progress__track" role="progressbar" aria-label="总体完成率" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="metric-rate-bar"></span></div>
+              <div class="completion-progress__scale" aria-hidden="true"><span>0%</span><span>50%</span><span>100%</span></div>
             </div>
             <div class="panel-title-row">
               <div>
@@ -184,7 +188,7 @@
               <input id="unselected-search" type="search" placeholder="搜索姓名 / 学号 / 专业">
             </label>
             <div id="unselected-list" class="unselected-list" aria-live="polite"></div>
-            <a id="export-unselected" class="button button--quiet button--wide" href="/api/admin/export/unselected.csv">导出未选名单</a>
+            <a id="export-unselected" class="button button--quiet button--wide" href="/api/admin/export/unselected.xlsx">导出未选名单 Excel</a>
           </section>
           <footer class="board-presentation-footer">安徽建筑大学 · 建筑与空间规划学院 制作：Mikutea</footer>
         </div>
@@ -194,7 +198,7 @@
             <div><p class="eyebrow">RECENT ACTIVITY</p><h2>最近选择记录</h2></div>
             <div class="content-card__actions">
               <span id="export-completion-callout" class="export-completion-callout is-hidden" role="status">全员已完成，可导出统一 Excel</span>
-              <a id="export-selections" class="button button--outline" href="/api/admin/export/selections.csv">导出选择记录</a>
+              <a id="export-selections" class="button button--outline" href="/api/admin/export/selections.xlsx">导出选择记录 Excel</a>
               <a id="export-complete-results" class="button button--primary" href="/api/admin/export/results.xlsx">导出本场完整结果 Excel</a>
             </div>
           </div>
@@ -225,7 +229,7 @@
             <div class="content-card__heading"><div><h3>教学组设置</h3><p id="group-count-label">0 个教学组</p><p class="entity-status-help">“停用”不会删除教学组；已有选择记录时系统会阻止停用。调整总容量时，专业配额矩阵会以各专业已选人数为下限自动重算，不会反向阻止容量设置。</p></div></div>
             <form id="add-group-form" class="inline-add-form inline-add-form--group">
               <input name="name" maxlength="80" required placeholder="例如：第七教学组">
-              <input name="capacity" type="number" min="0" max="1000" value="30" aria-label="总容量">
+              <input name="capacity" type="number" min="0" max="1000" step="1" inputmode="numeric" value="30" aria-label="总容量">
               <button class="button button--primary" type="submit">＋ 新增教学组</button>
             </form>
             <div id="group-editor" class="entity-editor"></div>
@@ -284,7 +288,7 @@
         </div>
         <section class="content-card roster-card">
           <div class="content-card__heading roster-card__heading">
-            <div><h3>本场完整学生名单</h3><p>激活码使用证件号后 6 位，仅提供“显示明文”查看并在 60 秒后自动隐藏，不提供随机生成或重置；如历史名单缺少证件号，请在关闭抢选后重新导入该生名单。</p></div>
+            <div><h3>本场完整学生名单</h3><p>激活码使用证件号后 6 位，仅提供“显示明文”查看并在 60 秒后自动隐藏，不提供随机生成或重置；若激活码无法显示，请在关闭抢选后重新导入当前规范名单。</p></div>
             <span id="student-roster-count" class="count-chip">0 人</span>
           </div>
           <label class="compact-search roster-search">
@@ -356,9 +360,16 @@
       <p class="eyebrow">CONFIRM ACTION</p>
       <h2 id="danger-dialog-title">确认操作</h2>
       <p id="danger-dialog-message"></p>
+      <section id="danger-dialog-roster" class="confirm-roster is-hidden" aria-labelledby="danger-dialog-roster-title">
+        <header class="confirm-roster__header">
+          <div><strong id="danger-dialog-roster-title">未进入候场学生</strong><small>已按专业分组，仅展示姓名</small></div>
+          <span id="danger-dialog-roster-count" class="count-chip">0 人</span>
+        </header>
+        <div id="danger-dialog-roster-groups" class="confirm-roster__groups"></div>
+      </section>
       <div class="dialog-actions">
         <button class="button button--quiet" value="cancel">取消</button>
-        <button class="button button--danger" value="confirm">确认</button>
+        <button id="danger-dialog-confirm" class="button button--danger" value="confirm">确认</button>
       </div>
     </form>
   </dialog>
