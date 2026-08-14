@@ -735,6 +735,13 @@ def create_app(config: Config | None = None) -> FastAPI:
         compact = base64.b32encode(signature).decode("ascii")[:12]
         return "-".join(compact[index : index + 4] for index in range(0, 12, 4))
 
+    def selection_receipt_verify_url(
+        token: str, settings: dict[str, Any]
+    ) -> str:
+        verify_path = "/receipt#token=" + quote(token, safe="")
+        base_url = str(settings.get("public_base_url") or config.public_base_url).rstrip("/")
+        return f"{base_url}{verify_path}" if base_url else verify_path
+
     def build_selection_receipt(
         *,
         settings: dict[str, Any],
@@ -760,14 +767,13 @@ def create_app(config: Config | None = None) -> FastAPI:
         )
         signature = receipt_signature(encoded_claims)
         token = f"v1.{encoded_claims}.{encode_receipt_segment(signature)}"
-        verify_path = "/receipt#token=" + quote(token, safe="")
         qr_path = "/api/student/receipt/qr.png"
         base_url = str(settings.get("public_base_url") or config.public_base_url).rstrip("/")
         return {
             "version": "v1",
             "token": token,
             "verification_code": receipt_verification_code(signature),
-            "verify_url": f"{base_url}{verify_path}" if base_url else verify_path,
+            "verify_url": selection_receipt_verify_url(token, settings),
             "qr_image_url": f"{base_url}{qr_path}" if base_url else qr_path,
         }
 
@@ -1660,30 +1666,33 @@ def create_app(config: Config | None = None) -> FastAPI:
         finally:
             connection.close()
 
-    @app.get("/api/student/receipt/qr.png")
-    def selection_receipt_qr(request: Request):
+    @app.post("/api/student/receipt/qr.png")
+    def selection_receipt_qr(payload: ReceiptVerify, request: Request):
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN")
-            identity = require_session_from_connection(request, "student", connection)
-            payload = student_payload_from_connection(connection, identity.subject_id)
-            receipt = payload.get("receipt")
-            if not receipt:
-                raise HTTPException(status_code=404, detail="当前没有可生成凭证的抢选记录")
+            identity = require_session_from_connection(
+                request, "student", connection, csrf=True
+            )
+            enforce_receipt_rate_limit(
+                receipt_qr_limiter,
+                f"receipt-qr-student:{identity.subject_id}",
+                limit=120,
+            )
+            claims, _ = parse_selection_receipt(payload.token)
+            if claims["student_id"] != identity.subject_id:
+                raise HTTPException(status_code=403, detail="凭证与当前学生不匹配")
+            settings = setting_dict(connection)
+            verify_url = selection_receipt_verify_url(payload.token, settings)
         finally:
             connection.close()
-        enforce_receipt_rate_limit(
-            receipt_qr_limiter,
-            f"receipt-qr-student:{identity.subject_id}",
-            limit=120,
-        )
         qr = qrcode.QRCode(
             version=None,
             error_correction=qrcode.constants.ERROR_CORRECT_Q,
             box_size=8,
             border=4,
         )
-        qr.add_data(receipt["verify_url"])
+        qr.add_data(verify_url)
         qr.make(fit=True)
         image = qr.make_image(fill_color="#241a1c", back_color="#ffffff")
         output = io.BytesIO()

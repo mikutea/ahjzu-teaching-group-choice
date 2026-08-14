@@ -9,6 +9,7 @@ import json
 
 from fastapi.testclient import TestClient
 
+import server.main as server_main
 from server.database import connect
 
 from .conftest import fictional_activation_code, fictional_document_number, open_selection_now
@@ -449,7 +450,22 @@ def test_signed_receipt_verifies_and_tampering_or_revocation_invalidates_it(
     assert client.get("/assets/receipt.js").status_code == 200
     assert client.get("/assets/receipt.css").status_code == 200
 
-    qr_image = client.get("/api/student/receipt/qr.png")
+    student_me = client.get("/api/student/me")
+    assert student_me.status_code == 200, student_me.text
+    qr_headers = {
+        "X-CSRF-Token": student_me.json()["csrf_token"],
+        "X-Activity-ID": admin_headers["X-Activity-ID"],
+    }
+    assert client.get("/api/student/receipt/qr.png").status_code == 405
+    missing_csrf = client.post(
+        "/api/student/receipt/qr.png", json={"token": receipt["token"]}
+    )
+    assert missing_csrf.status_code == 403
+    qr_image = client.post(
+        "/api/student/receipt/qr.png",
+        headers=qr_headers,
+        json={"token": receipt["token"]},
+    )
     assert qr_image.status_code == 200, qr_image.text
     assert qr_image.headers["content-type"] == "image/png"
     assert qr_image.headers["cache-control"] == "no-store"
@@ -457,8 +473,24 @@ def test_signed_receipt_verifies_and_tampering_or_revocation_invalidates_it(
     assert receipt["token"] not in str(qr_image.request.url)
     assert qr_image.request.url.path == "/api/student/receipt/qr.png"
     assert not qr_image.request.url.query
+    encoded_claims = receipt["token"].split(".")[1]
+    claims = json.loads(
+        base64.urlsafe_b64decode(encoded_claims + "=" * (-len(encoded_claims) % 4))
+    )
+    claims["student_id"] += 1
+    other_student_receipt = signed_receipt_token(
+        client.app.state.config.app_secret, claims
+    )
+    wrong_student = client.post(
+        "/api/student/receipt/qr.png",
+        headers=qr_headers,
+        json={"token": other_student_receipt},
+    )
+    assert wrong_student.status_code == 403
     with TestClient(client.app) as anonymous_client:
-        anonymous_qr = anonymous_client.get("/api/student/receipt/qr.png")
+        anonymous_qr = anonymous_client.post(
+            "/api/student/receipt/qr.png", json={"token": receipt["token"]}
+        )
     assert anonymous_qr.status_code == 401
     assert client.get("/api/public/receipts/verify").status_code == 405
 
@@ -489,6 +521,12 @@ def test_signed_receipt_verifies_and_tampering_or_revocation_invalidates_it(
 
     token = receipt["token"]
     replacement = "A" if token[-1] != "A" else "B"
+    tampered_qr = client.post(
+        "/api/student/receipt/qr.png",
+        headers=qr_headers,
+        json={"token": token[:-1] + replacement},
+    )
+    assert tampered_qr.status_code == 400
     tampered = client.post(
         "/api/public/receipts/verify", json={"token": token[:-1] + replacement}
     )
@@ -508,6 +546,72 @@ def test_signed_receipt_verifies_and_tampering_or_revocation_invalidates_it(
     assert after_revoke.status_code == 200, after_revoke.text
     assert after_revoke.json()["valid"] is False
     assert after_revoke.json()["revoked"] is True
+
+
+def test_receipt_qr_is_bound_to_rendered_token_during_revoke_reselect_race(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+):
+    selected_a, group = select_one_student(
+        client,
+        admin_headers,
+        student_no="20268000015",
+        student_name="竞态凭证学生",
+    )
+    receipt_a = selected_a["receipt"]
+    student_me = client.get("/api/student/me")
+    assert student_me.status_code == 200, student_me.text
+    student_headers = {
+        "X-CSRF-Token": student_me.json()["csrf_token"],
+        "X-Activity-ID": admin_headers["X-Activity-ID"],
+    }
+
+    revoked = client.post(
+        "/api/admin/selections/revoke",
+        headers=admin_headers,
+        json={"student_id": selected_a["student"]["id"], "reason": "构造结果卡竞态"},
+    )
+    assert revoked.status_code == 200, revoked.text
+    selected_b = client.post(
+        "/api/student/select",
+        headers=student_headers,
+        json={"group_id": group["id"]},
+    )
+    assert selected_b.status_code == 200, selected_b.text
+    receipt_b = selected_b.json()["receipt"]
+    assert receipt_b["token"] != receipt_a["token"]
+
+    encoded_values: list[str] = []
+    original_qr_code = server_main.qrcode.QRCode
+
+    class CapturingQrCode(original_qr_code):
+        def add_data(self, data, *args, **kwargs):
+            encoded_values.append(str(data))
+            return super().add_data(data, *args, **kwargs)
+
+    monkeypatch.setattr(server_main.qrcode, "QRCode", CapturingQrCode)
+    qr_image = client.post(
+        "/api/student/receipt/qr.png",
+        headers=student_headers,
+        json={"token": receipt_a["token"]},
+    )
+
+    assert qr_image.status_code == 200, qr_image.text
+    assert qr_image.headers["content-type"] == "image/png"
+    assert qr_image.content.startswith(b"\x89PNG\r\n\x1a\n")
+    assert qr_image.request.url.path == "/api/student/receipt/qr.png"
+    assert not qr_image.request.url.query
+    assert receipt_a["token"] not in str(qr_image.request.url)
+    assert encoded_values == [receipt_a["verify_url"]]
+    assert receipt_b["verify_url"] not in encoded_values
+
+    old_receipt_status = client.post(
+        "/api/public/receipts/verify", json={"token": receipt_a["token"]}
+    )
+    assert old_receipt_status.status_code == 200, old_receipt_status.text
+    assert old_receipt_status.json()["valid"] is False
+    assert old_receipt_status.json()["revoked"] is True
 
 
 def test_signed_receipt_remains_verifiable_from_integrity_checked_archive(

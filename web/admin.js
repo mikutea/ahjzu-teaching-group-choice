@@ -619,12 +619,22 @@ function startAdminPolling() {
 
 function structureEditorAutosaveBusy() {
   return adminState.entitySaveTimers.size > 0
+    || adminState.quotaSaveTimers.size > 0
     || Boolean(document.activeElement?.closest?.("#major-editor, #group-editor, #quota-matrix"))
     || Boolean(adminEls.majorEditor.querySelector('.entity-row[data-saving="true"]'))
-    || Boolean(adminEls.groupEditor.querySelector('.entity-row[data-saving="true"]'));
+    || Boolean(adminEls.groupEditor.querySelector('.entity-row[data-saving="true"]'))
+    || Boolean(adminEls.quotaMatrix.querySelector('input[data-saving="true"]'));
 }
 
-function renderDashboard(data) {
+function renderLatestStructureAfterAutosave({ forceStructure = false } = {}) {
+  if (
+    adminState.currentView === "structure"
+    && adminState.dashboard
+    && (forceStructure || !structureEditorAutosaveBusy())
+  ) renderDashboard(adminState.dashboard, { forceStructure });
+}
+
+function renderDashboard(data, { forceStructure = false } = {}) {
   synchronizeServerClock(data);
   const phase = dashboardPhase(data);
   const displayMode = boardDisplayMode(data, phase);
@@ -695,7 +705,7 @@ function renderDashboard(data) {
       ...data.groups.map((group) => [group.id, group.name, group.active, group.total_capacity, group.sort_order]),
       ...data.quotas.map((quota) => [quota.major_id, quota.group_id, quota.capacity, quota.selected_count]),
     ]);
-    if (!structureEditorAutosaveBusy() && structureFingerprint !== adminState.structureFingerprint) {
+    if ((forceStructure || !structureEditorAutosaveBusy()) && structureFingerprint !== adminState.structureFingerprint) {
       adminState.structureFingerprint = structureFingerprint;
       renderStructure(data, structureLocked);
     }
@@ -1988,14 +1998,6 @@ function entityRowHasChanges(row, { includeCapacity = true } = {}) {
     && row._capacityInput.value !== row.dataset.originalCapacity;
 }
 
-function renderLatestStructureAfterEntitySave() {
-  if (
-    adminState.currentView === "structure"
-    && adminState.dashboard
-    && !structureEditorAutosaveBusy()
-  ) renderDashboard(adminState.dashboard);
-}
-
 async function persistEntityRow(row, { refreshAfter = false, includeCapacity = false } = {}) {
   if (!row?.isConnected) return;
   const key = entityRowSaveKey(row);
@@ -2085,7 +2087,7 @@ async function persistEntityRow(row, { refreshAfter = false, includeCapacity = f
     if (queued && row.isConnected) {
       scheduleEntityRowSave(row, 0, { refreshAfter: queuedRefresh, includeCapacity: queuedCapacity });
     }
-    renderLatestStructureAfterEntitySave();
+    renderLatestStructureAfterAutosave();
   }
 }
 
@@ -2207,6 +2209,10 @@ async function persistQuotaInput(input) {
   const key = quotaInputKey(input);
   clearTimeout(adminState.quotaSaveTimers.get(key));
   adminState.quotaSaveTimers.delete(key);
+  if (input.dataset.saving === "true") {
+    input.dataset.saveQueued = "true";
+    return;
+  }
   const nextValue = Number(input.value);
   if (!Number.isInteger(nextValue) || nextValue < 0 || nextValue > 1000) {
     input.setCustomValidity("请输入 0 至 1000 的整数");
@@ -2217,20 +2223,46 @@ async function persistQuotaInput(input) {
   if (String(nextValue) === input.dataset.original) return;
   const activityId = Number(adminEls.quotaMatrix.dataset.activityId);
   const submittedValue = String(nextValue);
+  let activityCasConflict = false;
   input.dataset.saving = "true";
   input.setAttribute("aria-busy", "true");
   try {
     await adminApi(`/api/admin/quotas/${input.dataset.majorId}/${input.dataset.groupId}`, { method: "PUT", body: JSON.stringify({ capacity: nextValue }), activityId });
     input.dataset.original = submittedValue;
-    delete input.dataset.pending;
-    input.title = "";
+    if (input.value === submittedValue) {
+      delete input.dataset.pending;
+      input.title = "";
+    } else {
+      input.dataset.pending = "true";
+      input.title = "按回车或离开输入框保存配额";
+    }
     showAdminToast("配额已保存", "success");
+    await loadDashboard({ quiet: true, afterMutation: true });
   } catch (error) {
-    if (input.value === submittedValue) input.value = input.dataset.original;
+    activityCasConflict = error.status === 409 && error.message.includes("当前活动已经变化");
+    if (activityCasConflict) {
+      for (const timer of adminState.quotaSaveTimers.values()) clearTimeout(timer);
+      adminState.quotaSaveTimers.clear();
+      delete input.dataset.saveQueued;
+      input.value = input.dataset.original;
+      delete input.dataset.pending;
+      input.title = "";
+    } else if (input.value === submittedValue) {
+      input.value = input.dataset.original;
+      delete input.dataset.pending;
+      input.title = "";
+    }
     showAdminToast(error.message, "error");
+    if (activityCasConflict) await loadDashboard({ quiet: true, afterMutation: true });
   } finally {
+    const queued = !activityCasConflict
+      && input.dataset.saveQueued === "true"
+      && input.value !== input.dataset.original;
+    delete input.dataset.saveQueued;
     delete input.dataset.saving;
     input.removeAttribute("aria-busy");
+    if (queued && input.isConnected) scheduleQuotaSave(input, 0);
+    renderLatestStructureAfterAutosave({ forceStructure: activityCasConflict });
   }
 }
 
