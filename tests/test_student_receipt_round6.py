@@ -45,7 +45,7 @@ def test_student_result_receipt_is_mobile_portrait_and_never_contains_login_secr
     assert "receipt.verify_url" in card_source
     assert "receipt?.qr_image_url" in javascript
     assert "url.origin === window.location.origin" in javascript
-    assert 'typeof verificationQr.close === "function"' in card_source
+    assert 'typeof currentQr.close === "function"' in card_source
     assert "扫码可核对服务端原始记录" in card_source
     assert "在线核验暂不可用" in card_source
     assert 'context.fillText("核"' not in card_source
@@ -290,6 +290,207 @@ const document = {
 """
     completed = subprocess.run(
         ["node", "-e", "\n".join((qr_loader_source, result_flow_source, harness))],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+def test_result_card_always_releases_decoded_qr_bitmap_exactly_once() -> None:
+    javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
+    card_source = "async function createResultCardBlob" + javascript.split(
+        "async function createResultCardBlob", 1
+    )[1].split("function resultCardPreviewKey", 1)[0]
+
+    harness = r"""
+const assert = require("node:assert/strict");
+
+const payload = {
+  settings: { activity_id: 9, activity_title: "测试活动" },
+  student: { student_no: "20268000008", name: "凭证学生", major_name: "城乡规划" },
+  selection: { group_id: 3, group_name: "第三教学组", selected_at: "2026-08-14T12:00:00Z" },
+  receipt: {
+    token: "v1.signed.receipt-token",
+    verification_code: "ABC-DEF-GHI",
+    verify_url: "https://class.example/receipt#token=signed",
+    qr_image_url: "https://class.example/api/student/receipt/qr.png",
+  },
+};
+
+let scenario = null;
+let bitmapSequence = 0;
+function bitmap(label = `bitmap-${++bitmapSequence}`) {
+  return {
+    label,
+    closeCalls: 0,
+    drawCalls: 0,
+    close() { this.closeCalls += 1; },
+  };
+}
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolveValue, rejectValue) => {
+    resolve = resolveValue;
+    reject = rejectValue;
+  });
+  return { promise, resolve, reject };
+}
+async function pollUntil(predicate) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail("timed out waiting for decoded bitmap cleanup");
+}
+
+function drawingContext() {
+  const context = {
+    createLinearGradient() { return { addColorStop() {} }; },
+    measureText(value) { return { width: String(value).length * 10 }; },
+    drawImage(image) {
+      if (image && typeof image.drawCalls === "number") image.drawCalls += 1;
+      if (scenario.qrDrawFails && image?.label?.startsWith("qr-draw-failure")) {
+        throw new Error("QR drawing failed");
+      }
+    },
+  };
+  return new Proxy(context, {
+    get(target, property) {
+      if (property in target) return target[property];
+      return () => {};
+    },
+    set(target, property, value) {
+      target[property] = value;
+      return true;
+    },
+  });
+}
+
+const document = {
+  fonts: { ready: Promise.resolve() },
+  createElement(tag) {
+    assert.equal(tag, "canvas");
+    return {
+      width: 0,
+      height: 0,
+      getContext() {
+        if (scenario.contextMissing) return null;
+        const context = drawingContext();
+        if (scenario.drawFails) {
+          context.fillRect = () => { throw new Error("drawing failed"); };
+        }
+        return context;
+      },
+    };
+  },
+};
+function roundedRectangle() {}
+function drawWrappedCardText(_context, _value, _x, y) {
+  return { fontSize: 20, lineCount: 1, bottom: y + 32 };
+}
+function drawFittedCardText() {}
+function formatStudentTime(value) { return value; }
+function loadResultCardLogo() { return scenario.logoPromise; }
+function loadResultCardVerificationQr() { return scenario.qrPromise; }
+async function resultCardBlob() {
+  if (scenario.blobFails) throw new Error("blob failed");
+  return { type: "image/png" };
+}
+
+async function rejectsWithBitmapReleased(nextScenario, expectedError, qr) {
+  scenario = nextScenario;
+  await assert.rejects(createResultCardBlob(payload), expectedError);
+  await pollUntil(() => qr.closeCalls === 1);
+  assert.equal(qr.closeCalls, 1, `${qr.label} must be closed exactly once`);
+}
+
+(async () => {
+  const decodedBeforeLogoFailure = bitmap("decoded-before-logo-failure");
+  const delayedLogo = deferred();
+  scenario = {
+    logoPromise: delayedLogo.promise,
+    qrPromise: Promise.resolve(decodedBeforeLogoFailure),
+  };
+  const firstAttempt = createResultCardBlob(payload);
+  await new Promise((resolve) => setImmediate(resolve));
+  delayedLogo.reject(new Error("logo failed"));
+  await assert.rejects(firstAttempt, /logo failed/);
+  await pollUntil(() => decodedBeforeLogoFailure.closeCalls === 1);
+  assert.equal(decodedBeforeLogoFailure.closeCalls, 1);
+
+  const decodedAfterLogoFailure = bitmap("decoded-after-logo-failure");
+  const delayedQr = deferred();
+  scenario = {
+    logoPromise: Promise.reject(new Error("logo failed early")),
+    qrPromise: delayedQr.promise,
+  };
+  const secondAttempt = createResultCardBlob(payload);
+  await assert.rejects(secondAttempt, /logo failed early/);
+  delayedQr.resolve(decodedAfterLogoFailure);
+  await pollUntil(() => decodedAfterLogoFailure.closeCalls === 1);
+  assert.equal(decodedAfterLogoFailure.closeCalls, 1);
+
+  const missingContextQr = bitmap("missing-context");
+  await rejectsWithBitmapReleased({
+    logoPromise: Promise.resolve({ kind: "logo" }),
+    qrPromise: Promise.resolve(missingContextQr),
+    contextMissing: true,
+  }, /无法创建抢选结果凭证/, missingContextQr);
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const drawingFailureQr = bitmap(`drawing-failure-${attempt}`);
+    await rejectsWithBitmapReleased({
+      logoPromise: Promise.resolve({ kind: "logo" }),
+      qrPromise: Promise.resolve(drawingFailureQr),
+      drawFails: true,
+    }, /drawing failed/, drawingFailureQr);
+    assert.equal(drawingFailureQr.drawCalls, 0, "failed pre-QR drawing must not draw the QR");
+  }
+
+  const blobFailureQr = bitmap("blob-failure");
+  await rejectsWithBitmapReleased({
+    logoPromise: Promise.resolve({ kind: "logo" }),
+    qrPromise: Promise.resolve(blobFailureQr),
+    blobFails: true,
+  }, /blob failed/, blobFailureQr);
+  assert.equal(blobFailureQr.drawCalls, 1, "Blob failure still follows the normal QR draw path");
+
+  const qrDrawFailure = bitmap("qr-draw-failure");
+  await rejectsWithBitmapReleased({
+    logoPromise: Promise.resolve({ kind: "logo" }),
+    qrPromise: Promise.resolve(qrDrawFailure),
+    qrDrawFails: true,
+  }, /QR drawing failed/, qrDrawFailure);
+  assert.equal(qrDrawFailure.drawCalls, 1, "QR draw failure must not cause a second draw");
+
+  const normalQr = bitmap("normal");
+  scenario = {
+    logoPromise: Promise.resolve({ kind: "logo" }),
+    qrPromise: Promise.resolve(normalQr),
+  };
+  const blob = await createResultCardBlob(payload);
+  assert.equal(blob.type, "image/png");
+  assert.equal(normalQr.drawCalls, 1, "normal generation must draw the QR once");
+  assert.equal(normalQr.closeCalls, 1, "normal generation must close the QR exactly once");
+
+  const htmlImage = { kind: "html-image", drawCalls: 0 };
+  scenario = {
+    logoPromise: Promise.resolve({ kind: "logo" }),
+    qrPromise: Promise.resolve(htmlImage),
+  };
+  await createResultCardBlob(payload);
+  assert.equal(htmlImage.drawCalls, 1, "HTMLImage fallback must still be drawn");
+  assert.equal("close" in htmlImage, false, "HTMLImage fallback must not require close()");
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+    completed = subprocess.run(
+        ["node", "-e", "\n".join((card_source, harness))],
         cwd=ROOT,
         capture_output=True,
         check=False,
