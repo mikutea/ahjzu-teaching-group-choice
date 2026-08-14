@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+from dataclasses import replace
 import hashlib
 import hmac
 import io
@@ -12,7 +13,12 @@ from fastapi.testclient import TestClient
 import server.main as server_main
 from server.database import connect
 
-from .conftest import fictional_activation_code, fictional_document_number, open_selection_now
+from .conftest import (
+    TEST_ADMIN_PASSWORD,
+    fictional_activation_code,
+    fictional_document_number,
+    open_selection_now,
+)
 
 
 def signed_receipt_token(secret: str, claims: dict[str, object]) -> str:
@@ -546,6 +552,113 @@ def test_signed_receipt_verifies_and_tampering_or_revocation_invalidates_it(
     assert after_revoke.status_code == 200, after_revoke.text
     assert after_revoke.json()["valid"] is False
     assert after_revoke.json()["revoked"] is True
+
+
+def test_receipt_generation_and_qr_require_a_trusted_absolute_public_origin(
+    app_config,
+    tmp_path,
+):
+    isolated_config = replace(
+        app_config,
+        database_path=tmp_path / "receipt-origin.db",
+        public_base_url="",
+    )
+    isolated_app = server_main.create_app(isolated_config)
+
+    with TestClient(isolated_app, base_url="http://request-host.invalid") as isolated:
+        login = isolated.post(
+            "/api/admin/login",
+            json={"username": "admin", "password": TEST_ADMIN_PASSWORD},
+        )
+        assert login.status_code == 200, login.text
+        dashboard = isolated.get("/api/admin/dashboard").json()
+        activity_id = int(dashboard["settings"]["activity_id"])
+        admin_headers = {
+            "X-CSRF-Token": login.json()["csrf_token"],
+            "X-Activity-ID": str(activity_id),
+        }
+        assert dashboard["readiness"]["ready"] is False
+        assert "尚未设置学生端访问地址" in dashboard["readiness"]["blockers"]
+
+        major = dashboard["majors"][0]
+        group = dashboard["groups"][0]
+        student_no = "20268000022"
+        student_name = "缺少站点地址学生"
+        imported = import_rosters(
+            isolated,
+            admin_headers,
+            [
+                (
+                    "missing-origin.csv",
+                    [
+                        (
+                            student_no,
+                            student_name,
+                            major["name"],
+                            fictional_document_number("missing-receipt-origin"),
+                        )
+                    ],
+                )
+            ],
+        )
+        assert imported.status_code == 200, imported.text
+        quota = isolated.put(
+            f"/api/admin/quotas/{major['id']}/{group['id']}",
+            headers=admin_headers,
+            json={"capacity": 1},
+        )
+        assert quota.status_code == 200, quota.text
+
+        student_login = isolated.post(
+            "/api/student/login",
+            json={
+                "student_no": student_no,
+                "name": student_name,
+                "activation_code": fictional_activation_code(
+                    "missing-receipt-origin"
+                ),
+            },
+        )
+        assert student_login.status_code == 200, student_login.text
+        student = student_login.json()["student"]
+        student_headers = {
+            "X-CSRF-Token": student_login.json()["csrf_token"],
+            "X-Activity-ID": str(activity_id),
+            "Host": "attacker-controlled.invalid",
+            "X-Forwarded-Host": "also-attacker-controlled.invalid",
+        }
+        receipt_token = signed_receipt_token(
+            isolated_config.app_secret,
+            {
+                "activity_id": activity_id,
+                "selection_id": 1,
+                "student_id": int(student["id"]),
+                "group_id": int(group["id"]),
+                "selected_at": "2026-08-14T00:00:00+00:00",
+            },
+        )
+
+        qr = isolated.post(
+            "/api/student/receipt/qr.png",
+            headers=student_headers,
+            json={"token": receipt_token},
+        )
+        assert qr.status_code == 409, qr.text
+        assert qr.json()["detail"] == "请先在系统设置中填写学生端访问地址"
+
+        assigned = isolated.post(
+            "/api/admin/selections",
+            headers=admin_headers,
+            json={"student_id": student["id"], "group_id": group["id"]},
+        )
+        assert assigned.status_code == 409, assigned.text
+        assert assigned.json()["detail"] == "请先在系统设置中填写学生端访问地址"
+
+        connection = connect(isolated_config.database_path)
+        try:
+            assert connection.execute("SELECT COUNT(*) FROM selections").fetchone()[0] == 0
+        finally:
+            connection.close()
 
 
 def test_receipt_qr_is_bound_to_rendered_token_during_revoke_reselect_race(

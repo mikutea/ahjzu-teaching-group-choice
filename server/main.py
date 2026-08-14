@@ -735,12 +735,24 @@ def create_app(config: Config | None = None) -> FastAPI:
         compact = base64.b32encode(signature).decode("ascii")[:12]
         return "-".join(compact[index : index + 4] for index in range(0, 12, 4))
 
+    def selection_receipt_public_origin(settings: dict[str, Any]) -> str:
+        configured_origin = settings.get("public_base_url") or config.public_base_url
+        try:
+            public_origin = normalize_public_base_url(str(configured_origin or ""))
+        except ValueError:
+            public_origin = ""
+        if not public_origin:
+            raise HTTPException(
+                status_code=409,
+                detail="请先在系统设置中填写学生端访问地址",
+            )
+        return public_origin
+
     def selection_receipt_verify_url(
         token: str, settings: dict[str, Any]
     ) -> str:
         verify_path = "/receipt#token=" + quote(token, safe="")
-        base_url = str(settings.get("public_base_url") or config.public_base_url).rstrip("/")
-        return f"{base_url}{verify_path}" if base_url else verify_path
+        return f"{selection_receipt_public_origin(settings)}{verify_path}"
 
     def build_selection_receipt(
         *,
@@ -768,13 +780,13 @@ def create_app(config: Config | None = None) -> FastAPI:
         signature = receipt_signature(encoded_claims)
         token = f"v1.{encoded_claims}.{encode_receipt_segment(signature)}"
         qr_path = "/api/student/receipt/qr.png"
-        base_url = str(settings.get("public_base_url") or config.public_base_url).rstrip("/")
+        base_url = selection_receipt_public_origin(settings)
         return {
             "version": "v1",
             "token": token,
             "verification_code": receipt_verification_code(signature),
             "verify_url": selection_receipt_verify_url(token, settings),
-            "qr_image_url": f"{base_url}{qr_path}" if base_url else qr_path,
+            "qr_image_url": f"{base_url}{qr_path}",
         }
 
     def parse_selection_receipt(token: str) -> tuple[dict[str, Any], str]:
