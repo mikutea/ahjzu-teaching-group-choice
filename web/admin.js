@@ -8,12 +8,15 @@ const adminState = {
   messageTimer: null,
   loading: false,
   boardPageTimer: null,
+  lastBoardPageAt: 0,
   boardPages: { groups: 0, students: 0 },
   rosterScrollFrame: null,
   rosterScrollLastTime: 0,
   rosterFingerprint: "",
   rosterLoopSetupFrame: null,
   liveFeedFingerprint: "",
+  groupProgressFingerprint: "",
+  structureFingerprint: "",
   liveFeedScrollFrame: null,
   liveFeedScrollLastTime: 0,
   liveFeedLoopSetupFrame: null,
@@ -21,10 +24,18 @@ const adminState = {
   activationHideTimers: new Map(),
   phaseActionPending: false,
   serverClockOffset: 0,
+  serverClockSynchronized: false,
+  dashboardClockSample: null,
+  statusSyncLoading: false,
   recentRenderedAt: 0,
   lastActivityId: null,
   connectionInterrupted: false,
   lastBackgroundErrorAt: 0,
+  countdownFrame: null,
+  countdownTargetMs: null,
+  countdownLastSecond: null,
+  countdownFinishedTarget: null,
+  quotaSaveTimers: new Map(),
 };
 
 const adminEls = {
@@ -48,6 +59,8 @@ const adminEls = {
   waitingRateBar: document.querySelector("#waiting-rate-bar"),
   rate: document.querySelector("#metric-rate"),
   rateBar: document.querySelector("#metric-rate-bar"),
+  rateTrack: document.querySelector("#metric-rate-track"),
+  rateCount: document.querySelector("#metric-progress-count"),
   groupProgress: document.querySelector("#group-progress"),
   groupProgressPage: document.querySelector("#group-progress-page"),
   liveSelectionFeed: document.querySelector("#live-selection-feed"),
@@ -102,6 +115,11 @@ const adminEls = {
   exportUnselected: document.querySelector("#export-unselected"),
   toast: document.querySelector("#admin-toast"),
   dangerDialog: document.querySelector("#danger-dialog"),
+  dangerDialogMessage: document.querySelector("#danger-dialog-message"),
+  dangerDialogRoster: document.querySelector("#danger-dialog-roster"),
+  dangerDialogRosterCount: document.querySelector("#danger-dialog-roster-count"),
+  dangerDialogRosterGroups: document.querySelector("#danger-dialog-roster-groups"),
+  dangerDialogConfirm: document.querySelector("#danger-dialog-confirm"),
 };
 
 async function adminApi(path, options = {}) {
@@ -179,14 +197,56 @@ function createCell(text, className = "") {
   return cell;
 }
 
-function confirmDanger(title, message) {
+function renderConfirmationRoster(students = []) {
+  adminEls.dangerDialogRoster.classList.toggle("is-hidden", students.length === 0);
+  adminEls.dangerDialog.classList.toggle("confirm-dialog--roster", students.length > 0);
+  adminEls.dangerDialogConfirm.textContent = students.length > 0 ? "仍然开始倒计时" : "确认";
+  adminEls.dangerDialogRosterCount.textContent = `${students.length} 人`;
+  if (!students.length) {
+    adminEls.dangerDialogRosterGroups.replaceChildren();
+    return;
+  }
+  const grouped = new Map();
+  for (const student of students) {
+    const majorName = String(student.major_name || "未注明专业").trim() || "未注明专业";
+    if (!grouped.has(majorName)) grouped.set(majorName, []);
+    grouped.get(majorName).push(String(student.name || "姓名待同步"));
+  }
+  const sections = [...grouped.entries()]
+    .sort(([left], [right]) => left.localeCompare(right, "zh-CN"))
+    .map(([majorName, names]) => {
+      const section = document.createElement("section");
+      section.className = "confirm-roster__group";
+      const heading = document.createElement("div");
+      heading.className = "confirm-roster__group-heading";
+      const title = document.createElement("strong");
+      title.textContent = majorName;
+      const count = document.createElement("span");
+      count.textContent = `${names.length} 人`;
+      heading.append(title, count);
+      const grid = document.createElement("div");
+      grid.className = "confirm-roster__name-grid";
+      const sortedNames = names.sort((left, right) => left.localeCompare(right, "zh-CN"));
+      grid.append(...sortedNames.map((name) => {
+        const item = document.createElement("span");
+        item.textContent = name;
+        return item;
+      }));
+      section.append(heading, grid);
+      return section;
+    });
+  adminEls.dangerDialogRosterGroups.replaceChildren(...sections);
+}
+
+function confirmDanger(title, message, { roster = [] } = {}) {
   const originalParent = adminEls.dangerDialog.parentElement;
   const fullscreenHost = document.fullscreenElement;
   if (fullscreenHost && !fullscreenHost.contains(adminEls.dangerDialog)) {
     fullscreenHost.append(adminEls.dangerDialog);
   }
   document.querySelector("#danger-dialog-title").textContent = title;
-  document.querySelector("#danger-dialog-message").textContent = message;
+  adminEls.dangerDialogMessage.textContent = message;
+  renderConfirmationRoster(roster);
   adminEls.dangerDialog.returnValue = "";
   try {
     adminEls.dangerDialog.showModal();
@@ -202,6 +262,7 @@ function confirmDanger(title, message) {
       if (originalParent && adminEls.dangerDialog.parentElement !== originalParent) {
         originalParent.append(adminEls.dangerDialog);
       }
+      renderConfirmationRoster([]);
       resolve(confirmed);
     }, { once: true });
   });
@@ -210,21 +271,29 @@ function confirmDanger(title, message) {
 function showAdminApp() {
   adminEls.loginView.classList.add("is-hidden");
   adminEls.app.classList.remove("is-hidden");
+  document.body.classList.add("admin-authenticated");
 }
 
 function showAdminLogin() {
   adminEls.app.classList.add("is-hidden");
   adminEls.loginView.classList.remove("is-hidden");
+  document.body.classList.remove("admin-authenticated");
   clearInterval(adminState.pollTimer);
   clearInterval(adminState.boardPageTimer);
-  for (const timer of adminState.activationHideTimers.values()) clearTimeout(timer);
-  adminState.activationHideTimers.clear();
-  adminState.revealedActivationCodes.clear();
-  scrubRevealedActivationCodeDom();
+  clearAllRevealedActivationCodes();
   stopRosterAutoScroll();
   stopLiveFeedAutoScroll();
+  stopCountdownTicker();
+  for (const timer of adminState.quotaSaveTimers.values()) clearTimeout(timer);
+  adminState.quotaSaveTimers.clear();
+  adminState.serverClockOffset = 0;
+  adminState.serverClockSynchronized = false;
+  adminState.dashboardClockSample = null;
+  adminState.statusSyncLoading = false;
   adminState.rosterFingerprint = "";
   adminState.liveFeedFingerprint = "";
+  adminState.groupProgressFingerprint = "";
+  adminState.structureFingerprint = "";
 }
 
 function dashboardField(data, key) {
@@ -234,7 +303,18 @@ function dashboardField(data, key) {
 function synchronizeServerClock(data) {
   const serverNow = dashboardField(data, "server_now");
   const parsed = Date.parse(serverNow || "");
-  if (Number.isFinite(parsed)) adminState.serverClockOffset = parsed - Date.now();
+  if (!Number.isFinite(parsed)) return;
+  const sample = adminState.dashboardClockSample;
+  const clientReference = sample
+    ? (sample.requestStartedAt + sample.responseReceivedAt) / 2
+    : Date.now();
+  const sampledOffset = parsed - clientReference;
+  if (!adminState.serverClockSynchronized || Math.abs(sampledOffset - adminState.serverClockOffset) > 10_000) {
+    adminState.serverClockOffset = sampledOffset;
+    adminState.serverClockSynchronized = true;
+    return;
+  }
+  adminState.serverClockOffset = (adminState.serverClockOffset * 0.75) + (sampledOffset * 0.25);
 }
 
 function millisecondsUntilSelection(data = adminState.dashboard) {
@@ -242,6 +322,67 @@ function millisecondsUntilSelection(data = adminState.dashboard) {
   const target = Date.parse(opensAt || "");
   if (!Number.isFinite(target)) return null;
   return target - (Date.now() + adminState.serverClockOffset);
+}
+
+function serverSynchronizedDate() {
+  return new Date(Date.now() + adminState.serverClockOffset);
+}
+
+function renderBoardClock() {
+  adminEls.boardClock.textContent = serverSynchronizedDate().toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function stopCountdownTicker({ preserveTarget = false } = {}) {
+  if (adminState.countdownFrame) cancelAnimationFrame(adminState.countdownFrame);
+  adminState.countdownFrame = null;
+  adminState.countdownLastSecond = null;
+  if (!preserveTarget) adminState.countdownTargetMs = null;
+}
+
+function setCountdownNumber(seconds) {
+  if (adminState.countdownLastSecond === seconds) return;
+  adminState.countdownLastSecond = seconds;
+  const countdownElements = [adminEls.boardCountdown, adminEls.boardOverlayCountdown];
+  for (const element of countdownElements) {
+    element.textContent = String(seconds);
+    element.classList.remove("is-ticking");
+  }
+  void adminEls.boardOverlayCountdown.offsetWidth;
+  for (const element of countdownElements) element.classList.add("is-ticking");
+  adminEls.statusButton.textContent = `倒计时 ${seconds} 秒`;
+  adminEls.boardStart.textContent = `倒计时 ${seconds} 秒`;
+}
+
+function startCountdownTicker(data) {
+  const targetMs = Date.parse(dashboardField(data, "selection_opens_at") || "");
+  if (!Number.isFinite(targetMs)) {
+    setCountdownNumber(10);
+    return;
+  }
+  if (adminState.countdownTargetMs === targetMs && adminState.countdownFrame) return;
+  stopCountdownTicker({ preserveTarget: true });
+  adminState.countdownTargetMs = targetMs;
+  adminState.countdownFinishedTarget = null;
+  const tick = () => {
+    const remainingMs = targetMs - serverSynchronizedDate().getTime();
+    const remainingSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
+    setCountdownNumber(remainingSeconds);
+    if (remainingMs <= 0) {
+      adminState.countdownFrame = null;
+      if (adminState.countdownFinishedTarget !== targetMs) {
+        adminState.countdownFinishedTarget = targetMs;
+        requestAnimationFrame(() => {
+          if (adminState.dashboard && dashboardPhase(adminState.dashboard) !== "countdown") {
+            if (adminState.currentView === "overview") renderDashboard(adminState.dashboard);
+            else renderDashboardPhaseStatus(adminState.dashboard);
+          }
+        });
+      }
+      return;
+    }
+    adminState.countdownFrame = requestAnimationFrame(tick);
+  };
+  tick();
 }
 
 function dashboardPhase(data = adminState.dashboard) {
@@ -321,7 +462,9 @@ async function loadDashboard({ quiet = false } = {}) {
   if (adminState.loading) return;
   adminState.loading = true;
   try {
+    const requestStartedAt = Date.now();
     const dashboard = await adminApi("/api/admin/dashboard");
+    adminState.dashboardClockSample = { requestStartedAt, responseReceivedAt: Date.now() };
     adminState.dashboard = dashboard;
     renderDashboard(dashboard);
     adminEls.lastRefresh.textContent = `刷新于 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
@@ -345,19 +488,91 @@ async function loadDashboard({ quiet = false } = {}) {
   }
 }
 
+function mergeDashboardStatusSnapshot(snapshot) {
+  if (!adminState.dashboard?.settings) return null;
+  const cachedActivityId = Number(adminState.dashboard.settings.activity_id);
+  const snapshotActivityId = Number(snapshot.activity_id);
+  if (
+    Number.isFinite(cachedActivityId)
+    && Number.isFinite(snapshotActivityId)
+    && cachedActivityId !== snapshotActivityId
+  ) {
+    clearAllRevealedActivationCodes();
+    adminEls.statusBadge.className = "status-badge status-badge--closed";
+    adminEls.statusBadge.textContent = "活动已切换";
+    adminEls.statusButton.textContent = "请返回大屏刷新";
+    adminEls.statusButton.disabled = true;
+    adminEls.statusButton.title = "另一管理端已切换当前活动，请返回实时大屏完成同步";
+    return null;
+  }
+  const settings = {
+    ...adminState.dashboard.settings,
+    status: snapshot.status ?? adminState.dashboard.settings.status,
+    phase: snapshot.phase ?? adminState.dashboard.settings.phase,
+    server_now: snapshot.server_now ?? adminState.dashboard.settings.server_now,
+    selection_opens_at: snapshot.selection_opens_at ?? adminState.dashboard.settings.selection_opens_at,
+    student_login_allowed: snapshot.student_login_allowed ?? adminState.dashboard.settings.student_login_allowed,
+    status_message: snapshot.status_message ?? adminState.dashboard.settings.status_message,
+  };
+  return {
+    ...adminState.dashboard,
+    status: snapshot.status ?? adminState.dashboard.status,
+    phase: snapshot.phase ?? adminState.dashboard.phase,
+    server_now: snapshot.server_now ?? adminState.dashboard.server_now,
+    selection_opens_at: snapshot.selection_opens_at ?? adminState.dashboard.selection_opens_at,
+    settings,
+  };
+}
+
+async function loadDashboardStatusSnapshot({ quiet = false } = {}) {
+  if (adminState.statusSyncLoading || adminState.loading || !adminState.dashboard) return;
+  adminState.statusSyncLoading = true;
+  try {
+    const requestStartedAt = Date.now();
+    const snapshot = await adminApi("/api/public/status");
+    adminState.dashboardClockSample = { requestStartedAt, responseReceivedAt: Date.now() };
+    synchronizeServerClock(snapshot);
+    if (!adminState.csrf || document.hidden || adminState.currentView !== "students" || !mobileAdminQuery.matches) return;
+    const mergedDashboard = mergeDashboardStatusSnapshot(snapshot);
+    if (!mergedDashboard) return;
+    adminState.dashboard = mergedDashboard;
+    renderDashboardPhaseStatus(mergedDashboard);
+    adminEls.lastRefresh.textContent = `状态同步于 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
+    if (adminState.connectionInterrupted) {
+      adminState.connectionInterrupted = false;
+      showAdminToast("管理端状态同步已恢复", "success");
+    }
+  } catch (error) {
+    if (!quiet) {
+      showAdminToast(error.message, "error");
+    } else if (!adminState.connectionInterrupted || Date.now() - adminState.lastBackgroundErrorAt >= 10_000) {
+      adminState.connectionInterrupted = true;
+      adminState.lastBackgroundErrorAt = Date.now();
+      showAdminToast(error.status === 0 ? "抢选状态网络同步中断，系统会自动重试" : `${error.message}；系统会自动重试`, "error");
+    }
+  } finally {
+    adminState.statusSyncLoading = false;
+  }
+}
+
 function startAdminPolling() {
   clearInterval(adminState.pollTimer);
   adminState.pollTimer = setInterval(() => {
-    if (adminState.currentView === "overview" && !document.hidden) loadDashboard({ quiet: true });
+    if (document.hidden) return;
+    if (adminState.currentView === "overview") loadDashboard({ quiet: true });
+    else if (adminState.currentView === "students" && mobileAdminQuery.matches) loadDashboardStatusSnapshot({ quiet: true });
   }, 1000);
   clearInterval(adminState.boardPageTimer);
+  adminState.lastBoardPageAt = performance.now();
   adminState.boardPageTimer = setInterval(() => {
-    adminEls.boardClock.textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    renderBoardClock();
     if (adminState.currentView !== "overview" || document.hidden || !adminState.dashboard) return;
+    if (performance.now() - adminState.lastBoardPageAt < 5000) return;
+    adminState.lastBoardPageAt = performance.now();
     adminState.boardPages.groups += 1;
     renderGroupProgress(adminState.dashboard.groups || []);
-  }, 5000);
-  adminEls.boardClock.textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  }, 1000);
+  renderBoardClock();
 }
 
 function renderDashboard(data) {
@@ -368,20 +583,19 @@ function renderDashboard(data) {
   const presence = normalizedPresence(data);
   const activityId = Number(data.settings.activity_id);
   if (adminState.lastActivityId !== null && adminState.lastActivityId !== activityId) {
-    for (const timer of adminState.activationHideTimers.values()) clearTimeout(timer);
-    adminState.activationHideTimers.clear();
-    adminState.revealedActivationCodes.clear();
-    scrubRevealedActivationCodeDom();
+    clearAllRevealedActivationCodes();
     stopRosterAutoScroll();
     stopLiveFeedAutoScroll();
     adminState.rosterFingerprint = "";
     adminState.liveFeedFingerprint = "";
+    adminState.groupProgressFingerprint = "";
+    adminState.structureFingerprint = "";
   }
   adminState.lastActivityId = activityId;
   const rate = data.totals.students ? Math.round((data.totals.selected / data.totals.students) * 100) : 0;
   adminEls.title.textContent = data.settings.activity_title;
   adminEls.boardActivityTitle.textContent = data.settings.activity_title;
-  adminEls.boardClock.textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  renderBoardClock();
   document.title = `${data.settings.activity_title} · 管理端`;
   adminEls.selected.textContent = String(data.totals.selected);
   adminEls.unselected.textContent = String(data.totals.unselected);
@@ -391,13 +605,12 @@ function renderDashboard(data) {
   adminEls.waitingRate.textContent = `${waitingRate}%`;
   adminEls.waitingRateBar.style.width = `${waitingRate}%`;
   adminEls.rate.textContent = `${rate}%`;
+  adminEls.rateCount.textContent = `${data.totals.selected} / ${data.totals.students}`;
   adminEls.rateBar.style.width = `${rate}%`;
-  const badgeLabels = { waiting: "候场中", countdown: "倒计时", open: "进行中", closed: "已关闭" };
-  adminEls.boardHeaderPhase.textContent = badgeLabels[phase];
-  adminEls.statusBadge.className = `status-badge status-badge--${phase === "open" ? "open" : phase === "countdown" ? "countdown" : "closed"}`;
-  adminEls.statusBadge.textContent = badgeLabels[phase];
+  adminEls.rateTrack.setAttribute("aria-valuenow", String(rate));
+  adminEls.rateTrack.setAttribute("aria-valuetext", `已完成 ${data.totals.selected} 人，共 ${data.totals.students} 人，完成率 ${rate}%`);
   renderReadiness(data.readiness, structureLocked);
-  renderBoardStage(data, phase, presence);
+  renderDashboardPhaseStatus(data, phase, presence);
   liveBoard.dataset.displayMode = displayMode;
   liveBoard.classList.toggle("phase-waiting", displayMode === "waiting");
   liveBoard.classList.toggle("phase-selection", displayMode === "selection");
@@ -406,13 +619,13 @@ function renderDashboard(data) {
   adminEls.boardRosterHeading.textContent = displayMode === "waiting" ? "候场学生情况" : "当前抢选进度";
 
   const activityQuery = `activity_id=${encodeURIComponent(data.settings.activity_id)}`;
-  adminEls.exportSelections.href = `/api/admin/export/selections.csv?${activityQuery}`;
+  adminEls.exportSelections.href = `/api/admin/export/selections.xlsx?${activityQuery}`;
   adminEls.exportCompleteResults.href = `/api/admin/export/results.xlsx?${activityQuery}`;
   const complete = Number(data.totals.students) > 0 && Number(data.totals.unselected) === 0;
   adminEls.exportCompleteResults.classList.toggle("is-complete", complete);
   adminEls.exportCompleteResults.textContent = complete ? "全部完成 · 导出本场完整结果 Excel" : "导出本场完整结果 Excel";
   adminEls.exportCompletionCallout.classList.toggle("is-hidden", !complete);
-  adminEls.exportUnselected.href = `/api/admin/export/unselected.csv?${activityQuery}`;
+  adminEls.exportUnselected.href = `/api/admin/export/unselected.xlsx?${activityQuery}`;
   if (adminState.currentView === "overview") {
     renderGroupProgress(data.groups);
     renderLiveSelectionFeed(data.recent_selections || []);
@@ -424,7 +637,17 @@ function renderDashboard(data) {
       adminState.recentRenderedAt = Date.now();
     }
   } else if (adminState.currentView === "structure") {
-    renderStructure(data, structureLocked);
+    const structureFingerprint = JSON.stringify([
+      structureLocked,
+      ...data.majors.map((major) => [major.id, major.name, major.active, major.sort_order]),
+      ...data.groups.map((group) => [group.id, group.name, group.active, group.total_capacity, group.sort_order]),
+      ...data.quotas.map((quota) => [quota.major_id, quota.group_id, quota.capacity, quota.selected_count]),
+    ]);
+    const structureEditorHasFocus = Boolean(document.activeElement?.closest?.("#view-structure"));
+    if (!structureEditorHasFocus && structureFingerprint !== adminState.structureFingerprint) {
+      adminState.structureFingerprint = structureFingerprint;
+      renderStructure(data, structureLocked);
+    }
   } else if (adminState.currentView === "students") {
     renderAssignmentTable(data);
     adminEls.assignmentBody.dataset.activityId = String(data.settings.activity_id);
@@ -436,10 +659,18 @@ function renderDashboard(data) {
   }
 }
 
+function renderDashboardPhaseStatus(data, phase = dashboardPhase(data), presence = normalizedPresence(data)) {
+  const badgeLabels = { waiting: "候场中", countdown: "倒计时", open: "进行中", closed: "已关闭" };
+  adminEls.boardHeaderPhase.textContent = badgeLabels[phase];
+  adminEls.statusBadge.className = `status-badge status-badge--${phase === "open" ? "open" : phase === "countdown" ? "countdown" : "closed"}`;
+  adminEls.statusBadge.textContent = badgeLabels[phase];
+  adminEls.statusButton.removeAttribute("title");
+  renderBoardStage(data, phase, presence);
+  renderBoardClock();
+}
+
 function renderBoardStage(data, phase, presence) {
   const total = Number(data.totals?.students || 0);
-  const remainingMs = millisecondsUntilSelection(data);
-  const remainingSeconds = remainingMs === null ? 10 : Math.max(0, Math.ceil(remainingMs / 1000));
   const readiness = normalizeReadiness(data.readiness);
   adminEls.boardStage.className = `board-stage board-stage--${phase}`;
   adminEls.boardNotice.classList.toggle("is-open", phase === "open");
@@ -448,17 +679,18 @@ function renderBoardStage(data, phase, presence) {
 
   if (phase === "countdown") {
     adminEls.boardStageLabel.textContent = "全体同步倒计时";
-    adminEls.boardCountdown.textContent = String(remainingSeconds);
-    adminEls.boardOverlayCountdown.textContent = String(remainingSeconds);
     adminEls.boardStageDetail.textContent = `已进入候场 ${presence.online} / ${total} 人，倒计时结束后同时进入抢选`;
     adminEls.boardStatus.textContent = "倒计时正在同步到全部学生端";
     adminEls.boardLiveNote.textContent = "请保持大屏与学生手机页面打开";
-    adminEls.statusButton.textContent = `倒计时 ${remainingSeconds} 秒`;
     adminEls.statusButton.className = "button button--primary";
-    adminEls.boardStart.textContent = `倒计时 ${remainingSeconds} 秒`;
     adminEls.boardStart.className = "button button--primary button--wide";
+    startCountdownTicker(data);
     return;
   }
+
+  stopCountdownTicker();
+  adminEls.boardCountdown.classList.remove("is-ticking");
+  adminEls.boardOverlayCountdown.classList.remove("is-ticking");
 
   if (phase === "open") {
     adminEls.boardStageLabel.textContent = "抢选进行中";
@@ -594,6 +826,14 @@ adminEls.activityList.addEventListener("click", async (event) => {
 function renderGroupProgress(groups) {
   const activeGroups = groups.filter((group) => group.active);
   const page = boardPage(activeGroups, "groups");
+  const fingerprint = JSON.stringify([
+    boardIsPresentation(),
+    page.index,
+    page.pages,
+    ...page.items.map((group) => [group.id, group.name, group.selected_count, group.total_capacity]),
+  ]);
+  if (fingerprint === adminState.groupProgressFingerprint) return;
+  adminState.groupProgressFingerprint = fingerprint;
   adminEls.groupProgressPage.textContent = page.pages > 1 ? `第 ${page.index + 1} / ${page.pages} 页` : activeGroups.length ? "实时更新" : "";
   if (!activeGroups.length) {
     const empty = document.createElement("div");
@@ -626,16 +866,15 @@ function renderGroupProgress(groups) {
 function captureLiveFeedScrollRatio() {
   const list = adminEls.liveSelectionFeed;
   const loopHeight = Number(list.dataset.loopHeight || 0);
-  if (loopHeight > 0) return (list.scrollTop % loopHeight) / loopHeight;
-  const max = Math.max(0, list.scrollHeight - list.clientHeight);
-  return max > 0 ? list.scrollTop / max : 0;
+  if (loopHeight > 0) return list.scrollTop % loopHeight;
+  return Math.max(0, list.scrollTop);
 }
 
-function restoreLiveFeedScrollRatio(ratio) {
+function restoreLiveFeedScrollRatio(offset) {
   const list = adminEls.liveSelectionFeed;
   const loopHeight = Number(list.dataset.loopHeight || 0);
   const max = loopHeight > 0 ? loopHeight - 1 : Math.max(0, list.scrollHeight - list.clientHeight);
-  list.scrollTop = Math.min(max, Math.max(0, ratio * max));
+  list.scrollTop = Math.min(max, Math.max(0, offset));
 }
 
 function stopLiveFeedAutoScroll() {
@@ -778,20 +1017,19 @@ function boardStudentListData() {
 function captureRosterScrollRatio() {
   const list = adminEls.unselectedList;
   const loopHeight = Number(list.dataset.loopHeight || 0);
-  if (loopHeight > 0) return (list.scrollTop % loopHeight) / loopHeight;
-  const max = Math.max(0, list.scrollHeight - list.clientHeight);
-  return max > 0 ? list.scrollTop / max : 0;
+  if (loopHeight > 0) return list.scrollTop % loopHeight;
+  return Math.max(0, list.scrollTop);
 }
 
-function restoreRosterScrollRatio(ratio) {
+function restoreRosterScrollRatio(offset) {
   const list = adminEls.unselectedList;
   const loopHeight = Number(list.dataset.loopHeight || 0);
   if (loopHeight > 0) {
-    list.scrollTop = Math.min(loopHeight - 1, Math.max(0, ratio * loopHeight));
+    list.scrollTop = Math.min(loopHeight - 1, Math.max(0, offset));
     return;
   }
   const max = Math.max(0, list.scrollHeight - list.clientHeight);
-  list.scrollTop = Math.min(max, Math.max(0, ratio * max));
+  list.scrollTop = Math.min(max, Math.max(0, offset));
 }
 
 function stopRosterAutoScroll() {
@@ -1018,6 +1256,8 @@ function renderGroupEditor(groups, locked) {
     capacity.type = "number";
     capacity.min = "0";
     capacity.max = "1000";
+    capacity.step = "1";
+    capacity.inputMode = "numeric";
     capacity.value = String(group.total_capacity);
     capacity.disabled = locked;
     capacity.setAttribute("aria-label", "教学组总容量");
@@ -1069,6 +1309,8 @@ function renderQuotaMatrix(data, locked) {
       input.type = "number";
       input.min = "0";
       input.max = "1000";
+      input.step = "1";
+      input.inputMode = "numeric";
       input.value = String(quota.capacity);
       input.disabled = locked || !major.active || !group.active;
       input.dataset.majorId = String(major.id);
@@ -1187,6 +1429,13 @@ function scrubRevealedActivationCodeDom() {
   });
 }
 
+function clearAllRevealedActivationCodes() {
+  for (const timer of adminState.activationHideTimers.values()) clearTimeout(timer);
+  adminState.activationHideTimers.clear();
+  adminState.revealedActivationCodes.clear();
+  scrubRevealedActivationCodeDom();
+}
+
 function rememberRevealedActivationCode(studentId, code) {
   const key = revealedCodeKey(studentId);
   clearTimeout(adminState.activationHideTimers.get(key));
@@ -1200,11 +1449,23 @@ function rememberRevealedActivationCode(studentId, code) {
 }
 
 function activationCodeFromResponse(result) {
-  return result?.activation_code || result?.code || result?.credential?.activation_code || null;
+  return result?.credential?.activation_code || null;
 }
 
 function renderStudentRoster(data = adminState.dashboard) {
   const students = Array.isArray(data?.students) ? data.students : [];
+  const rosterQuery = adminEls.rosterSearch.value.trim();
+  const mobileLookupWaiting = window.matchMedia("(max-width: 700px)").matches && !rosterQuery;
+  if (mobileLookupWaiting) {
+    adminEls.rosterCount.textContent = "输入条件查询";
+    const row = document.createElement("tr");
+    const cell = createCell("请输入姓名或 11 位学号，匹配后再显示个人激活码");
+    cell.colSpan = 6;
+    cell.className = "empty-state mobile-roster-lookup-hint";
+    row.append(cell);
+    adminEls.rosterBody.replaceChildren(row);
+    return;
+  }
   const filtered = filteredRosterStudents(students);
   adminEls.rosterCount.textContent = filtered.length === students.length
     ? `${students.length} 人`
@@ -1252,11 +1513,8 @@ function renderStudentRoster(data = adminState.dashboard) {
     value.className = "activation-code-value";
     const key = revealedCodeKey(student.id);
     const revealedCode = adminState.revealedActivationCodes.get(key);
-    const revealable = student.activation_code_revealable
-      ?? student.activation_code_available
-      ?? student.has_recoverable_activation_code
-      ?? true;
-    value.textContent = revealedCode || (revealable ? "••••••" : "历史码不可显示");
+    const revealable = student.activation_code_revealable === true;
+    value.textContent = revealedCode || (revealable ? "••••••" : "不可显示");
     value.classList.toggle("is-revealed", Boolean(revealedCode));
     const reveal = document.createElement("button");
     reveal.type = "button";
@@ -1267,7 +1525,7 @@ function renderStudentRoster(data = adminState.dashboard) {
     reveal.disabled = !revealable;
     reveal.title = revealable
       ? revealedCode ? "立即从页面隐藏" : "仅本页显示，60 秒后自动隐藏"
-      : "请在关闭抢选后，重新导入包含证件号的该生名单";
+      : "当前学生没有可显示的个人激活码";
     credentialControl.append(value, reveal);
     credentialCell.append(credentialControl);
     row.append(statusCell, selectionCell, credentialCell);
@@ -1284,6 +1542,12 @@ function fillSettingsForm(settings) {
 }
 
 function switchAdminView(viewName) {
+  if (window.matchMedia("(max-width: 700px)").matches && !["overview", "students"].includes(viewName)) {
+    viewName = "overview";
+  }
+  if (adminState.currentView === "students" && viewName !== "students") {
+    clearAllRevealedActivationCodes();
+  }
   adminState.currentView = viewName;
   document.querySelectorAll(".admin-nav__item").forEach((button) => button.classList.toggle("is-active", button.dataset.view === viewName));
   document.querySelectorAll(".admin-view").forEach((view) => view.classList.add("is-hidden"));
@@ -1299,6 +1563,11 @@ function switchAdminView(viewName) {
 }
 
 document.querySelectorAll(".admin-nav__item").forEach((button) => button.addEventListener("click", () => switchAdminView(button.dataset.view)));
+
+const mobileAdminQuery = window.matchMedia("(max-width: 700px)");
+mobileAdminQuery.addEventListener?.("change", (event) => {
+  if (event.matches && !["overview", "students"].includes(adminState.currentView)) switchAdminView("overview");
+});
 
 adminEls.loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1343,15 +1612,19 @@ async function handleSelectionPhaseAction() {
     : "就绪检查已通过。";
   const presence = normalizedPresence();
   const absentStudents = presence.absentStudents || [];
-  const absentDetail = absentStudents.map((student) => `${student.name}（${student.major_name}）`).join("、");
+  const absentRoster = absentStudents.map((student) => ({
+    name: student.name,
+    major_name: student.major_name,
+  }));
   const startMessage = presence.absent > 0
-    ? `${readinessMessage}\n\n还有 ${presence.absent} 名同学未进入候场：\n${absentDetail || "名单正在同步，请以右侧实时名单为准"}\n\n仍可继续开始。确认后，全体学生端将同步进入 10 秒倒计时，倒计时结束后同时开放提交。`
+    ? `${readinessMessage}\n\n还有 ${presence.absent} 名同学未进入候场。名单已按专业整理如下；仍可继续开始。确认后，全体学生端将同步进入 10 秒倒计时，倒计时结束后同时开放提交。`
     : `${readinessMessage}全部 ${presence.online} 名同学均已进入候场。确认后，全体学生端将同步进入 10 秒倒计时，倒计时结束后同时开放提交。`;
   const confirmed = await confirmDanger(
     phase === "open" ? "关闭学生抢选" : "开始全体 10 秒倒计时",
     phase === "open"
       ? "关闭后学生无法继续提交，管理员仍可补位和撤销。"
       : startMessage,
+    { roster: phase === "open" ? [] : absentRoster },
   );
   if (!confirmed) return;
   adminState.phaseActionPending = true;
@@ -1404,6 +1677,15 @@ function leavePresentationMode() {
   stopLiveFeedAutoScroll();
 }
 
+function enterPresentationFallback() {
+  liveBoard.classList.add("is-presentation");
+  document.body.classList.add("is-presentation");
+}
+
+function shouldUsePresentationFallback() {
+  return window.matchMedia("(max-width: 700px)").matches || typeof liveBoard.requestFullscreen !== "function";
+}
+
 function updateFullscreenButton() {
   fullscreenButton.textContent = document.fullscreenElement || liveBoard.classList.contains("is-presentation") ? "退出全屏" : "⛶ 全屏展示";
   if (adminState.dashboard) {
@@ -1425,12 +1707,13 @@ fullscreenButton.addEventListener("click", async () => {
       await document.exitFullscreen();
     } else if (liveBoard.classList.contains("is-presentation")) {
       leavePresentationMode();
+    } else if (shouldUsePresentationFallback()) {
+      enterPresentationFallback();
     } else {
       await liveBoard.requestFullscreen();
     }
   } catch (_) {
-    liveBoard.classList.add("is-presentation");
-    document.body.classList.add("is-presentation");
+    enterPresentationFallback();
     showAdminToast("浏览器未授予原生全屏，已切换为页面大屏模式", "success");
   }
   updateFullscreenButton();
@@ -1566,19 +1849,66 @@ adminEls.groupEditor.addEventListener("click", async (event) => {
   }
 });
 
-adminEls.quotaMatrix.addEventListener("change", async (event) => {
+function quotaInputKey(input) {
+  return `${input.dataset.majorId}:${input.dataset.groupId}`;
+}
+
+async function persistQuotaInput(input) {
+  if (!input?.isConnected) return;
+  const key = quotaInputKey(input);
+  clearTimeout(adminState.quotaSaveTimers.get(key));
+  adminState.quotaSaveTimers.delete(key);
+  const nextValue = Number(input.value);
+  if (!Number.isInteger(nextValue) || nextValue < 0 || nextValue > 1000) {
+    input.setCustomValidity("请输入 0 至 1000 的整数");
+    input.reportValidity();
+    return;
+  }
+  input.setCustomValidity("");
+  if (String(nextValue) === input.dataset.original) return;
+  const activityId = Number(adminEls.quotaMatrix.dataset.activityId);
+  const submittedValue = String(nextValue);
+  input.dataset.saving = "true";
+  input.setAttribute("aria-busy", "true");
+  try {
+    await adminApi(`/api/admin/quotas/${input.dataset.majorId}/${input.dataset.groupId}`, { method: "PUT", body: JSON.stringify({ capacity: nextValue }), activityId });
+    input.dataset.original = submittedValue;
+    showAdminToast("配额已保存", "success");
+  } catch (error) {
+    if (input.value === submittedValue) input.value = input.dataset.original;
+    showAdminToast(error.message, "error");
+  } finally {
+    delete input.dataset.saving;
+    input.removeAttribute("aria-busy");
+  }
+}
+
+function scheduleQuotaSave(input, delay = 650) {
+  const key = quotaInputKey(input);
+  clearTimeout(adminState.quotaSaveTimers.get(key));
+  adminState.quotaSaveTimers.set(key, setTimeout(() => {
+    adminState.quotaSaveTimers.delete(key);
+    persistQuotaInput(input);
+  }, delay));
+}
+
+adminEls.quotaMatrix.addEventListener("input", (event) => {
   const input = event.target.closest("input[data-major-id]");
   if (!input) return;
-  const activityId = Number(adminEls.quotaMatrix.dataset.activityId);
-  try {
-    await adminApi(`/api/admin/quotas/${input.dataset.majorId}/${input.dataset.groupId}`, { method: "PUT", body: JSON.stringify({ capacity: Number(input.value) }), activityId });
-    input.dataset.original = input.value;
-    showAdminToast("配额已保存", "success");
-    await loadDashboard();
-  } catch (error) {
-    input.value = input.dataset.original;
-    showAdminToast(error.message, "error");
-  }
+  input.setCustomValidity("");
+  scheduleQuotaSave(input);
+});
+
+adminEls.quotaMatrix.addEventListener("focusout", (event) => {
+  const input = event.target.closest("input[data-major-id]");
+  if (input) scheduleQuotaSave(input, 0);
+});
+
+adminEls.quotaMatrix.addEventListener("keydown", (event) => {
+  const input = event.target.closest("input[data-major-id]");
+  if (!input || event.key !== "Enter") return;
+  event.preventDefault();
+  scheduleQuotaSave(input, 0);
 });
 
 adminEls.settingsForm.addEventListener("submit", async (event) => {
@@ -1771,9 +2101,9 @@ document.querySelector("#download-template").addEventListener("click", () => {
 });
 
 for (const [anchor, filename, message] of [
-  [adminEls.exportSelections, "选择记录.csv", "选择记录已导出"],
+  [adminEls.exportSelections, "选择记录.xlsx", "选择记录 Excel 已导出"],
   [adminEls.exportCompleteResults, "本场完整结果.xlsx", "完整名单与抢选结果 Excel 已导出"],
-  [adminEls.exportUnselected, "未选学生名单.csv", "未选学生名单已导出"],
+  [adminEls.exportUnselected, "未选学生名单.xlsx", "未选学生名单 Excel 已导出"],
 ]) {
   anchor.addEventListener("click", (event) => {
     event.preventDefault();
@@ -1821,7 +2151,7 @@ adminEls.rosterBody.addEventListener("click", async (event) => {
         activityId,
       });
       const activationCode = activationCodeFromResponse(result);
-      if (!activationCode) throw new Error("该历史激活码无法显示；请在关闭抢选后，重新导入包含证件号的该生名单");
+      if (!activationCode) throw new Error("服务未返回可显示的激活码，请刷新后重试");
       rememberRevealedActivationCode(studentId, activationCode);
       renderStudentRoster();
       showAdminToast("激活码明文已显示，60 秒后自动隐藏", "success");
@@ -1851,10 +2181,17 @@ adminEls.recentBody.addEventListener("click", async (event) => {
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && adminState.currentView === "overview" && adminState.csrf) {
+  if (document.hidden) {
+    clearAllRevealedActivationCodes();
+    return;
+  }
+  if (!adminState.csrf) return;
+  if (adminState.currentView === "overview") {
     adminState.rosterFingerprint = "";
     adminState.liveFeedFingerprint = "";
     loadDashboard({ quiet: true });
+  } else if (adminState.currentView === "students" && mobileAdminQuery.matches) {
+    loadDashboardStatusSnapshot({ quiet: true });
   }
 });
 

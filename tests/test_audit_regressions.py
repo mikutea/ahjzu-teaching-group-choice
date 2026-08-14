@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 import server.main as main_module
 from server.config import Config
-from server.database import connect, initialize_database
+from server.database import SCHEMA, connect, initialize_database
 from server.maintenance import check_database
 
 from .conftest import fictional_activation_code, fictional_document_number
@@ -26,44 +26,16 @@ def import_students(
     csv_text: str,
     *,
     mode: str = "merge",
-    regenerate_existing: bool = False,
 ):
-    source = io.StringIO(csv_text)
-    parsed_rows = list(csv.reader(source))
-    assert parsed_rows
-    header = parsed_rows[0]
-    lowered = [value.casefold() for value in header]
-    activation_index = next(
-        (index for index, value in enumerate(lowered) if value in {"activation_code", "激活码"}),
-        None,
-    )
-    if activation_index is not None:
-        header[activation_index] = "document_number"
-        document_index = activation_index
-    else:
-        header.append("document_number")
-        document_index = len(header) - 1
-    student_index = next(
-        index for index, value in enumerate(lowered) if value in {"student_no", "学号"}
-    )
-    for row in parsed_rows[1:]:
-        while len(row) <= document_index:
-            row.append("")
-        row[document_index] = fictional_document_number(row[student_index])
-    rendered = io.StringIO()
-    csv.writer(rendered, lineterminator="\n").writerows(parsed_rows)
     return client.post(
         "/api/admin/students/import",
         headers=headers,
-        params={
-            "mode": mode,
-            "regenerate_existing": str(regenerate_existing).lower(),
-        },
-        files={"file": ("students.csv", rendered.getvalue().encode("utf-8"), "text/csv")},
+        params={"mode": mode},
+        files={"files": ("students.csv", csv_text.encode("utf-8"), "text/csv")},
     )
 
 
-def login_student(client: TestClient, *, student_no: str, name: str, code: str):
+def login_student(client: TestClient, *, student_no: str, name: str):
     return client.post(
         "/api/student/login",
         json={
@@ -74,21 +46,17 @@ def login_student(client: TestClient, *, student_no: str, name: str, code: str):
     )
 
 
-def decode_csv(response) -> list[list[str]]:
-    assert response.status_code == 200, response.text
-    return list(csv.reader(io.StringIO(response.content.decode("utf-8-sig"))))
-
-
 def test_sixty_students_behind_one_ip_can_all_log_in(
     app, client: TestClient, admin_headers: dict[str, str]
 ):
     dashboard = client.get("/api/admin/dashboard").json()
     major_name = dashboard["majors"][0]["name"]
-    rows = ["student_no,name,major,activation_code"]
-    rows.extend(
-        f"2031{index:04d},同网学生{index:02d},{major_name},NAT{index:05d}"
-        for index in range(60)
-    )
+    rows = ["student_no,name,major,document_number"]
+    for index in range(60):
+        student_no = f"2031000{index:04d}"
+        rows.append(
+            f"{student_no},同网学生,{major_name},{fictional_document_number(student_no)}"
+        )
     imported = import_students(client, admin_headers, "\n".join(rows) + "\n")
     assert imported.status_code == 200, imported.text
     assert imported.json()["created"] == 60
@@ -100,9 +68,8 @@ def test_sixty_students_behind_one_ip_can_all_log_in(
         barrier.wait(timeout=15)
         return login_student(
             students[index],
-            student_no=f"2031{index:04d}",
-            name=f"同网学生{index:02d}",
-            code=f"NAT{index:05d}",
+            student_no=f"2031000{index:04d}",
+            name="同网学生",
         )
 
     try:
@@ -116,101 +83,17 @@ def test_sixty_students_behind_one_ip_can_all_log_in(
     assert not failures
 
 
-def test_random_activation_code_reset_is_rejected_without_revoking_session(
+def test_reimport_with_same_document_keeps_existing_credential(
     app, client: TestClient, admin_headers: dict[str, str]
 ):
     dashboard = client.get("/api/admin/dashboard").json()
     major_name = dashboard["majors"][0]["name"]
-    imported = import_students(
-        client,
-        admin_headers,
-        "student_no,name,major,activation_code\n"
-        f"20320001,轮换学生,{major_name},OLD20001\n",
-    )
-    assert imported.status_code == 200, imported.text
-
-    student = TestClient(app)
-    try:
-        login = login_student(
-            student,
-            student_no="20320001",
-            name="轮换学生",
-            code="OLD20001",
-        )
-        assert login.status_code == 200, login.text
-        student_id = login.json()["student"]["id"]
-
-        reset = client.post(
-            f"/api/admin/students/{student_id}/activation-code",
-            headers=admin_headers,
-        )
-        assert reset.status_code == 409, reset.text
-        assert "重新导入" in reset.json()["detail"]
-        assert student.get("/api/student/me").status_code == 200
-    finally:
-        student.close()
-
-
-def test_forbidden_activation_reset_does_not_block_valid_selection(
-    app,
-    client: TestClient,
-    admin_headers: dict[str, str],
-):
-    dashboard = client.get("/api/admin/dashboard").json()
-    activity_id = int(dashboard["settings"]["activity_id"])
-    major_name = dashboard["majors"][0]["name"]
-    imported = import_students(
-        client,
-        admin_headers,
-        "student_no,name,major,activation_code\n"
-        f"20320009,竞态轮换学生,{major_name},RACE2009\n",
-    )
-    assert imported.status_code == 200, imported.text
-    opened = client.post(
-        "/api/admin/status", headers=admin_headers, json={"status": "open"}
-    )
-    assert opened.status_code == 200, opened.text
-
-    student = TestClient(app)
-    try:
-        login = login_student(
-            student,
-            student_no="20320009",
-            name="竞态轮换学生",
-            code="RACE2009",
-        )
-        assert login.status_code == 200, login.text
-        student_id = int(login.json()["student"]["id"])
-        reset = client.post(
-            f"/api/admin/students/{student_id}/activation-code",
-            headers=admin_headers,
-        )
-        assert reset.status_code == 409, reset.text
-        selected = student.post(
-            "/api/student/select",
-            headers={
-                "X-CSRF-Token": login.json()["csrf_token"],
-                "X-Activity-ID": str(activity_id),
-            },
-            json={"group_id": int(login.json()["groups"][0]["id"])},
-        )
-        assert selected.status_code == 200, selected.text
-        after = client.get("/api/admin/dashboard").json()
-        assert after["totals"]["selected"] == 1
-    finally:
-        student.close()
-
-
-def test_legacy_regenerate_flag_cannot_randomize_existing_credential(
-    app, client: TestClient, admin_headers: dict[str, str]
-):
-    dashboard = client.get("/api/admin/dashboard").json()
-    major_name = dashboard["majors"][0]["name"]
+    document_number = fictional_document_number("20320000002")
     first = import_students(
         client,
         admin_headers,
-        "student_no,name,major,activation_code\n"
-        f"20320002,批量轮换,{major_name},OLD20002\n",
+        "student_no,name,major,document_number\n"
+        f"20320000002,批量轮换,{major_name},{document_number}\n",
     )
     assert first.status_code == 200, first.text
 
@@ -218,18 +101,16 @@ def test_legacy_regenerate_flag_cannot_randomize_existing_credential(
     try:
         assert login_student(
             student,
-            student_no="20320002",
+            student_no="20320000002",
             name="批量轮换",
-            code="OLD20002",
         ).status_code == 200
 
         rotated = import_students(
             client,
             admin_headers,
-            "student_no,name,major,activation_code\n"
-            f"20320002,批量轮换,{major_name},\n",
+            "student_no,name,major,document_number\n"
+            f"20320000002,批量轮换,{major_name},{document_number}\n",
             mode="merge",
-            regenerate_existing=True,
         )
         assert rotated.status_code == 200, rotated.text
         assert rotated.json()["rotated"] == 0
@@ -245,12 +126,14 @@ def test_sync_import_deactivates_omitted_student_and_invalidates_session(
 ):
     dashboard = client.get("/api/admin/dashboard").json()
     major_name = dashboard["majors"][0]["name"]
+    retained_document = fictional_document_number("20320000003")
+    omitted_document = fictional_document_number("20320000004")
     initial = import_students(
         client,
         admin_headers,
-        "student_no,name,major,activation_code\n"
-        f"20320003,保留学生,{major_name},SYNC2003\n"
-        f"20320004,遗漏学生,{major_name},SYNC2004\n",
+        "student_no,name,major,document_number\n"
+        f"20320000003,保留学生,{major_name},{retained_document}\n"
+        f"20320000004,遗漏学生,{major_name},{omitted_document}\n",
     )
     assert initial.status_code == 200, initial.text
 
@@ -258,104 +141,63 @@ def test_sync_import_deactivates_omitted_student_and_invalidates_session(
     try:
         assert login_student(
             omitted,
-            student_no="20320004",
+            student_no="20320000004",
             name="遗漏学生",
-            code="SYNC2004",
         ).status_code == 200
 
         synchronized = import_students(
             client,
             admin_headers,
-            "student_no,name,major,activation_code\n"
-            f"20320003,保留学生,{major_name},\n",
+            "student_no,name,major,document_number\n"
+            f"20320000003,保留学生,{major_name},{retained_document}\n",
             mode="sync",
         )
         assert synchronized.status_code == 200, synchronized.text
         assert omitted.get("/api/student/me").status_code == 401
         assert login_student(
             omitted,
-            student_no="20320004",
+            student_no="20320000004",
             name="遗漏学生",
-            code="SYNC2004",
         ).status_code == 401
 
         students = {
             row["student_no"]: row
             for row in client.get("/api/admin/dashboard").json()["students"]
         }
-        assert students["20320003"]["active"] == 1
-        assert students["20320004"]["active"] == 0
+        assert students["20320000003"]["active"] == 1
+        assert students["20320000004"]["active"] == 0
     finally:
         omitted.close()
 
 
-def test_csv_exports_neutralize_formula_cells(
+def test_roster_rejects_formula_like_student_names_atomically(
     client: TestClient, admin_headers: dict[str, str]
 ):
     dashboard = client.get("/api/admin/dashboard").json()
     major_name = dashboard["majors"][0]["name"]
     group_id = dashboard["groups"][0]["id"]
-    formula_name = "=HYPERLINK(\"https://example.invalid\",\"打开\")"
+    formula_name = "=HYPERLINK(\"x\",\"y\")"
     rows = [
-        ["student_no", "name", "major", "activation_code"],
-        ["20330001", formula_name, major_name, "FORMULA1"],
-        ["20330002", "@SUM(1,1)", major_name, "FORMULA2"],
+        ["student_no", "name", "major", "document_number"],
+        [
+            "20330000001",
+            formula_name,
+            major_name,
+            fictional_document_number("20330000001"),
+        ],
+        [
+            "20330000002",
+            "@SUM(1,1)",
+            major_name,
+            fictional_document_number("20330000002"),
+        ],
     ]
     buffer = io.StringIO()
     csv.writer(buffer, lineterminator="\n").writerows(rows)
     imported = import_students(client, admin_headers, buffer.getvalue())
     assert imported.status_code == 400, imported.text
-    assert "姓名包含不支持的字符" in imported.json()["detail"]
+    assert "姓名只能包含中文或英文字母" in imported.json()["detail"]
     assert client.get("/api/admin/dashboard").json()["students"] == []
-
-
-def test_csv_exports_neutralize_legacy_formula_cells(
-    client: TestClient, admin_headers: dict[str, str], app_config
-):
-    dashboard = client.get("/api/admin/dashboard").json()
-    major_id = dashboard["majors"][0]["id"]
-    group_id = dashboard["groups"][0]["id"]
-    formula_name = "=HYPERLINK(\"https://example.invalid\",\"打开\")"
-    connection = connect(app_config.database_path)
-    try:
-        now = "2026-08-13T00:00:00+00:00"
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            """
-            INSERT INTO students
-                (student_no, name, major_id, activation_hash, activation_ciphertext,
-                 active, created_at, updated_at)
-            VALUES ('+20330001', ?, ?, 'legacy', NULL, 1, ?, ?),
-                   ('-20330002', '@SUM(1,1)', ?, 'legacy', NULL, 1, ?, ?)
-            """,
-            (formula_name, major_id, now, now, major_id, now, now),
-        )
-        selected_id = connection.execute(
-            "SELECT id FROM students WHERE student_no = '+20330001'"
-        ).fetchone()["id"]
-        connection.execute(
-            """
-            INSERT INTO selections
-                (student_id, group_id, selected_at, source, operator)
-            VALUES (?, ?, ?, 'admin', 'legacy-test')
-            """,
-            (selected_id, group_id, now),
-        )
-        connection.commit()
-    finally:
-        connection.close()
-
-    activity_params = {"activity_id": dashboard["settings"]["activity_id"]}
-    selection_rows = decode_csv(
-        client.get("/api/admin/export/selections.csv", params=activity_params)
-    )
-    unselected_rows = decode_csv(
-        client.get("/api/admin/export/unselected.csv", params=activity_params)
-    )
-    assert selection_rows[1][0] == "'+20330001"
-    assert selection_rows[1][1] == "'" + formula_name
-    assert unselected_rows[1][0] == "'-20330002"
-    assert unselected_rows[1][1] == "'@SUM(1,1)"
 
 
 def test_opening_is_blocked_until_readiness_passes(
@@ -379,19 +221,16 @@ def test_opening_is_blocked_until_readiness_passes(
     imported = import_students(
         client,
         admin_headers,
-        "student_no,name,major,activation_code\n"
-        f"20340001,就绪学生,{major_name},READY001\n",
+        "student_no,name,major,document_number\n"
+        f"20340000001,就绪学生,{major_name},"
+        f"{fictional_document_number('20340000001')}\n",
     )
     assert imported.status_code == 200, imported.text
     ready = client.get("/api/admin/dashboard").json()["readiness"]
     assert ready["ready"] is True, ready
     assert ready["blockers"] == []
 
-    opened = client.post(
-        "/api/admin/status",
-        headers=admin_headers,
-        json={"status": "open"},
-    )
+    opened = client.post("/api/admin/countdown", headers=admin_headers)
     assert opened.status_code == 200, opened.text
 
 
@@ -403,16 +242,18 @@ def test_dashboard_exposes_students_for_sync_review(
     imported = import_students(
         client,
         admin_headers,
-        "student_no,name,major,activation_code\n"
-        f"20350001,名单甲,{major_name},SYNC0001\n"
-        f"20350002,名单乙,{major_name},SYNC0002\n",
+        "student_no,name,major,document_number\n"
+        f"20350000001,名单甲,{major_name},"
+        f"{fictional_document_number('20350000001')}\n"
+        f"20350000002,名单乙,{major_name},"
+        f"{fictional_document_number('20350000002')}\n",
     )
     assert imported.status_code == 200, imported.text
 
     refreshed = client.get("/api/admin/dashboard").json()
     by_number = {student["student_no"]: student for student in refreshed["students"]}
-    assert {"20350001", "20350002"} <= by_number.keys()
-    for student_no in ("20350001", "20350002"):
+    assert {"20350000001", "20350000002"} <= by_number.keys()
+    for student_no in ("20350000001", "20350000002"):
         assert {
             "id",
             "student_no",
@@ -530,11 +371,11 @@ def test_import_rejects_unrecognized_document_number_atomically(
         "/api/admin/students/import",
         headers=admin_headers,
         files={
-            "file": (
+            "files": (
                 "students.csv",
                 (
                     "student_no,name,major,document_number\n"
-                    f"20360001,无效证件学生,{major_name},ABC\n"
+                    f"20360000001,无效证件学生,{major_name},ABC\n"
                 ).encode("utf-8"),
                 "text/csv",
             )
@@ -548,7 +389,7 @@ def test_import_rejects_unrecognized_document_number_atomically(
 def test_import_body_limit_runs_before_multipart_authentication(client: TestClient):
     oversized = client.post(
         "/api/admin/students/import",
-        files={"file": ("oversized.csv", b"x" * 1_300_000, "text/csv")},
+        files={"files": ("oversized.csv", b"x" * 1_300_000, "text/csv")},
     )
     assert oversized.status_code == 413
     assert "1.25 MB" in oversized.json()["detail"]
@@ -706,7 +547,7 @@ def test_archive_download_and_database_check_fail_closed_after_tamper(
     assert download.status_code == 500
     assert "归档校验失败" in download.json()["detail"]
     with pytest.raises(RuntimeError, match="SHA-256"):
-        check_database(app_config.database_path)
+        check_database(app_config.database_path, app_config.app_secret)
 
 
 def test_database_check_rejects_archive_summary_tamper(
@@ -738,7 +579,7 @@ def test_database_check_rejects_archive_summary_tamper(
     finally:
         connection.close()
     with pytest.raises(RuntimeError, match="汇总与快照不一致"):
-        check_database(app_config.database_path)
+        check_database(app_config.database_path, app_config.app_secret)
     assert client.get(f"/api/admin/activities/{activity_id}/archive.json").status_code == 500
 
 
@@ -772,7 +613,7 @@ def test_archive_time_is_bound_to_snapshot(
         connection.close()
 
     with pytest.raises(RuntimeError, match="缺少快照|归档时间"):
-        check_database(app_config.database_path)
+        check_database(app_config.database_path, app_config.app_secret)
     assert client.get(f"/api/admin/activities/{activity_id}/archive.json").status_code == 500
 
 
@@ -780,9 +621,9 @@ def test_current_exports_require_matching_activity_version(
     client: TestClient, admin_headers: dict[str, str]
 ):
     activity_id = int(admin_headers["X-Activity-ID"])
-    assert client.get("/api/admin/export/selections.csv").status_code == 422
+    assert client.get("/api/admin/export/selections.xlsx").status_code == 422
     stale = client.get(
-        "/api/admin/export/selections.csv", params={"activity_id": activity_id + 999}
+        "/api/admin/export/selections.xlsx", params={"activity_id": activity_id + 999}
     )
     assert stale.status_code == 409
 
@@ -812,29 +653,31 @@ def test_profile_change_invalidates_existing_student_session(
     app, client: TestClient, admin_headers: dict[str, str]
 ):
     major_name = client.get("/api/admin/dashboard").json()["majors"][0]["name"]
+    document_number = fictional_document_number("20400000001")
     imported = import_students(
         client,
         admin_headers,
-        "student_no,name,major,activation_code\n20400001,原姓名,"
-        f"{major_name},PROFILE1\n",
+        "student_no,name,major,document_number\n20400000001,原姓名,"
+        f"{major_name},{document_number}\n",
     )
     assert imported.status_code == 200, imported.text
     student = TestClient(app)
     try:
         assert login_student(
-            student, student_no="20400001", name="原姓名", code="PROFILE1"
+            student, student_no="20400000001", name="原姓名"
         ).status_code == 200
         changed = import_students(
             client,
             admin_headers,
-            f"student_no,name,major\n20400001,新姓名,{major_name}\n",
+            "student_no,name,major,document_number\n"
+            f"20400000001,新姓名,{major_name},{document_number}\n",
         )
         assert changed.status_code == 200, changed.text
         assert "credentials" not in changed.json()
         assert '"activation_code":' not in changed.text
         assert student.get("/api/student/me").status_code == 401
         assert login_student(
-            student, student_no="20400001", name="新姓名", code="PROFILE1"
+            student, student_no="20400000001", name="新姓名"
         ).status_code == 200
     finally:
         student.close()
@@ -900,7 +743,7 @@ def test_database_check_binds_archive_snapshot_to_outer_activity(
         connection.close()
 
     with pytest.raises(RuntimeError, match="快照归属"):
-        check_database(app_config.database_path)
+        check_database(app_config.database_path, app_config.app_secret)
     download = client.get(f"/api/admin/activities/{first_activity_id}/archive.json")
     assert download.status_code == 500
 
@@ -949,14 +792,19 @@ def test_archived_summary_keeps_active_student_semantics_after_sync(
     initial = import_students(
         client,
         admin_headers,
-        "student_no,name,major\n20410001,保留学生,"
-        f"{major_name}\n20410002,停用学生,{major_name}\n",
+        "student_no,name,major,document_number\n"
+        f"20410000001,保留学生,{major_name},"
+        f"{fictional_document_number('20410000001')}\n"
+        f"20410000002,停用学生,{major_name},"
+        f"{fictional_document_number('20410000002')}\n",
     )
     assert initial.status_code == 200, initial.text
     synchronized = import_students(
         client,
         admin_headers,
-        f"student_no,name,major\n20410001,保留学生,{major_name}\n",
+        "student_no,name,major,document_number\n"
+        f"20410000001,保留学生,{major_name},"
+        f"{fictional_document_number('20410000001')}\n",
         mode="sync",
     )
     assert synchronized.status_code == 200, synchronized.text
@@ -978,7 +826,7 @@ def test_archived_summary_keeps_active_student_semantics_after_sync(
     assert archived["summary"] == before
 
 
-def test_invalid_legacy_quota_total_blocks_check_and_opening(
+def test_invalid_persisted_quota_total_blocks_check_and_opening(
     client: TestClient, admin_headers: dict[str, str], app_config
 ):
     dashboard = client.get("/api/admin/dashboard").json()
@@ -986,8 +834,9 @@ def test_invalid_legacy_quota_total_blocks_check_and_opening(
     imported = import_students(
         client,
         admin_headers,
-        "student_no,name,major\n20420001,异常配额学生,"
-        f"{major_name}\n",
+        "student_no,name,major,document_number\n"
+        f"20420000001,异常配额学生,{major_name},"
+        f"{fictional_document_number('20420000001')}\n",
     )
     assert imported.status_code == 200, imported.text
     quota = dashboard["quotas"][0]
@@ -1002,16 +851,22 @@ def test_invalid_legacy_quota_total_blocks_check_and_opening(
         connection.commit()
     finally:
         connection.close()
-    initialize_database(app_config)
+
+    # The current-version initializer deliberately refuses to repair missing
+    # constraints. Restore the deliberately removed guard explicitly so this
+    # test can isolate the persisted business invariant violation.
+    connection = sqlite3.connect(app_config.database_path)
+    try:
+        connection.executescript(SCHEMA)
+    finally:
+        connection.close()
 
     with pytest.raises(RuntimeError, match="配额合计超过教学组总容量"):
-        check_database(app_config.database_path)
+        check_database(app_config.database_path, app_config.app_secret)
     readiness = client.get("/api/admin/dashboard").json()["readiness"]
     assert readiness["ready"] is False
     assert any("超过教学组总容量" in blocker for blocker in readiness["blockers"])
-    opened = client.post(
-        "/api/admin/status", headers=admin_headers, json={"status": "open"}
-    )
+    opened = client.post("/api/admin/countdown", headers=admin_headers)
     assert opened.status_code == 409
 
 
@@ -1065,7 +920,9 @@ def test_database_check_uses_one_read_snapshot_during_activity_rollover(
     )
     activity_id = int(admin_headers["X-Activity-ID"])
     with ThreadPoolExecutor(max_workers=2) as pool:
-        check_future = pool.submit(check_database, app_config.database_path)
+        check_future = pool.submit(
+            check_database, app_config.database_path, app_config.app_secret
+        )
         assert paused.wait(timeout=10)
         rollover = client.post(
             "/api/admin/activities",

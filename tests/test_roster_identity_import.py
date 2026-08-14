@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import csv
 import io
 import subprocess
@@ -8,15 +7,14 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
+import xlwt
 from fastapi.testclient import TestClient
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from server.database import connect
+from server.roster import RosterParseError, activation_code_from_document_number
 
-from .conftest import fictional_document_number
-
-
-XLS_FIXTURE_BASE64 = "0M8R4KGxGuEAAAAAAAAAAAAAAAAAAAAAPgADAP7/CQAGAAAAAAAAAAAAAAABAAAACQAAAAAAAAAAEAAA/v///wAAAAD+////AAAAAAgAAAD///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////8JCBAAAAYFALsNzAcAAAAABgAAAOEAAgCwBMEAAgAAAOIAAABcAHAATm9uZSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIEIAAgCwBGEBAgAAAD0BAgABAJwAAgAOABkAAgAAABIAAgAAAGMAAgAAABMAAgAAAK8BAgAAALwBAgAAAEAAAgAAAI0AAgAAAD0AEgDgAVoAzz9OKjgAAAAAAAEAWAIiAAIAAAAOAAIAAQC3AQIAAADaAAIAAAAxABUAyAAAAP9/kAEAAAAAAQAFAEFyaWFsMQAVAMgAAAD/f5ABAAAAAAEABQBBcmlhbDEAFQDIAAAA/3+QAQAAAAABAAUAQXJpYWwxABUAyAAAAP9/kAEAAAAAAQAFAEFyaWFsMQAVAMgAAAD/f5ABAAAAAAEABQBBcmlhbDEAFQDIAAAA/3+QAQAAAAABAAUAQXJpYWwxABUAyAAAAP9/kAEAAAAAAQAFAEFyaWFsHgQMAKQABwAAR2VuZXJhbOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQA9f8gAAD0AAAAAAAAAADAIOAAFAAGAKQAAQAgAAD4AAAAAAAAAADAIOAAFAAHAKQAAQAgAAD4AAAAAAAAAADAIJMCBAAAgAD/YAECAAEAhQAOAAsEAAAAAAYAUm9zdGVy/ABmAAgAAAAIAAAAAwABwYv2TvdTAgAB01kNVAQAARNOGk4NVPB5AgABZlv3UxIAAEgwMDAwMDAwMDAwMDIzNDU2Nw0AAEZpY3Rpb25hbCBYTFMKAABUZXN0IE1ham9yBwAAWExTMDAwMQoAAAAJCBAAAAYQALsNzAcAAAAABgAAAA0AAgABAAwAAgBkAA8AAgABABEAAgAAABAACAD8qfHSTWJQP18AAgAAAIAACAAAAAAAAQAAACUCBAAAAP8AgQACAAEMAAIOAAAAAAACAAAAAAAEAAAAKgACAAAAKwACAAAAggACAAEAGwACAAAAGgACAAAAFAAFAAIAACZQFQAFAAIAACZGgwACAAEAhAACAAAAJgAIADMzMzMzM9M/JwAIADMzMzMzM9M/KAAIAIXrUbgeheM/KQAIAK5H4XoUrtc/oQAiAAkAZAABAAEAAQCDACwBLAGamZmZmZm5P5qZmZmZmbk/AQASAAIAAADdAAIAAAAZAAIAAABjAAIAAAATAAIAAAAIAhAAAAAAAAQA/wAAAAAAAAEPAP0ACgAAAAAAEQAAAAAA/QAKAAAAAQARAAEAAAD9AAoAAAACABEAAgAAAP0ACgAAAAMAEQADAAAACAIQAAEAAAAEAP8AAAAAAAABDwD9AAoAAQAAABEABAAAAP0ACgABAAEAEQAFAAAA/QAKAAEAAgARAAYAAAD9AAoAAQADABEABwAAAD4CEgC2AgAAAABAAAAAAAAAAAAAAAAKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAIAAAADAAAABAAAAAUAAAAGAAAABwAAAP7////9/////v////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////9SAG8AbwB0ACAARQBuAHQAcgB5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFgAFAf//////////AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP7///8AAAAAAAAAAFcAbwByAGsAYgBvAG8AawAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASAAIB////////////////AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH///////////////8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD+////AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAf///////////////wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP7///8AAAAAAAAAAA=="
+from .conftest import fictional_document_number, open_selection_now
 
 
 def roster_csv(rows: list[tuple[str, str, str, str]]) -> bytes:
@@ -39,6 +37,19 @@ def roster_xlsx(rows: list[tuple[object, str, str, str]]) -> bytes:
     buffer = io.BytesIO()
     workbook.save(buffer)
     workbook.close()
+    return buffer.getvalue()
+
+
+def roster_xls(rows: list[tuple[object, str, str, str]]) -> bytes:
+    workbook = xlwt.Workbook()
+    sheet = workbook.add_sheet("名单")
+    for column, heading in enumerate(["证件号", "姓名", "专业名称", "学号"]):
+        sheet.write(0, column, heading)
+    for row_index, row in enumerate(rows, start=1):
+        for column, value in enumerate(row):
+            sheet.write(row_index, column, value)
+    buffer = io.BytesIO()
+    workbook.save(buffer)
     return buffer.getvalue()
 
 
@@ -76,23 +87,23 @@ def test_csv_xls_xlsx_sync_is_one_combined_roster_and_identity_never_persists(
     assert created_major.status_code == 200, created_major.text
 
     documents = {
-        "CSV0001": "H00000000000123456",
-        "XLS0001": "H00000000000234567",
-        "XLSX0001": "H00000000000345678",
-        "OMIT0001": "H00000000000456789",
+        "20265000001": "H00000000000123456",
+        "20265000002": "H00000000000234567",
+        "20265000003": "H00000000000345678",
+        "20265000004": "H00000000000456789",
     }
     initial = client.post(
         "/api/admin/students/import",
         headers=admin_headers,
         files={
-            "file": (
+            "files": (
                 "initial.csv",
                 roster_csv(
                     [
-                        (documents["CSV0001"], "Fictional CSV", "Test Major", "CSV0001"),
-                        (documents["XLS0001"], "Fictional XLS", "Test Major", "XLS0001"),
-                        (documents["XLSX0001"], "Fictional XLSX", "Test Major", "XLSX0001"),
-                        (documents["OMIT0001"], "Fictional Omitted", "Test Major", "OMIT0001"),
+                        (documents["20265000001"], "Fictional CSV", "Test Major", "20265000001"),
+                        (documents["20265000002"], "Fictional XLS", "Test Major", "20265000002"),
+                        (documents["20265000003"], "Fictional XLSX", "Test Major", "20265000003"),
+                        (documents["20265000004"], "Fictional Omitted", "Test Major", "20265000004"),
                     ]
                 ),
                 "text/csv",
@@ -117,19 +128,28 @@ def test_csv_xls_xlsx_sync_is_one_combined_roster_and_identity_never_persists(
             (
                 "one.csv",
                 roster_csv(
-                    [(documents["CSV0001"], "Fictional CSV", "Test Major", "CSV0001")]
+                    [(documents["20265000001"], "Fictional CSV", "Test Major", "20265000001")]
                 ),
                 "text/csv",
             ),
             (
                 "two.xls",
-                base64.b64decode(XLS_FIXTURE_BASE64),
+                roster_xls(
+                    [
+                        (
+                            documents["20265000002"],
+                            "Fictional XLS",
+                            "Test Major",
+                            "20265000002",
+                        )
+                    ]
+                ),
                 "application/vnd.ms-excel",
             ),
             (
                 "three.xlsx",
                 roster_xlsx(
-                    [(documents["XLSX0001"], "Fictional XLSX", "Test Major", "XLSX0001")]
+                    [(documents["20265000003"], "Fictional XLSX", "Test Major", "20265000003")]
                 ),
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             ),
@@ -156,12 +176,14 @@ def test_csv_xls_xlsx_sync_is_one_combined_roster_and_identity_never_persists(
         for row in dashboard["students"]
     }
     assert active_by_number == {
-        "CSV0001": True,
-        "XLS0001": True,
-        "XLSX0001": True,
-        "OMIT0001": False,
+        "20265000001": True,
+        "20265000002": True,
+        "20265000003": True,
+        "20265000004": False,
     }
-    xls_student = next(row for row in dashboard["students"] if row["student_no"] == "XLS0001")
+    xls_student = next(
+        row for row in dashboard["students"] if row["student_no"] == "20265000002"
+    )
     revealed = client.post(
         f"/api/admin/students/{xls_student['id']}/activation-code/reveal",
         headers=admin_headers,
@@ -212,12 +234,12 @@ def test_supported_document_formats_derive_last_six_and_can_login_after_open(
     dashboard = client.get("/api/admin/dashboard").json()
     major_name = dashboard["majors"][0]["name"]
     suffix = expected_code.replace("X", "9").replace("A", "8")
-    student_no = f"FMT{suffix}"
+    student_no = f"20265{suffix}"
     imported = client.post(
         "/api/admin/students/import",
         headers=admin_headers,
         files={
-            "file": (
+            "files": (
                 "format.csv",
                 roster_csv([(document_number, "虚构格式学生", major_name, student_no)]),
                 "text/csv",
@@ -228,12 +250,7 @@ def test_supported_document_formats_derive_last_six_and_can_login_after_open(
     assert "credentials" not in imported.json()
     assert document_number not in imported.text
 
-    opened = client.post(
-        "/api/admin/status",
-        headers=admin_headers,
-        json={"status": "open"},
-    )
-    assert opened.status_code == 200, opened.text
+    open_selection_now(client, admin_headers)
     public_status = client.get("/api/public/status")
     assert public_status.status_code == 200, public_status.text
     assert public_status.json()["student_login_allowed"] is True
@@ -257,6 +274,38 @@ def test_supported_document_formats_derive_last_six_and_can_login_after_open(
         student.close()
 
 
+@pytest.mark.parametrize(
+    "document_number",
+    [
+        "١٢٣٤٥٦٧٨٩٠١٢٣٤٥",
+        "A١٢٣٤٥٦(٧)",
+        "1١٢٣٤٥٦٧",
+        "H١٢٣٤٥٦٧٨",
+        "A1١٢٣٤٥٦٧٨",
+        "T١٢٣٤٥٦٧٨٩٠١٢٣٤٥٦X",
+    ],
+)
+def test_document_numbers_reject_non_ascii_decimal_digits(document_number: str):
+    with pytest.raises(RosterParseError, match="证件号格式无法识别"):
+        activation_code_from_document_number(document_number)
+
+
+@pytest.mark.parametrize(
+    ("document_number", "expected_code"),
+    [
+        ("３４０１０２２００６０１０１１２３４", "011234"),
+        ("Ａ１２３４５６（７）", "1234567"[-6:]),
+        ("Ｈ１２３４５６７８", "345678"),
+    ],
+)
+def test_document_numbers_nfkc_fullwidth_digits_to_ascii(
+    document_number: str, expected_code: str
+):
+    code = activation_code_from_document_number(document_number)
+    assert code == expected_code
+    assert code.isascii()
+
+
 def test_complete_results_export_contains_every_active_student(
     client: TestClient,
     admin_headers: dict[str, str],
@@ -270,12 +319,12 @@ def test_complete_results_export_contains_every_active_student(
         "/api/admin/students/import",
         headers=admin_headers,
         files={
-            "file": (
+            "files": (
                 "results.csv",
                 roster_csv(
                     [
-                        (documents[0], "虚构已选学生", major_name, "RESULT001"),
-                        (documents[1], "虚构未选学生", major_name, "RESULT002"),
+                        (documents[0], "虚构已选学生", major_name, "20265010001"),
+                        (documents[1], "虚构未选学生", major_name, "20265010002"),
                     ]
                 ),
                 "text/csv",
@@ -290,25 +339,30 @@ def test_complete_results_export_contains_every_active_student(
     assigned = client.post(
         "/api/admin/selections",
         headers=admin_headers,
-        json={"student_id": students["RESULT001"]["id"], "group_id": group["id"]},
+        json={"student_id": students["20265010001"]["id"], "group_id": group["id"]},
     )
     assert assigned.status_code == 200, assigned.text
 
     exported = client.get(
-        "/api/admin/export/results.csv",
+        "/api/admin/export/results.xlsx",
         params={"activity_id": activity_id},
     )
     assert exported.status_code == 200, exported.text
-    rows = list(csv.DictReader(io.StringIO(exported.content.decode("utf-8-sig"))))
-    assert list(rows[0]) == ["学号", "姓名", "专业", "选择状态", "教学组", "选择时间"]
-    by_number = {row["学号"]: row for row in rows}
-    assert set(by_number) == {"RESULT001", "RESULT002"}
-    assert by_number["RESULT001"]["选择状态"] == "已选"
-    assert by_number["RESULT001"]["教学组"] == group["name"]
-    assert by_number["RESULT001"]["选择时间"]
-    assert by_number["RESULT002"]["选择状态"] == "未选"
-    assert by_number["RESULT002"]["教学组"] == ""
-    assert by_number["RESULT002"]["选择时间"] == ""
+    workbook = load_workbook(io.BytesIO(exported.content), read_only=True, data_only=True)
+    rows = list(workbook["完整结果"].iter_rows(values_only=True))
+    workbook.close()
+    assert rows[0] == ("学号", "姓名", "专业", "状态", "教学组", "选择时间")
+    by_number = {
+        row[0]: dict(zip(rows[0], row, strict=True))
+        for row in rows[1:]
+    }
+    assert set(by_number) == {"20265010001", "20265010002"}
+    assert by_number["20265010001"]["状态"] == "已选"
+    assert by_number["20265010001"]["教学组"] == group["name"]
+    assert by_number["20265010001"]["选择时间"]
+    assert by_number["20265010002"]["状态"] == "未选"
+    assert by_number["20265010002"]["教学组"] is None
+    assert by_number["20265010002"]["选择时间"] is None
     assert_identifiers_absent(exported.content, documents)
 
 
@@ -327,12 +381,12 @@ def test_duplicate_student_number_rolls_back_the_whole_batch(
         fictional_document_number("unique-two"),
     ]
     first_rows = [
-        (documents[2], "虚构唯一甲", major_name, "UNIQUE001"),
-        (documents[0], "虚构重复甲", major_name, "DUPLICATE01"),
+        (documents[2], "虚构唯一甲", major_name, "20265020001"),
+        (documents[0], "虚构重复甲", major_name, "20265029999"),
     ]
     second_rows = [
-        (documents[3], "虚构唯一乙", major_name, "UNIQUE002"),
-        (documents[1], "虚构重复乙", major_name, "DUPLICATE01"),
+        (documents[3], "虚构唯一乙", major_name, "20265020002"),
+        (documents[1], "虚构重复乙", major_name, "20265029999"),
     ]
     uploads = (
         [
@@ -354,7 +408,7 @@ def test_duplicate_student_number_rolls_back_the_whole_batch(
     assert_identifiers_absent(app_config.database_path.read_bytes(), documents)
 
 
-def test_missing_document_cannot_generate_random_code_and_reset_is_fixed_409(
+def test_missing_document_cannot_generate_an_activation_code(
     client: TestClient,
     admin_headers: dict[str, str],
 ):
@@ -363,11 +417,11 @@ def test_missing_document_cannot_generate_random_code_and_reset_is_fixed_409(
         "/api/admin/students/import",
         headers=admin_headers,
         files={
-            "file": (
-                "legacy.csv",
+            "files": (
+                "missing-document.csv",
                 (
-                    "学号,姓名,专业名称,激活码\n"
-                    f"LEGACY001,虚构旧格式,{major_name},RANDOM99\n"
+                    "学号,姓名,专业名称\n"
+                    f"20265030001,虚构缺失证件,{major_name}\n"
                 ).encode("utf-8"),
                 "text/csv",
             )
@@ -376,32 +430,6 @@ def test_missing_document_cannot_generate_random_code_and_reset_is_fixed_409(
     assert missing.status_code == 400, missing.text
     assert "缺少必要表头" in missing.json()["detail"]
     assert client.get("/api/admin/dashboard").json()["students"] == []
-
-    document_number = fictional_document_number("no-random-reset")
-    imported = client.post(
-        "/api/admin/students/import",
-        headers=admin_headers,
-        params={"regenerate_existing": "true"},
-        files={
-            "file": (
-                "valid.csv",
-                roster_csv([(document_number, "虚构固定凭据", major_name, "FIXED001")]),
-                "text/csv",
-            )
-        },
-    )
-    assert imported.status_code == 200, imported.text
-    assert imported.json()["activation_code_policy"] == "normalized_document_number_last_6"
-    assert "credentials" not in imported.json()
-    assert '"activation_code":' not in imported.text
-    student_id = client.get("/api/admin/dashboard").json()["students"][0]["id"]
-    reset = client.post(
-        f"/api/admin/students/{student_id}/activation-code",
-        headers=admin_headers,
-    )
-    assert reset.status_code == 409, reset.text
-    assert "证件号" in reset.json()["detail"]
-    assert "重新导入" in reset.json()["detail"]
 
 
 def test_reimported_document_suffix_rotates_derived_credential_and_revokes_session(
@@ -417,9 +445,9 @@ def test_reimported_document_suffix_rotates_derived_credential_and_revokes_sessi
         "/api/admin/students/import",
         headers=admin_headers,
         files={
-            "file": (
+            "files": (
                 "first.csv",
-                roster_csv([(old_document, "虚构换证学生", major_name, "ROTATE001")]),
+                roster_csv([(old_document, "虚构换证学生", major_name, "20265030003")]),
                 "text/csv",
             )
         },
@@ -431,7 +459,7 @@ def test_reimported_document_suffix_rotates_derived_credential_and_revokes_sessi
         login = student.post(
             "/api/student/login",
             json={
-                "student_no": "ROTATE001",
+                "student_no": "20265030003",
                 "name": "虚构换证学生",
                 "activation_code": "111111",
             },
@@ -442,9 +470,9 @@ def test_reimported_document_suffix_rotates_derived_credential_and_revokes_sessi
             "/api/admin/students/import",
             headers=admin_headers,
             files={
-                "file": (
+                "files": (
                     "changed.csv",
-                    roster_csv([(new_document, "虚构换证学生", major_name, "ROTATE001")]),
+                    roster_csv([(new_document, "虚构换证学生", major_name, "20265030003")]),
                     "text/csv",
                 )
             },
@@ -461,7 +489,7 @@ def test_reimported_document_suffix_rotates_derived_credential_and_revokes_sessi
             assert old_code.post(
                 "/api/student/login",
                 json={
-                    "student_no": "ROTATE001",
+                    "student_no": "20265030003",
                     "name": "虚构换证学生",
                     "activation_code": "111111",
                 },
@@ -469,7 +497,7 @@ def test_reimported_document_suffix_rotates_derived_credential_and_revokes_sessi
             assert new_code.post(
                 "/api/student/login",
                 json={
-                    "student_no": "ROTATE001",
+                    "student_no": "20265030003",
                     "name": "虚构换证学生",
                     "activation_code": "222222",
                 },
@@ -497,7 +525,7 @@ def test_xlsx_long_numeric_document_cell_is_rejected_as_precision_risk(
         [
             (
                 "numeric.xlsx",
-                roster_xlsx([(123456789012345678, "虚构数值单元格", major_name, "NUMERIC001")]),
+                roster_xlsx([(123456789012345678, "虚构数值单元格", major_name, "20265040001")]),
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         ],
@@ -560,13 +588,13 @@ def test_projection_and_roster_ui_dom_contract_and_guidance_copy():
     assert "示例学生" not in template_block
 
 
-def test_repository_privacy_guards_ignore_roster_files_but_keep_fictional_fixture():
+def test_repository_privacy_guards_ignore_all_roster_files():
     root = Path(__file__).resolve().parents[1]
     gitignore = (root / ".gitignore").read_text(encoding="utf-8")
     dockerignore = (root / ".dockerignore").read_text(encoding="utf-8")
 
     assert "*.csv" in gitignore
-    assert "!examples/fictional-students-180.csv" in gitignore
+    assert "!examples/" not in gitignore
     assert "*.xls" in gitignore and "*.xlsx" in gitignore
     assert "*.csv" in dockerignore
     assert "*.xls" in dockerignore and "*.xlsx" in dockerignore
@@ -579,11 +607,3 @@ def test_repository_privacy_guards_ignore_roster_files_but_keep_fictional_fixtur
         check=False,
     )
     assert ignored.returncode == 0, ignored.stderr
-    assert (root / "examples" / "fictional-students-180.csv").exists()
-    assert subprocess.run(
-        ["git", "ls-files", "--error-unmatch", "examples/fictional-students-180.csv"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-    ).returncode == 0

@@ -8,53 +8,57 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from openpyxl import load_workbook
 
 from server.database import connect
 from server.maintenance import check_database
 
-from .conftest import fictional_document_number
+from .conftest import fictional_document_number, open_selection_now
 
 
-ROSTER_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "examples"
-    / "fictional-students-180.csv"
-)
 SHARED_STUDENT_IP = "198.51.100.23"
 CONCURRENCY = 60
 
 
-def load_fictional_roster() -> tuple[bytes, list[dict[str, str]]]:
-    content = ROSTER_PATH.read_bytes()
+def load_fictional_roster(
+    roster_path: Path,
+) -> tuple[bytes, list[dict[str, str]]]:
+    source_rows: list[dict[str, str]] = []
+    major_names = ("建筑学", "城乡规划", "风景园林")
+    for index in range(1, 181):
+        suffix = chr(65 + ((index - 1) // 26)) + chr(65 + ((index - 1) % 26))
+        source_rows.append(
+            {
+                "学号": f"2026400{index:04d}",
+                "姓名": f"FictionalStudent{suffix}",
+                "专业": major_names[(index - 1) // 60],
+                "证件号": fictional_document_number(f"2026400{index:04d}"),
+            }
+        )
+    fixture_buffer = io.StringIO()
+    fixture_writer = csv.DictWriter(
+        fixture_buffer,
+        fieldnames=["学号", "姓名", "专业", "证件号"],
+        lineterminator="\n",
+    )
+    fixture_writer.writeheader()
+    fixture_writer.writerows(source_rows)
+    roster_path.write_text(fixture_buffer.getvalue(), encoding="utf-8-sig")
+
+    content = roster_path.read_bytes()
     reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
-    assert reader.fieldnames == ["学号", "姓名", "专业"]
+    assert reader.fieldnames == ["学号", "姓名", "专业", "证件号"]
     rows = list(reader)
     assert len(rows) == 180
     assert [row["学号"] for row in rows] == [
-        f"TEST2026{index:04d}" for index in range(1, 181)
+        f"2026400{index:04d}" for index in range(1, 181)
     ]
-    assert [row["姓名"] for row in rows] == [
-        f"虚构学生{index:03d}" for index in range(1, 181)
-    ]
-    assert Counter(row["专业"] for row in rows) == {
+    assert Counter(row["专业"] for row in source_rows) == {
         "建筑学": 60,
         "城乡规划": 60,
         "风景园林": 60,
     }
-    # The checked-in fixture intentionally carries no identity number.  Add only
-    # deterministic H-prefixed synthetic values in memory for API validation.
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=["学号", "姓名", "专业", "证件号"])
-    writer.writeheader()
-    enriched_rows: list[dict[str, str]] = []
-    for row in rows:
-        enriched = {
-            **row,
-            "证件号": fictional_document_number(row["学号"]),
-        }
-        enriched_rows.append(enriched)
-        writer.writerow(enriched)
-    return output.getvalue().encode("utf-8-sig"), enriched_rows
+    return content, rows
 
 
 def assert_all_ok(label: str, responses) -> None:
@@ -75,13 +79,14 @@ def assert_all_ok(label: str, responses) -> None:
 def assert_activation_codes_are_not_plaintext(database_path: Path, codes: set[str]) -> None:
     connection = connect(database_path)
     try:
-        hashes = [
-            str(row["activation_hash"])
-            for row in connection.execute(
-                "SELECT activation_hash FROM students ORDER BY student_no"
-            ).fetchall()
-        ]
-        logical_dump = "\n".join(connection.iterdump())
+        credential_rows = connection.execute(
+            """
+            SELECT activation_hash, activation_ciphertext
+            FROM students ORDER BY student_no
+            """
+        ).fetchall()
+        hashes = [str(row["activation_hash"]) for row in credential_rows]
+        ciphertexts = [str(row["activation_ciphertext"]) for row in credential_rows]
     finally:
         connection.close()
 
@@ -89,7 +94,9 @@ def assert_activation_codes_are_not_plaintext(database_path: Path, codes: set[st
     assert len(set(hashes)) == 180
     assert all(re.fullmatch(r"[0-9a-f]{64}", value) for value in hashes)
     assert codes.isdisjoint(hashes)
-    assert not [code for code in codes if code in logical_dump]
+    assert all(ciphertexts)
+    assert len(set(ciphertexts)) == 180
+    assert codes.isdisjoint(ciphertexts)
 
 
 def test_fictional_roster_full_concurrent_multi_activity_flow(
@@ -97,8 +104,10 @@ def test_fictional_roster_full_concurrent_multi_activity_flow(
     client: TestClient,
     admin_headers: dict[str, str],
     app_config,
+    tmp_path: Path,
 ):
-    roster_bytes, roster = load_fictional_roster()
+    roster_path = tmp_path / "generated-current-roster.csv"
+    roster_bytes, roster = load_fictional_roster(roster_path)
     dashboard = client.get("/api/admin/dashboard").json()
     activity_id = int(dashboard["settings"]["activity_id"])
     assert int(admin_headers["X-Activity-ID"]) == activity_id
@@ -134,8 +143,8 @@ def test_fictional_roster_full_concurrent_multi_activity_flow(
         headers=admin_headers,
         params={"mode": "merge"},
         files={
-            "file": (
-                ROSTER_PATH.name,
+            "files": (
+                    roster_path.name,
                 roster_bytes,
                 "text/csv",
             )
@@ -164,12 +173,7 @@ def test_fictional_roster_full_concurrent_multi_activity_flow(
     }
     assert ready_dashboard["readiness"]["ready"] is True
     assert ready_dashboard["readiness"]["blockers"] == []
-    opened = client.post(
-        "/api/admin/status",
-        headers=admin_headers,
-        json={"status": "open"},
-    )
-    assert opened.status_code == 200, opened.text
+    open_selection_now(client, admin_headers)
 
     student_clients = [
         TestClient(app, client=(SHARED_STUDENT_IP, 40000 + index))
@@ -234,26 +238,35 @@ def test_fictional_roster_full_concurrent_multi_activity_flow(
         )
 
         exported = client.get(
-            "/api/admin/export/selections.csv",
+            "/api/admin/export/selections.xlsx",
             params={"activity_id": activity_id},
         )
         assert exported.status_code == 200, exported.text
-        exported_rows = list(
-            csv.DictReader(io.StringIO(exported.content.decode("utf-8-sig")))
+        selection_workbook = load_workbook(
+            io.BytesIO(exported.content), read_only=True, data_only=True
         )
-        assert len(exported_rows) == 180
-        assert {row["学号"] for row in exported_rows} == {
+        selection_rows = list(
+            selection_workbook["选择记录"].iter_rows(values_only=True)
+        )
+        selection_workbook.close()
+        assert selection_rows[0] == ("学号", "姓名", "专业", "教学组", "选择时间", "来源")
+        assert len(selection_rows) == 181
+        assert {row[0] for row in selection_rows[1:]} == {
             row["学号"] for row in roster
         }
 
         unselected_export = client.get(
-            "/api/admin/export/unselected.csv",
+            "/api/admin/export/unselected.xlsx",
             params={"activity_id": activity_id},
         )
         assert unselected_export.status_code == 200, unselected_export.text
-        assert len(
-            list(csv.reader(io.StringIO(unselected_export.content.decode("utf-8-sig"))))
-        ) == 1
+        unselected_workbook = load_workbook(
+            io.BytesIO(unselected_export.content), read_only=True, data_only=True
+        )
+        assert list(
+            unselected_workbook["未选名单"].iter_rows(values_only=True)
+        ) == [("学号", "姓名", "专业")]
+        unselected_workbook.close()
 
         closed = client.post(
             "/api/admin/status",
@@ -301,7 +314,7 @@ def test_fictional_roster_full_concurrent_multi_activity_flow(
         }
         assert len(next_dashboard["majors"]) == 3
         assert len(next_dashboard["groups"]) == 6
-        assert check_database(app_config.database_path) == "ok"
+        assert check_database(app_config.database_path, app_config.app_secret) == "ok"
     finally:
         for student_client in student_clients:
             student_client.close()

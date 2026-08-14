@@ -27,19 +27,19 @@ MAX_TABLE_COLUMNS = 64
 
 _DOCUMENT_SEPARATORS = re.compile(r"[\s()（）/\\\-‐‑‒–—―]+")
 _DOCUMENT_PATTERNS = (
-    # Mainland resident identity cards (current and legacy).
-    re.compile(r"^\d{17}[0-9X]$"),
-    re.compile(r"^\d{15}$"),
+    # Mainland resident identity cards (18-digit and historical 15-digit forms).
+    re.compile(r"^[0-9]{17}[0-9X]$"),
+    re.compile(r"^[0-9]{15}$"),
     # Hong Kong identity card, Macao resident identity card, and Taiwan ID /
     # unified certificate formats. Formatting punctuation is removed first.
-    re.compile(r"^[A-Z]{1,2}\d{6}[0-9A]$"),
-    re.compile(r"^[157]\d{7}$"),
-    re.compile(r"^[HM]\d{8}$"),
-    re.compile(r"^\d{8}$"),
-    re.compile(r"^[A-Z][1289]\d{8}$"),
-    re.compile(r"^[A-Z]{2}\d{8}$"),
+    re.compile(r"^[A-Z]{1,2}[0-9]{6}[0-9A]$"),
+    re.compile(r"^[157][0-9]{7}$"),
+    re.compile(r"^[HM][0-9]{8}$"),
+    re.compile(r"^[0-9]{8}$"),
+    re.compile(r"^[A-Z][1289][0-9]{8}$"),
+    re.compile(r"^[A-Z]{2}[0-9]{8}$"),
     # School registry expansion: H, M, or T followed by 17 positions.
-    re.compile(r"^[HMT]\d{16}[0-9X]$"),
+    re.compile(r"^[HMT][0-9]{16}[0-9X]$"),
 )
 
 HEADER_ALIASES = {
@@ -67,7 +67,6 @@ class RosterParseError(ValueError):
 class ParsedRosterRow:
     file_index: int
     line_number: int
-    source_student_no: str
     student_no: str
     name: str
     major_name: str
@@ -297,7 +296,6 @@ def parse_roster_file(
             ParsedRosterRow(
                 file_index=file_index,
                 line_number=row_index,
-                source_student_no=values["student_no"].strip(),
                 student_no=student_no,
                 name=name,
                 major_name=values["major"],
