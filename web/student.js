@@ -570,20 +570,59 @@ function resultCardSameOriginImageUrl(value) {
   }
 }
 
-function loadResultCardVerificationQr(payload) {
+async function loadResultCardVerificationQr(payload) {
   const receipt = payload?.receipt;
+  const token = String(receipt?.token || "").trim();
   const verificationCode = String(receipt?.verification_code || "").trim();
   const verifyUrl = resultCardSameOriginImageUrl(receipt?.verify_url);
   const qrImageUrl = resultCardSameOriginImageUrl(receipt?.qr_image_url);
-  if (!receipt || !verificationCode || !verifyUrl || !qrImageUrl) {
-    return Promise.reject(new Error("防伪核验信息不完整，请刷新页面后重试"));
+  if (!receipt || !token || !verificationCode || !verifyUrl || !qrImageUrl || !studentState.csrf) {
+    throw new Error("防伪核验信息不完整，请刷新页面后重试");
   }
+
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    "X-CSRF-Token": studentState.csrf,
+  });
+  if (payload?.settings?.activity_id) {
+    headers.set("X-Activity-ID", String(payload.settings.activity_id));
+  }
+  let response;
+  try {
+    response = await fetch(qrImageUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ token }),
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+  } catch (_error) {
+    throw new Error("防伪二维码加载失败，请检查网络后重试");
+  }
+  if (!response.ok) {
+    let data = null;
+    if ((response.headers.get("content-type") || "").includes("application/json")) {
+      try { data = await response.json(); } catch (_error) { data = null; }
+    }
+    throw new Error(apiErrorDetails(data, response.status).message);
+  }
+  if (!(response.headers.get("content-type") || "").includes("image/png")) {
+    throw new Error("防伪二维码响应格式异常，请刷新页面后重试");
+  }
+  const qrBlob = await response.blob();
+  const objectUrl = URL.createObjectURL(qrBlob);
   return new Promise((resolve, reject) => {
     const image = new Image();
     image.decoding = "async";
-    image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error("防伪二维码加载失败，请检查网络后重试"));
-    image.src = qrImageUrl;
+    image.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error("防伪二维码加载失败，请检查网络后重试"));
+    };
+    image.src = objectUrl;
   });
 }
 

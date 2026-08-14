@@ -165,7 +165,7 @@ def test_native_fullscreen_three_column_stage_fits_tablet_and_small_projector_wi
     assert "aspect-ratio: 3808 / 909" in css
 
 
-def test_quota_inputs_save_after_idle_without_polling_rerender() -> None:
+def test_quota_inputs_save_after_idle_then_refresh_latest_dashboard() -> None:
     _, javascript, _ = _sources()
     persist = javascript.split("async function persistQuotaInput", 1)[1].split(
         "function scheduleQuotaSave", 1
@@ -174,10 +174,12 @@ def test_quota_inputs_save_after_idle_without_polling_rerender() -> None:
     assert "Number.isInteger(nextValue)" in persist
     assert 'setAttribute("aria-busy", "true")' in persist
     assert "await adminApi" in persist
-    assert "loadDashboard" not in persist
+    assert "await loadDashboard({ quiet: true, afterMutation: true })" in persist
     assert "scheduleQuotaSave(input, 0)" in javascript
     assert 'adminEls.quotaMatrix.addEventListener("input"' in javascript
     assert "structureFingerprint" in javascript
+    assert "adminState.quotaSaveTimers.size > 0" in javascript
+    assert 'adminEls.quotaMatrix.querySelector(\'input[data-saving="true"]\')' in javascript
     assert 'document.activeElement?.closest?.("#major-editor, #group-editor, #quota-matrix")' in javascript
 
 

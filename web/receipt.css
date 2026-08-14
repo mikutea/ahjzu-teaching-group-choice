@@ -135,6 +135,37 @@ h1 {
   line-height: 1.75;
 }
 
+.verification-retry {
+  width: 100%;
+  margin: 0 0 22px;
+  padding: 13px 18px;
+  border: 0;
+  border-radius: 14px;
+  background: #7f292f;
+  color: #fff;
+  font: inherit;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.verification-retry:hover {
+  background: #681f25;
+}
+
+.verification-retry:focus-visible {
+  outline: 3px solid rgba(127, 41, 47, .28);
+  outline-offset: 3px;
+}
+
+.verification-retry:disabled {
+  cursor: wait;
+  opacity: .65;
+}
+
+.verification-retry[hidden] {
+  display: none;
+}
+
 .verification-details {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
