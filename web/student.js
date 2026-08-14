@@ -570,6 +570,39 @@ function resultCardSameOriginImageUrl(value) {
   }
 }
 
+function resultCardVerificationQrDataUrl(qrBlob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || "");
+      if (dataUrl.startsWith("data:image/png")) resolve(dataUrl);
+      else reject(new Error("防伪二维码加载失败，请检查网络后重试"));
+    };
+    reader.onerror = () => reject(new Error("防伪二维码加载失败，请检查网络后重试"));
+    reader.onabort = reader.onerror;
+    reader.readAsDataURL(qrBlob);
+  });
+}
+
+async function decodeResultCardVerificationQr(qrBlob) {
+  if (typeof createImageBitmap === "function") {
+    try {
+      return await createImageBitmap(qrBlob);
+    } catch (_error) {
+      // Older WebKit versions can expose createImageBitmap but reject PNG blobs.
+    }
+  }
+
+  const dataUrl = await resultCardVerificationQrDataUrl(qrBlob);
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("防伪二维码加载失败，请检查网络后重试"));
+    image.src = dataUrl;
+  });
+}
+
 async function loadResultCardVerificationQr(payload) {
   const receipt = payload?.receipt;
   const token = String(receipt?.token || "").trim();
@@ -609,21 +642,13 @@ async function loadResultCardVerificationQr(payload) {
   if (!(response.headers.get("content-type") || "").includes("image/png")) {
     throw new Error("防伪二维码响应格式异常，请刷新页面后重试");
   }
-  const qrBlob = await response.blob();
-  const objectUrl = URL.createObjectURL(qrBlob);
-  return new Promise((resolve, reject) => {
-    const image = new Image();
-    image.decoding = "async";
-    image.onload = () => {
-      URL.revokeObjectURL(objectUrl);
-      resolve(image);
-    };
-    image.onerror = () => {
-      URL.revokeObjectURL(objectUrl);
-      reject(new Error("防伪二维码加载失败，请检查网络后重试"));
-    };
-    image.src = objectUrl;
-  });
+  let qrBlob;
+  try {
+    qrBlob = await response.blob();
+  } catch (_error) {
+    throw new Error("防伪二维码加载失败，请检查网络后重试");
+  }
+  return decodeResultCardVerificationQr(qrBlob);
 }
 
 function resultCardBlob(canvas) {
@@ -837,8 +862,12 @@ async function createResultCardBlob(payload) {
     context.lineWidth = 2;
     context.stroke();
     context.imageSmoothingEnabled = false;
-    context.drawImage(verificationQr, 747, verificationY + 47, 184, 184);
-    context.imageSmoothingEnabled = true;
+    try {
+      context.drawImage(verificationQr, 747, verificationY + 47, 184, 184);
+    } finally {
+      context.imageSmoothingEnabled = true;
+      if (typeof verificationQr.close === "function") verificationQr.close();
+    }
   }
 
   context.strokeStyle = "#c9aaad";

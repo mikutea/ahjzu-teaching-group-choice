@@ -45,6 +45,7 @@ def test_student_result_receipt_is_mobile_portrait_and_never_contains_login_secr
     assert "receipt.verify_url" in card_source
     assert "receipt?.qr_image_url" in javascript
     assert "url.origin === window.location.origin" in javascript
+    assert 'typeof verificationQr.close === "function"' in card_source
     assert "扫码可核对服务端原始记录" in card_source
     assert "在线核验暂不可用" in card_source
     assert 'context.fillText("核"' not in card_source
@@ -74,7 +75,7 @@ def test_result_preview_is_cached_and_uses_csp_compatible_data_url() -> None:
     assert '.student-body[data-student-view="success"] .success-card__actions { grid-template-columns: 1fr 1fr;' in css
 
 
-def test_signed_receipt_qr_failure_blocks_preview_cache_and_download() -> None:
+def test_signed_receipt_qr_uses_csp_compatible_decode_and_fails_closed() -> None:
     javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
     qr_loader_source = "function resultCardSameOriginImageUrl" + javascript.split(
         "function resultCardSameOriginImageUrl", 1
@@ -82,6 +83,9 @@ def test_signed_receipt_qr_failure_blocks_preview_cache_and_download() -> None:
     result_flow_source = "function resultCardPreviewKey" + javascript.split(
         "function resultCardPreviewKey", 1
     )[1].split("function createGroupOption", 1)[0]
+
+    assert "createImageBitmap(qrBlob)" in qr_loader_source
+    assert "URL.createObjectURL" not in qr_loader_source
 
     harness = r"""
 const assert = require("node:assert/strict");
@@ -91,14 +95,33 @@ const window = {
     origin: "https://class.example",
   },
 };
+let bitmapShouldDecode = true;
+let bitmapDecodeCalls = 0;
+const decodedBitmap = { kind: "verification-qr-bitmap" };
+async function createImageBitmap(blob) {
+  bitmapDecodeCalls += 1;
+  assert.equal(blob.type, "image/png");
+  if (!bitmapShouldDecode) throw new Error("bitmap decode failed");
+  return decodedBitmap;
+}
 let imageRequests = 0;
-let imageShouldLoad = true;
+let fallbackImageShouldLoad = true;
 class Image {
-  set src(_value) {
+  set src(value) {
     imageRequests += 1;
-    queueMicrotask(() => imageShouldLoad
+    assert.match(value, /^data:image\/png;base64,/);
+    queueMicrotask(() => fallbackImageShouldLoad
       ? this.onload()
-      : this.onerror(new Error("network unavailable")));
+      : this.onerror(new Error("data URL decode failed")));
+  }
+}
+let fallbackDataUrlReads = 0;
+class FileReader {
+  readAsDataURL(blob) {
+    fallbackDataUrlReads += 1;
+    assert.equal(blob.type, "image/png");
+    this.result = "data:image/png;base64,iVBORw0KGgo=";
+    queueMicrotask(() => this.onload());
   }
 }
 
@@ -128,18 +151,30 @@ const studentEls = {
 };
 let dataUrlCalls = 0;
 const fetchCalls = [];
+let apiShouldSucceed = true;
 let objectUrlCalls = 0;
 let revokedObjectUrls = 0;
 let anchorClicks = 0;
 let lastMessage = null;
 async function fetch(url, options) {
   fetchCalls.push({url, options});
+  if (!apiShouldSucceed) {
+    return {
+      ok: false,
+      status: 503,
+      headers: {get(name) { return name.toLowerCase() === "content-type" ? "application/json" : null; }},
+      async json() { return {detail: "二维码服务暂不可用"}; },
+    };
+  }
   return {
     ok: true,
     status: 200,
     headers: {get(name) { return name.toLowerCase() === "content-type" ? "image/png" : null; }},
     async blob() { return {type: "image/png"}; },
   };
+}
+function apiErrorDetails(data, status) {
+  return {message: data?.detail || `request failed: ${status}`};
 }
 async function createResultCardBlob(value) {
   await loadResultCardVerificationQr(value);
@@ -154,7 +189,7 @@ function showStudentMessage(message, kind) {
 }
 URL.createObjectURL = () => {
   objectUrlCalls += 1;
-  return `blob:verification-qr-${objectUrlCalls}`;
+  throw new Error("CSP-incompatible blob URL must not be created");
 };
 URL.revokeObjectURL = () => { revokedObjectUrls += 1; };
 const document = {
@@ -182,20 +217,53 @@ const document = {
   }
   assert.equal(fetchCalls.length, 0, "核验信息缺失或非同源时不应请求二维码");
   assert.equal(imageRequests, 0);
+  assert.equal(bitmapDecodeCalls, 0);
 
   const validQr = await loadResultCardVerificationQr(payload);
-  assert.ok(validQr instanceof Image, "完整同源核验信息应正常加载二维码");
+  assert.equal(validQr, decodedBitmap, "完整同源核验信息应由 createImageBitmap 解码");
   assert.equal(fetchCalls.length, 1);
   assert.equal(fetchCalls[0].url, payload.receipt.qr_image_url);
   assert.equal(fetchCalls[0].options.method, "POST");
   assert.deepEqual(JSON.parse(fetchCalls[0].options.body), {token: payload.receipt.token});
   assert.equal(fetchCalls[0].options.headers.get("X-CSRF-Token"), "student-csrf-token");
   assert.equal(fetchCalls[0].options.headers.get("X-Activity-ID"), "9");
-  assert.equal(imageRequests, 1);
-  assert.equal(objectUrlCalls, 1);
-  assert.equal(revokedObjectUrls, 1);
+  assert.equal(bitmapDecodeCalls, 1);
+  assert.equal(imageRequests, 0, "正常路径不应依赖 Image 加载 blob URL");
+  assert.equal(fallbackDataUrlReads, 0);
+  assert.equal(objectUrlCalls, 0);
+  assert.equal(revokedObjectUrls, 0);
 
-  imageShouldLoad = false;
+  const availableBitmapDecoder = createImageBitmap;
+  createImageBitmap = undefined;
+  const fallbackQr = await loadResultCardVerificationQr(payload);
+  assert.ok(fallbackQr instanceof Image, "无 createImageBitmap 时应使用 CSP 允许的 data URL 解码");
+  assert.equal(bitmapDecodeCalls, 1);
+  assert.equal(fallbackDataUrlReads, 1);
+  assert.equal(imageRequests, 1);
+  assert.equal(objectUrlCalls, 0);
+  createImageBitmap = availableBitmapDecoder;
+
+  apiShouldSucceed = false;
+  await assert.rejects(
+    loadResultCardVerificationQr(payload),
+    /二维码服务暂不可用/,
+  );
+  assert.equal(bitmapDecodeCalls, 1, "API 失败时不应尝试解码响应");
+  assert.equal(imageRequests, 1);
+  assert.equal(objectUrlCalls, 0);
+
+  apiShouldSucceed = true;
+  bitmapShouldDecode = false;
+  fallbackImageShouldLoad = false;
+  await assert.rejects(
+    loadResultCardVerificationQr(payload),
+    /防伪二维码加载失败.*重试/,
+  );
+  assert.equal(bitmapDecodeCalls, 2);
+  assert.equal(fallbackDataUrlReads, 2, "位图解码失败时仅回退到 CSP 允许的 data URL");
+  assert.equal(imageRequests, 2);
+  assert.equal(objectUrlCalls, 0);
+
   await ensureStudentResultCardPreview(payload);
   assert.equal(studentState.resultCardPreviewKey, null, "二维码失败不能写入预览缓存键");
   assert.equal(studentState.resultCardPreviewUrl, null, "二维码失败不能写入预览缓存内容");
@@ -205,8 +273,11 @@ const document = {
   assert.match(studentEls.resultCardPreviewStatus.textContent, /防伪二维码.*重试/);
 
   await downloadStudentResultCard();
-  assert.equal(objectUrlCalls, 3, "失败请求只能创建并回收临时二维码对象 URL");
-  assert.equal(revokedObjectUrls, 3, "所有临时二维码对象 URL 都必须及时回收");
+  assert.equal(bitmapDecodeCalls, 4);
+  assert.equal(fallbackDataUrlReads, 4);
+  assert.equal(imageRequests, 4);
+  assert.equal(objectUrlCalls, 0, "防伪二维码解码不得创建 CSP 禁止的 blob URL");
+  assert.equal(revokedObjectUrls, 0);
   assert.equal(anchorClicks, 0, "二维码失败不能触发缺少防伪二维码的下载");
   assert.deepEqual(lastMessage, {
     message: "防伪二维码加载失败，请检查网络后重试",
