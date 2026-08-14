@@ -617,6 +617,13 @@ function startAdminPolling() {
   renderBoardClock();
 }
 
+function structureEditorAutosaveBusy() {
+  return adminState.entitySaveTimers.size > 0
+    || Boolean(document.activeElement?.closest?.("#major-editor, #group-editor, #quota-matrix"))
+    || Boolean(adminEls.majorEditor.querySelector('.entity-row[data-saving="true"]'))
+    || Boolean(adminEls.groupEditor.querySelector('.entity-row[data-saving="true"]'));
+}
+
 function renderDashboard(data) {
   synchronizeServerClock(data);
   const phase = dashboardPhase(data);
@@ -688,8 +695,7 @@ function renderDashboard(data) {
       ...data.groups.map((group) => [group.id, group.name, group.active, group.total_capacity, group.sort_order]),
       ...data.quotas.map((quota) => [quota.major_id, quota.group_id, quota.capacity, quota.selected_count]),
     ]);
-    const structureEditorHasFocus = Boolean(document.activeElement?.closest?.("#major-editor, #group-editor, #quota-matrix"));
-    if (!structureEditorHasFocus && structureFingerprint !== adminState.structureFingerprint) {
+    if (!structureEditorAutosaveBusy() && structureFingerprint !== adminState.structureFingerprint) {
       adminState.structureFingerprint = structureFingerprint;
       renderStructure(data, structureLocked);
     }
@@ -1982,6 +1988,14 @@ function entityRowHasChanges(row, { includeCapacity = true } = {}) {
     && row._capacityInput.value !== row.dataset.originalCapacity;
 }
 
+function renderLatestStructureAfterEntitySave() {
+  if (
+    adminState.currentView === "structure"
+    && adminState.dashboard
+    && !structureEditorAutosaveBusy()
+  ) renderDashboard(adminState.dashboard);
+}
+
 async function persistEntityRow(row, { refreshAfter = false, includeCapacity = false } = {}) {
   if (!row?.isConnected) return;
   const key = entityRowSaveKey(row);
@@ -2071,6 +2085,7 @@ async function persistEntityRow(row, { refreshAfter = false, includeCapacity = f
     if (queued && row.isConnected) {
       scheduleEntityRowSave(row, 0, { refreshAfter: queuedRefresh, includeCapacity: queuedCapacity });
     }
+    renderLatestStructureAfterEntitySave();
   }
 }
 

@@ -1,3 +1,5 @@
+import json
+import subprocess
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -65,6 +67,191 @@ def test_entity_names_autosave_with_ime_guard_and_capacity_only_on_commit() -> N
     assert "delay = 360" in javascript
     assert "saveQueued" in javascript
     assert "保存失败 · 已还原" in javascript
+
+
+def test_entity_autosave_keeps_the_latest_queued_edit_across_dashboard_refresh() -> None:
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const dashboardFunctions = source.slice(
+  source.indexOf("function structureEditorAutosaveBusy"),
+  source.indexOf("function renderDashboardPhaseStatus"),
+);
+const saveFunctions = "function entityRowSaveKey" + source.split("function entityRowSaveKey", 2)[1].split(
+  "function wireEntityAutosave", 1,
+)[0];
+
+const row = {
+  dataset: {
+    entityKind: "group",
+    id: "3",
+    originalName: "原教学组",
+    originalCapacity: "10",
+  },
+  isConnected: true,
+  _nameInput: {
+    value: "第一版教学组",
+    setCustomValidity() {},
+    reportValidity() {},
+  },
+  _capacityInput: {
+    value: "11",
+    setCustomValidity() {},
+    reportValidity() {},
+  },
+  _saveState: {className: "", textContent: ""},
+  setAttribute() {},
+  removeAttribute() {},
+};
+const makeElement = () => ({
+  textContent: "",
+  href: "",
+  style: {},
+  classList: {toggle() {}},
+  setAttribute() {},
+});
+const majorEditor = {
+  dataset: {activityId: "7"},
+  querySelector() { return null; },
+};
+const groupEditor = {
+  dataset: {activityId: "7"},
+  querySelector(selector) {
+    return row.isConnected && row.dataset.saving === "true" && selector.includes('data-saving="true"')
+      ? row
+      : null;
+  },
+};
+const adminEls = new Proxy({majorEditor, groupEditor}, {
+  get(target, property) {
+    if (!(property in target)) target[property] = makeElement();
+    return target[property];
+  },
+});
+const adminState = {
+  currentView: "structure",
+  dashboard: null,
+  entitySaveTimers: new Map(),
+  lastActivityId: 7,
+  structureFingerprint: JSON.stringify([false, [3, "原教学组", true, 10, 1]]),
+};
+const document = {activeElement: null};
+const liveBoard = {dataset: {}, classList: {toggle() {}}};
+const synchronizeServerClock = () => {};
+const dashboardPhase = () => "waiting";
+const boardDisplayMode = () => "waiting";
+const normalizedPresence = () => ({online: 0, absent: 0});
+const clearAllRevealedActivationCodes = () => {};
+const stopRosterAutoScroll = () => {};
+const stopLiveFeedAutoScroll = () => {};
+const stopWaitingFeedAutoScroll = () => {};
+const renderBoardClock = () => {};
+const renderReadiness = () => {};
+const renderDashboardPhaseStatus = () => {};
+const renderGroupProgress = () => {};
+const renderLiveSelectionFeed = () => {};
+const renderWaitingStudentFeed = () => {};
+const renderQr = () => {};
+const renderUnselectedList = () => {};
+const renderRecentSelections = () => {};
+const renderAssignmentTable = () => {};
+const renderStudentRoster = () => {};
+const renderActivities = () => {};
+const fillSettingsForm = () => {};
+const showAdminToast = () => {};
+let structureRenders = 0;
+const renderStructure = () => {
+  structureRenders += 1;
+  row.isConnected = false;
+};
+
+let serverGroup = {id: 3, name: "原教学组", active: true, total_capacity: 10, sort_order: 1, selected_count: 0};
+const payloads = [];
+const pendingResponses = [];
+let activeRequests = 0;
+let maxConcurrentRequests = 0;
+async function adminApi(path, options) {
+  if (path !== "/api/admin/groups/3") throw new Error(`unexpected API ${path}`);
+  const payload = JSON.parse(options.body);
+  payloads.push(payload);
+  activeRequests += 1;
+  maxConcurrentRequests = Math.max(maxConcurrentRequests, activeRequests);
+  return new Promise((resolve) => pendingResponses.push(() => {
+    if (Object.hasOwn(payload, "name")) serverGroup.name = payload.name;
+    if (Object.hasOwn(payload, "total_capacity")) serverGroup.total_capacity = payload.total_capacity;
+    activeRequests -= 1;
+    resolve({});
+  }));
+}
+function dashboardData() {
+  return {
+    settings: {activity_id: 7, activity_title: "回归测试", status: "waiting", phase: "waiting", public_base_url: ""},
+    totals: {students: 0, selected: 0, unselected: 0},
+    readiness: {},
+    majors: [],
+    groups: [{...serverGroup}],
+    quotas: [],
+    activities: [],
+  };
+}
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+eval(`
+  (async () => {
+    ${dashboardFunctions}
+    ${saveFunctions}
+    async function loadDashboard() {
+      const data = dashboardData();
+      adminState.dashboard = data;
+      renderDashboard(data);
+    }
+    const firstSave = persistEntityRow(row, {refreshAfter: true, includeCapacity: true});
+    await tick();
+    row._nameInput.value = "最终教学组";
+    row._capacityInput.value = "12";
+    await persistEntityRow(row, {refreshAfter: true, includeCapacity: true});
+    pendingResponses.shift()();
+    await firstSave;
+    for (let attempt = 0; attempt < 20 && pendingResponses.length === 0; attempt += 1) await tick();
+    if (pendingResponses.length) pendingResponses.shift()();
+    for (let attempt = 0; attempt < 20 && (row.dataset.saving === "true" || adminState.entitySaveTimers.size); attempt += 1) await tick();
+    const structureRendersAfterAutosaves = structureRenders;
+    const rowConnectedAfterAutosaves = row.isConnected;
+    await loadDashboard();
+    process.stdout.write(JSON.stringify({
+      payloads,
+      maxConcurrentRequests,
+      structureRendersAfterAutosaves,
+      rowConnectedAfterAutosaves,
+      structureRenders,
+      rowConnected: row.isConnected,
+      timers: adminState.entitySaveTimers.size,
+      saving: row.dataset.saving === "true",
+    }));
+  })().catch((error) => { console.error(error); process.exitCode = 1; });
+`);
+"""
+    execution = subprocess.run(
+        ["node", "-e", script, str(ROOT / "web" / "admin.js")],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert execution.returncode == 0, execution.stderr
+    assert json.loads(execution.stdout) == {
+        "payloads": [
+            {"name": "第一版教学组", "total_capacity": 11},
+            {"name": "最终教学组", "total_capacity": 12},
+        ],
+        "maxConcurrentRequests": 1,
+        "structureRendersAfterAutosaves": 1,
+        "rowConnectedAfterAutosaves": False,
+        "structureRenders": 1,
+        "rowConnected": False,
+        "timers": 0,
+        "saving": False,
+    }
 
 
 def test_mutation_refresh_waits_for_an_inflight_poll_and_add_forms_force_refresh() -> None:

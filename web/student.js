@@ -571,16 +571,19 @@ function resultCardSameOriginImageUrl(value) {
 }
 
 function loadResultCardVerificationQr(payload) {
-  const url = resultCardSameOriginImageUrl(payload?.receipt?.qr_image_url);
-  if (!url) return Promise.resolve(null);
-  return new Promise((resolve) => {
+  const receipt = payload?.receipt;
+  const verificationCode = String(receipt?.verification_code || "").trim();
+  const verifyUrl = resultCardSameOriginImageUrl(receipt?.verify_url);
+  const qrImageUrl = resultCardSameOriginImageUrl(receipt?.qr_image_url);
+  if (!receipt || !verificationCode || !verifyUrl || !qrImageUrl) {
+    return Promise.reject(new Error("防伪核验信息不完整，请刷新页面后重试"));
+  }
+  return new Promise((resolve, reject) => {
     const image = new Image();
     image.decoding = "async";
     image.onload = () => resolve(image);
-    // A receipt must still be downloadable when the optional verification QR
-    // cannot be fetched. The human-readable verification code remains visible.
-    image.onerror = () => resolve(null);
-    image.src = url;
+    image.onerror = () => reject(new Error("防伪二维码加载失败，请检查网络后重试"));
+    image.src = qrImageUrl;
   });
 }
 
