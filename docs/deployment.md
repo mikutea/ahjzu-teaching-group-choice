@@ -25,6 +25,12 @@ sudo APP_DIR=/opt/ahjzu-teaching-group-choice \
 `cloudflared` 访问，不向校园网或公网直接暴露。只有明确需要受控的局域网直连、并已经
 配置主机防火墙时，才可显式改为 `0.0.0.0`。
 
+在建议的 2 vCPU、2 GiB 虚拟机上，应用容器默认限制为 1.5 CPU 和 1 GiB 内存，给
+Docker、SQLite 页缓存、`cloudflared` 与系统服务保留余量。可通过 `.env` 中的
+`APP_CPU_LIMIT`、`APP_MEMORY_LIMIT` 调整，但正式环境不应取消资源上限。应用保持单个
+Uvicorn worker：名额写入由 SQLite 单写事务串行化，多 worker 不会提高原子抢位吞吐，
+反而会扩大写锁竞争。
+
 ## 更新
 
 首次安装更新器，或需要从已审核提交刷新更新器时，先从完整指定的提交提取并校验脚本；
@@ -104,6 +110,8 @@ sudo APP_DIR=/opt/ahjzu-teaching-group-choice \
 
 ```dotenv
 ORIGIN_BIND=127.0.0.1
+APP_CPU_LIMIT=1.5
+APP_MEMORY_LIMIT=1g
 PUBLIC_BASE_URL=https://choice.example.com
 COOKIE_SECURE=true
 TRUSTED_PROXY_IPS=172.18.0.1

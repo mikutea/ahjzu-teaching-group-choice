@@ -9,6 +9,8 @@ fi
 APP_DIR="${APP_DIR:-/opt/ahjzu-teaching-group-choice}"
 PUBLIC_URL="${PUBLIC_URL:-}"
 ORIGIN_BIND_VALUE="${ORIGIN_BIND:-127.0.0.1}"
+APP_CPU_LIMIT_VALUE="${APP_CPU_LIMIT:-1.5}"
+APP_MEMORY_LIMIT_VALUE="${APP_MEMORY_LIMIT:-1g}"
 
 if [[ ! -f "${APP_DIR}/docker-compose.yml" ]]; then
   echo "未找到 ${APP_DIR}/docker-compose.yml" >&2
@@ -42,6 +44,8 @@ if [[ ! -f .env ]]; then
     echo "ENVIRONMENT=production"
     echo "DATA_DIR=/data"
     echo "ORIGIN_BIND=${ORIGIN_BIND_VALUE}"
+    echo "APP_CPU_LIMIT=${APP_CPU_LIMIT_VALUE}"
+    echo "APP_MEMORY_LIMIT=${APP_MEMORY_LIMIT_VALUE}"
     echo "APP_SECRET=${APP_SECRET_VALUE}"
     echo "ADMIN_USERNAME=admin"
     echo "ADMIN_INITIAL_PASSWORD=${ADMIN_PASSWORD_VALUE}"
