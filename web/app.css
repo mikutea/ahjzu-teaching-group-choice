@@ -64,24 +64,31 @@ img { display: block; max-width: 100%; }
 
 .eyebrow--light { color: #f0dfe0; }
 
+/* Official PNG is 4151x1487; its measured alpha bbox is
+   (328,152)-(4136,1061). Every placement uses that 3808:909 crop with a
+   0.25% inner safety edge so anti-aliased logo pixels are never clipped. */
 .college-wordmark {
   position: relative;
   display: block;
   flex: 0 0 auto;
-  overflow: hidden;
+  aspect-ratio: 3808 / 909;
+  overflow: visible;
 }
 
 .college-wordmark img {
   position: absolute;
+  width: 108.4623%;
+  height: auto;
   max-width: none;
+  left: -8.3204%;
+  top: -16.3881%;
+  pointer-events: none;
+  user-select: none;
 }
 
-.college-wordmark--mobile { width: 176px; height: 43px; }
-.college-wordmark--mobile img { width: 192px; left: -15px; top: -7px; }
-.college-wordmark--desktop { width: 215px; height: 52px; }
-.college-wordmark--desktop img { width: 236px; left: -18px; top: -8px; }
-.college-wordmark--login { width: 330px; height: 74px; }
-.college-wordmark--login img { width: 358px; left: -27px; top: -12px; }
+.college-wordmark--mobile { width: 176px; }
+.college-wordmark--desktop { width: 215px; }
+.college-wordmark--login { width: min(100%, 390px); }
 
 .button {
   display: inline-flex;
@@ -272,6 +279,11 @@ img { display: block; max-width: 100%; }
 .success-card__message { color: var(--muted); line-height: 1.8; }
 .success-card__message strong { color: var(--college); }
 .success-ticket { display: flex; align-items: center; justify-content: space-between; margin: 20px 0 12px; border: 1px dashed var(--rule-strong); border-radius: 10px; padding: 13px; background: var(--college-soft); font-size: 12px; }
+.result-card-preview { width: min(100%, 240px); margin: 14px auto 10px; }
+.result-card-preview__frame { position: relative; display: grid; width: 100%; aspect-ratio: 9 / 16; place-items: center; border: 1px solid var(--rule-strong); border-radius: 15px; background: linear-gradient(145deg, #fff, var(--college-soft)); box-shadow: 0 10px 28px rgba(72,24,29,.1); overflow: hidden; }
+.result-card-preview__frame img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.result-card-preview__status { margin: 0; padding: 14px; color: var(--muted); text-align: center; font-size: 11px; line-height: 1.6; }
+.result-card-preview figcaption { margin-top: 6px; color: var(--muted); text-align: center; font-size: 9px; line-height: 1.45; }
 .success-card__tip { color: var(--muted); font-size: 11px; }
 .success-card__tip strong { display: block; margin-bottom: 3px; color: var(--college); font-size: 12px; }
 .success-card__actions { display: grid; gap: 10px; margin-top: 16px; }
@@ -304,11 +316,14 @@ img { display: block; max-width: 100%; }
 
 /* Admin login */
 .admin-login-shell { display: grid; min-height: 100vh; grid-template-columns: minmax(420px, 1.15fr) minmax(420px, .85fr); }
-.admin-login-brand { position: relative; display: flex; flex-direction: column; justify-content: center; overflow: hidden; padding: 10vw; color: #fff; background: var(--college); }
+.admin-login-brand { position: relative; display: grid; align-items: center; overflow: hidden; padding: clamp(54px,8vw,132px); color: #fff; background: var(--college); }
 .admin-login-brand::before { content: ""; position: absolute; inset: 0; background-image: linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px); background-size: 38px 38px; }
 .admin-login-brand > * { position: relative; z-index: 1; }
-.admin-login-brand h1 { max-width: 620px; margin: 16px 0 12px; font-size: clamp(34px, 4.1vw, 62px); line-height: 1.12; letter-spacing: -.035em; }
-.admin-login-brand > p:last-of-type { color: #ead7d9; font-size: 16px; }
+.admin-login-brand__content { display: grid; width: min(100%, 720px); align-content: center; gap: clamp(28px,4.5vh,54px); }
+.admin-login-brand__copy { display: grid; gap: 12px; }
+.admin-login-brand h1 { max-width: 620px; margin: 0; font-size: clamp(34px, 4.1vw, 62px); line-height: 1.12; letter-spacing: -.035em; }
+.admin-login-brand__copy > p { margin: 0; }
+.admin-login-brand__copy > p:last-of-type { color: #ead7d9; font-size: 16px; }
 .architectural-lines { position: absolute; z-index: 0 !important; right: -14%; bottom: -22%; width: 64%; aspect-ratio: 1; border: 1px solid rgba(255,255,255,.12); transform: rotate(45deg); }
 .architectural-lines::before, .architectural-lines::after { content: ""; position: absolute; inset: 14%; border: 1px solid rgba(255,255,255,.09); }
 .architectural-lines::after { inset: 30%; }
@@ -361,6 +376,17 @@ img { display: block; max-width: 100%; }
 .waiting-overview { display: grid; flex: 1; align-content: center; gap: 26px; }
 .waiting-overview__metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .waiting-overview__progress { padding: 0 4px; }
+.waiting-feed-shell { display: grid; min-height: 0; border: 1px solid var(--rule); border-radius: 11px; background: #fff; overflow: hidden; }
+.waiting-feed-shell__heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid var(--rule); padding: 9px 11px; color: var(--college); background: var(--college-soft); font-size: 10px; }
+.waiting-feed-shell__heading span { color: var(--muted); font-size: 9px; font-weight: 700; }
+.waiting-student-feed { display: grid; max-height: 145px; grid-auto-rows: max-content; align-content: start; overflow: hidden; will-change: scroll-position; }
+.waiting-feed-item { display: grid; grid-template-columns: 27px minmax(0,1fr); align-items: center; gap: 8px; min-height: 44px; border-bottom: 1px solid #eee5e6; padding: 7px 10px; background: #fff; }
+.waiting-feed-item:last-child { border-bottom: 0; }
+.waiting-feed-item__marker { display: grid; width: 25px; height: 25px; place-items: center; border-radius: 50%; color: #fff; background: var(--success); font-size: 10px; font-weight: 900; }
+.waiting-feed-item strong, .waiting-feed-item small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.waiting-feed-item strong { font-size: 11px; }
+.waiting-feed-item small { margin-top: 1px; color: var(--muted); font-size: 9px; }
+.waiting-feed-empty { display: grid; min-height: 74px; place-items: center; padding: 12px; color: var(--muted); text-align: center; font-size: 10px; }
 .waiting-overview > p { margin: 0; border-left: 3px solid var(--college); padding: 13px 15px; color: var(--muted); background: var(--college-soft); font-size: 11px; line-height: 1.75; }
 .board-panel--stats { grid-area: stats; }
 .board-panel--qr { grid-area: qr; }
@@ -420,7 +446,10 @@ img { display: block; max-width: 100%; }
 .board-panel--qr { display: flex; flex-direction: column; align-items: stretch; text-align: center; }
 .qr-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; text-align: left; }
 .qr-heading h2 { margin-bottom: 0; }
-.qr-frame { position: relative; display: grid; width: min(82%, 360px); aspect-ratio: 1; place-items: center; margin: auto; border: 1px solid var(--rule); padding: 18px; background: #fff; box-shadow: inset 0 0 0 8px #faf7f7, 0 10px 30px rgba(72,24,29,.08); }
+.qr-portal { position: relative; display: grid; width: min(100%, 460px); justify-items: center; align-self: center; margin: auto; border: 1px solid var(--rule); border-radius: 20px; padding: 17px 18px 14px; background: radial-gradient(circle at 50% 42%, #fff 0 38%, #faf5f5 78%, #f4eaea 100%); box-shadow: 0 15px 38px rgba(72,24,29,.11); isolation: isolate; }
+.qr-portal::before { content: ""; position: absolute; z-index: -1; inset: 10px; border: 1px solid rgba(127,41,47,.08); border-radius: 14px; pointer-events: none; }
+.qr-portal__label { display: inline-flex; align-items: center; gap: 8px; margin-bottom: 9px; border-radius: 99px; padding: 6px 11px; color: var(--college); background: #fff; box-shadow: 0 3px 12px rgba(72,24,29,.08); font-size: 10px; }
+.qr-frame { position: relative; display: grid; width: min(92%, 380px); aspect-ratio: 1; place-items: center; border: 1px solid var(--rule-strong); border-radius: 12px; padding: 9px; background: #fff; box-shadow: inset 0 0 0 5px #faf7f7, 0 9px 24px rgba(72,24,29,.1); }
 .qr-frame img { width: 100%; height: 100%; object-fit: contain; }
 .qr-placeholder { padding: 18px; color: var(--muted); font-size: 12px; line-height: 1.7; }
 .qr-corner { position: absolute; width: 22px; height: 22px; border-color: var(--college); border-style: solid; }
@@ -428,6 +457,9 @@ img { display: block; max-width: 100%; }
 .qr-corner--b { top: -4px; right: -4px; border-width: 3px 3px 0 0; }
 .qr-corner--c { bottom: -4px; left: -4px; border-width: 0 0 3px 3px; }
 .qr-corner--d { right: -4px; bottom: -4px; border-width: 0 3px 3px 0; }
+.qr-portal__instruction { display: grid; gap: 3px; margin: 10px 0 0; }
+.qr-portal__instruction strong { color: var(--ink); font-size: 13px; }
+.qr-portal__instruction span { color: var(--muted); font-size: 10px; line-height: 1.55; }
 .public-url { margin: 12px 0 10px; color: var(--muted); font-family: Consolas, monospace; font-size: 10px; overflow-wrap: anywhere; }
 .qr-notice { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 4px 10px; border-top: 1px solid var(--rule); padding-top: 12px; text-align: left; }
 .qr-notice .status-dot { grid-row: 1 / 3; margin-left: 3px; color: var(--danger); box-shadow: 0 0 0 3px rgba(166,50,50,.1); }
@@ -446,6 +478,7 @@ img { display: block; max-width: 100%; }
 .board-stage--open .board-stage__countdown { color: var(--success); }
 
 .panel-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.completion-progress + .panel-title-row { margin-top: 19px; }
 .board-list-meta { display: grid; justify-items: end; gap: 6px; }
 .count-chip { flex: 0 0 auto; border-radius: 99px; padding: 5px 9px; color: var(--college); background: var(--college-soft); font-size: 10px; font-weight: 800; }
 .compact-search { display: flex; align-items: center; gap: 8px; margin-bottom: 11px; border: 1px solid var(--rule); border-radius: 9px; padding: 0 10px; color: var(--muted); background: #faf8f8; }
@@ -484,9 +517,9 @@ img { display: block; max-width: 100%; }
 .inline-add-form--group { grid-template-columns: 1fr 84px auto; }
 .inline-add-form input { min-height: 40px; font-size: 12px; }
 .inline-add-form .button { min-height: 40px; font-size: 11px; }
-.entity-editor { display: grid; max-height: 330px; gap: 8px; overflow: auto; padding-right: 3px; }
-.entity-row { display: grid; grid-template-columns: 24px minmax(100px,1fr) minmax(126px,auto) auto auto; align-items: center; gap: 8px; border: 1px solid #eee5e6; border-radius: 10px; padding: 8px; background: #fcfafa; }
-.entity-row--group { grid-template-columns: 24px minmax(100px,1fr) 80px minmax(126px,auto) auto auto; }
+.entity-editor { display: grid; max-height: 330px; gap: 8px; overflow-x: hidden; overflow-y: auto; padding-right: 3px; }
+.entity-row { display: grid; min-width: 0; grid-template-columns: 24px minmax(100px,1fr) minmax(126px,auto) minmax(76px,auto) auto; align-items: center; gap: 8px; border: 1px solid #eee5e6; border-radius: 10px; padding: 8px; background: #fcfafa; }
+.entity-row--group { grid-template-columns: 24px minmax(100px,1fr) 80px minmax(126px,auto) minmax(76px,auto) auto; }
 .entity-row__drag { color: #b8aaab; text-align: center; }
 .entity-row input { min-height: 34px; padding: 6px 8px; font-size: 11px; }
 .entity-row__capacity { position: relative; }
@@ -497,6 +530,11 @@ img { display: block; max-width: 100%; }
 .entity-status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .entity-status.is-active { color: var(--success); background: var(--success-soft); }
 .entity-status.is-inactive { color: var(--muted); background: #eee8e8; }
+.entity-save-state { display: inline-flex; min-height: 25px; align-items: center; justify-content: center; border-radius: 99px; padding: 4px 8px; color: var(--muted); background: #f0ebeb; font-size: 9px; font-weight: 800; white-space: nowrap; }
+.entity-save-state.is-saving { color: var(--college); background: var(--college-soft); }
+.entity-save-state.is-saved { color: var(--success); background: var(--success-soft); }
+.entity-save-state.is-pending { color: var(--warning); background: #fff5e7; }
+.entity-save-state.is-error { color: var(--danger); background: #fff0f0; }
 .entity-status-action.button { min-height: 30px; padding: 5px 8px; font-size: 9px; }
 .entity-status-help { max-width: 520px; margin-top: 6px !important; line-height: 1.55; }
 .icon-button { display: grid; width: 31px; height: 31px; place-items: center; border: 1px solid var(--rule); border-radius: 8px; color: var(--muted); background: #fff; font-size: 12px; }
@@ -513,6 +551,7 @@ img { display: block; max-width: 100%; }
 .quota-table thead th { position: sticky; top: 0; z-index: 3; border-top: 1px solid #eee5e6; }
 .quota-table thead th:first-child { z-index: 4; background: #faf7f7; }
 .quota-table input { width: 58px; min-height: 32px; border: 1px solid var(--rule); border-radius: 7px; padding: 5px; text-align: center; }
+.quota-table input[data-pending="true"] { border-color: #d69b50; background: #fff9ef; }
 .quota-cell { display: flex; align-items: center; justify-content: center; gap: 5px; }
 .quota-cell span { color: var(--college); font-size: 9px; font-weight: 800; }
 .quota-total { color: var(--college); font-weight: 800; }
@@ -630,8 +669,7 @@ img { display: block; max-width: 100%; }
   animation: countdown-halo 1s ease-in-out infinite alternate;
 }
 .countdown-content { position: relative; z-index: 4; display: grid; justify-items: center; text-align: center; }
-.college-wordmark--countdown { width: clamp(320px,33vw,620px); height: clamp(76px,8vw,122px); margin-bottom: 22px; }
-.college-wordmark--countdown img { width: 107.5%; left: -7.4%; top: -15%; }
+.college-wordmark--countdown { width: clamp(320px,33vw,620px); margin-bottom: 22px; }
 .countdown-content > span:not(.college-wordmark--countdown) { border: 1px solid rgba(255,255,255,.55); border-radius: 99px; padding: 9px 22px; font-size: clamp(14px,1.1vw,20px); font-weight: 900; letter-spacing: .22em; }
 .countdown-content strong {
   margin: clamp(10px,1.4vh,20px) 0 0;
@@ -692,18 +730,8 @@ img { display: block; max-width: 100%; }
 .board-presentation-brand { display: flex; min-width: 0; align-items: center; gap: 22px; }
 .college-wordmark--board {
   width: clamp(310px,22vw,390px);
-  height: clamp(76px,5.3vw,92px);
   border-radius: 8px;
   background: transparent;
-  overflow: hidden;
-}
-.college-wordmark--board img {
-  position: absolute;
-  width: 106.8%;
-  height: auto;
-  max-width: none;
-  left: -7%;
-  top: -16.5%;
 }
 .board-presentation-brand h1 { min-width: 0; margin: 0; border-left: 1px solid rgba(255,255,255,.4); padding-left: 28px; font-size: clamp(27px,2.1vw,38px); line-height: 1.12; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .board-header-phase { min-width: 150px; border: 2px solid rgba(255,255,255,.84); border-radius: 13px; padding: 13px 20px; text-align: center; font-size: clamp(24px,2vw,36px); }
@@ -743,6 +771,8 @@ img { display: block; max-width: 100%; }
 .live-board.is-presentation .progress-track { height: 12px; }
 .live-board:fullscreen .completion-progress,
 .live-board.is-presentation .completion-progress { margin-top: 18px; padding: 15px 16px 11px; }
+.live-board:fullscreen .completion-progress + .panel-title-row,
+.live-board.is-presentation .completion-progress + .panel-title-row { margin-top: 25px; }
 .live-board:fullscreen .completion-progress__header > div,
 .live-board.is-presentation .completion-progress__header > div { gap: 8px; font-size: 15px; }
 .live-board:fullscreen .completion-progress__header > div > strong,
@@ -820,7 +850,17 @@ img { display: block; max-width: 100%; }
 .live-board:fullscreen #fullscreen-board,
 .live-board.is-presentation #fullscreen-board { display: none; }
 .live-board:fullscreen .qr-frame,
-.live-board.is-presentation .qr-frame { width: min(45vh, 96%, 520px); margin: 8px auto; padding: 14px; }
+.live-board.is-presentation .qr-frame { width: min(48vh, 100%, 560px); padding: 8px; }
+.live-board:fullscreen .qr-portal,
+.live-board.is-presentation .qr-portal { width: min(100%, 600px); margin: 8px auto; padding: 13px 15px 11px; }
+.live-board:fullscreen .qr-portal__label,
+.live-board.is-presentation .qr-portal__label { margin-bottom: 7px; padding: 6px 13px; font-size: 13px; }
+.live-board:fullscreen .qr-portal__instruction,
+.live-board.is-presentation .qr-portal__instruction { margin-top: 8px; }
+.live-board:fullscreen .qr-portal__instruction strong,
+.live-board.is-presentation .qr-portal__instruction strong { font-size: 17px; }
+.live-board:fullscreen .qr-portal__instruction span,
+.live-board.is-presentation .qr-portal__instruction span { font-size: 12px; }
 .live-board:fullscreen .public-url,
 .live-board.is-presentation .public-url { display: none; }
 .live-board:fullscreen .board-stage,
@@ -844,11 +884,27 @@ img { display: block; max-width: 100%; }
 .live-board:fullscreen .qr-notice small,
 .live-board.is-presentation .qr-notice small { font-size: 12px; }
 .live-board:fullscreen .waiting-overview,
-.live-board.is-presentation .waiting-overview { align-content: center; gap: clamp(24px,4vh,52px); }
+.live-board.is-presentation .waiting-overview { align-content: stretch; gap: clamp(13px,2vh,24px); }
 .live-board:fullscreen .waiting-overview__metrics,
 .live-board.is-presentation .waiting-overview__metrics { gap: 16px; }
 .live-board:fullscreen .waiting-overview > p,
 .live-board.is-presentation .waiting-overview > p { padding: 18px 20px; font-size: clamp(16px,1.25vw,22px); line-height: 1.8; }
+.live-board:fullscreen .waiting-feed-shell,
+.live-board.is-presentation .waiting-feed-shell { min-height: 150px; flex: 1; }
+.live-board:fullscreen .waiting-feed-shell__heading,
+.live-board.is-presentation .waiting-feed-shell__heading { padding: 11px 14px; font-size: 15px; }
+.live-board:fullscreen .waiting-feed-shell__heading span,
+.live-board.is-presentation .waiting-feed-shell__heading span { font-size: 12px; }
+.live-board:fullscreen .waiting-student-feed,
+.live-board.is-presentation .waiting-student-feed { min-height: 0; max-height: none; flex: 1; }
+.live-board:fullscreen .waiting-feed-item,
+.live-board.is-presentation .waiting-feed-item { min-height: 50px; grid-template-columns: 34px minmax(0,1fr); padding: 8px 13px; }
+.live-board:fullscreen .waiting-feed-item__marker,
+.live-board.is-presentation .waiting-feed-item__marker { width: 31px; height: 31px; font-size: 13px; }
+.live-board:fullscreen .waiting-feed-item strong,
+.live-board.is-presentation .waiting-feed-item strong { font-size: clamp(15px,1.1vw,19px); }
+.live-board:fullscreen .waiting-feed-item small,
+.live-board.is-presentation .waiting-feed-item small { font-size: 12px; }
 
 @media (max-width: 1350px) {
   .admin-app { grid-template-columns: 218px minmax(0,1fr); }
@@ -881,8 +937,6 @@ img { display: block; max-width: 100%; }
   .live-board:fullscreen .college-wordmark--board,
   .live-board.is-presentation .college-wordmark--board {
     width: clamp(205px,28vw,310px);
-    height: auto;
-    aspect-ratio: 3808 / 909;
   }
   .live-board:fullscreen .board-presentation-brand h1,
   .live-board.is-presentation .board-presentation-brand h1 { padding-left: 12px; font-size: clamp(17px,2.1vw,27px); }
@@ -900,7 +954,7 @@ img { display: block; max-width: 100%; }
   .admin-login-panel { padding: 35px 20px; }
   .admin-app { display: block; }
   .admin-sidebar { position: sticky; z-index: 30; width: 100%; height: auto; flex-direction: row; align-items: center; gap: 14px; padding: 10px 16px; }
-  .admin-sidebar .college-wordmark { margin: 0 auto 0 0; transform: scale(.76); transform-origin: left center; }
+  .admin-sidebar .college-wordmark { width: 164px; margin: 0 auto 0 0; transform: none; }
   .admin-nav { display: flex; }
   .admin-nav__item { min-height: 40px; padding: 0 10px; }
   .admin-nav__item span { display: none; }
@@ -915,16 +969,17 @@ img { display: block; max-width: 100%; }
 
 @media (max-width: 700px) {
   .admin-body:not(.admin-authenticated) { height: 100dvh; min-height: 100dvh; overflow: hidden; }
-  .admin-body:not(.admin-authenticated) .admin-login-shell { height: 100%; min-height: 0; grid-template-rows: 110px minmax(0,1fr); overflow: hidden; }
-  .admin-body:not(.admin-authenticated) .admin-login-brand { min-height: 0; padding: 10px 18px; }
-  .admin-body:not(.admin-authenticated) .admin-login-brand .college-wordmark--login { width: min(72vw,260px); height: 58px; }
-  .admin-body:not(.admin-authenticated) .admin-login-brand .college-wordmark--login img { width: 108.5%; left: -7.6%; top: -15%; }
+  .admin-body:not(.admin-authenticated) .admin-login-shell { height: 100%; min-height: 0; grid-template-rows: minmax(146px,19dvh) minmax(0,1fr); overflow: hidden; }
+  .admin-body:not(.admin-authenticated) .admin-login-brand { min-height: 0; align-items: center; padding: max(14px, env(safe-area-inset-top)) 22px 14px; }
+  .admin-body:not(.admin-authenticated) .admin-login-brand__content { justify-items: center; gap: 12px; }
+  .admin-body:not(.admin-authenticated) .admin-login-brand .college-wordmark--login { width: min(78vw,300px); }
   .admin-body:not(.admin-authenticated) .admin-login-brand .eyebrow,
-  .admin-body:not(.admin-authenticated) .admin-login-brand > p:last-of-type,
+  .admin-body:not(.admin-authenticated) .admin-login-brand__copy > p:last-of-type,
   .admin-body:not(.admin-authenticated) .admin-login-brand .architectural-lines { display: none; }
-  .admin-body:not(.admin-authenticated) .admin-login-brand h1 { margin: 5px 0 0; font-size: 20px; }
-  .admin-body:not(.admin-authenticated) .admin-login-panel { min-height: 0; padding: 10px; overflow: hidden; }
-  .admin-body:not(.admin-authenticated) .admin-login-card { max-height: 100%; padding: 18px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none; }
+  .admin-body:not(.admin-authenticated) .admin-login-brand__copy { justify-items: center; gap: 0; }
+  .admin-body:not(.admin-authenticated) .admin-login-brand h1 { margin: 0; font-size: clamp(18px,5vw,22px); text-align: center; }
+  .admin-body:not(.admin-authenticated) .admin-login-panel { min-height: 0; align-items: start; padding: clamp(16px,4dvh,30px) 14px 12px; overflow: hidden; }
+  .admin-body:not(.admin-authenticated) .admin-login-card { max-height: 100%; border-radius: 17px; padding: clamp(20px,5vw,27px); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none; }
   .admin-body:not(.admin-authenticated) .admin-login-card::-webkit-scrollbar { display: none; }
   .admin-body:not(.admin-authenticated) .admin-login-card h2 { margin: 10px 0 4px; font-size: 22px; }
   .admin-body:not(.admin-authenticated) .admin-login-card > p { margin-bottom: 10px; font-size: 11px; }
@@ -933,7 +988,7 @@ img { display: block; max-width: 100%; }
   .admin-body:not(.admin-authenticated) .admin-login-card .form-error { min-height: 16px; margin: 0; color: var(--danger); font-size: 11px; }
   .student-brandbar__label { display: none; }
   .student-brandbar { min-height: 56px; padding-top: max(6px, env(safe-area-inset-top)); padding-bottom: 6px; }
-  .college-wordmark--mobile { width: min(46vw, 180px); transform: scale(.88); transform-origin: left center; }
+  .college-wordmark--mobile { width: min(46vw, 180px); }
   .student-clock { min-width: 82px; }
   .student-clock__status { font-size: 9px; }
   .student-clock__time { font-size: 15px; }
@@ -965,6 +1020,9 @@ img { display: block; max-width: 100%; }
   .success-card { padding-top: 20px; }
   .success-mark { width: 52px; height: 52px; margin-bottom: 11px; font-size: 24px; }
   .success-ticket { margin: 12px 0 8px; padding: 10px; }
+  .result-card-preview { width: min(46vw, 180px); margin: 8px auto 6px; }
+  .result-card-preview__frame { border-radius: 12px; }
+  .result-card-preview figcaption { margin-top: 4px; font-size: 8px; }
   .site-footer { flex-direction: column; gap: 2px; }
   .site-footer span + span { padding: 0; border: 0; }
   .site-footer--student { min-height: 30px; margin: 0 auto max(5px, env(safe-area-inset-bottom)); font-size: 9px; }
@@ -985,10 +1043,31 @@ img { display: block; max-width: 100%; }
   .entity-row, .entity-row--group { grid-template-columns: 20px minmax(100px,1fr) auto; }
   .entity-row__capacity { grid-column: 2; }
   .entity-row .entity-status-control { grid-column: 2 / 4; justify-content: flex-start; }
+  .entity-row .entity-save-state { grid-column: 2; justify-self: start; }
   .page-heading { flex-direction: column; }
   .roster-card__heading { align-items: flex-start; }
   .settings-grid { grid-template-columns: 1fr; }
   .site-footer--admin { min-height: 80px; }
+}
+
+/* Success stays fully actionable inside one phone viewport. The downloaded
+   credential remains 1080x1920; only its on-screen preview is scaled down. */
+@media (max-width: 700px) and (max-height: 900px) {
+  .student-body[data-student-view="success"] .student-hero { display: none; }
+  .student-body[data-student-view="success"] .student-main { padding-top: 7px; padding-bottom: 5px; }
+  .student-body[data-student-view="success"] .success-card { padding: 14px 15px 13px; }
+  .student-body[data-student-view="success"] .student-avatar--success { top: 10px; right: 10px; }
+  .student-body[data-student-view="success"] .success-mark { width: 42px; height: 42px; margin-bottom: 7px; box-shadow: 0 0 0 6px var(--success-soft); font-size: 21px; }
+  .student-body[data-student-view="success"] .success-card > .eyebrow { margin-bottom: 4px; font-size: 8px; }
+  .student-body[data-student-view="success"] .success-card h2 { margin-bottom: 4px; font-size: 20px; }
+  .student-body[data-student-view="success"] .success-card__message { margin: 0; font-size: 12px; line-height: 1.45; }
+  .student-body[data-student-view="success"] .success-ticket { margin: 8px 0 5px; padding: 7px 9px; font-size: 10px; }
+  .student-body[data-student-view="success"] .result-card-preview { width: min(34vw, 120px); margin: 5px auto 3px; }
+  .student-body[data-student-view="success"] .result-card-preview figcaption { display: none; }
+  .student-body[data-student-view="success"] .success-card__tip { margin: 5px 0 0; font-size: 9px; line-height: 1.35; }
+  .student-body[data-student-view="success"] .success-card__tip strong { margin-bottom: 1px; font-size: 10px; }
+  .student-body[data-student-view="success"] .success-card__actions { grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 7px; }
+  .student-body[data-student-view="success"] .success-card__actions .button { min-height: 38px; padding: 7px 8px; font-size: 10px; }
 }
 
 /* Phone admin: a focused two-tool console with a card-based credential lookup. */
@@ -996,8 +1075,7 @@ img { display: block; max-width: 100%; }
   .admin-body.admin-authenticated { height: 100dvh; min-height: 100dvh; overflow: hidden; }
   .admin-authenticated .admin-app { display: grid; height: 100dvh; min-height: 0; grid-template-columns: 1fr; grid-template-rows: 58px minmax(0,1fr); overflow: hidden; }
   .admin-authenticated .admin-sidebar { position: relative; top: auto; display: grid; width: 100%; height: 58px; grid-template-columns: minmax(92px,32vw) minmax(0,1fr) 48px; gap: 5px; padding: max(5px, env(safe-area-inset-top)) 10px 5px; overflow: hidden; }
-  .admin-authenticated .admin-sidebar .college-wordmark { display: block; width: 100%; max-width: 142px; height: 40px; margin: 0; transform: none; }
-  .admin-authenticated .admin-sidebar .college-wordmark img { width: 110%; left: -8.5%; top: -12.5%; }
+  .admin-authenticated .admin-sidebar .college-wordmark { display: block; width: min(100%, 138px); align-self: center; margin: 0; transform: none; }
   .admin-authenticated .admin-nav { display: grid; width: 100%; grid-template-columns: 1fr 1fr; gap: 5px; }
   .admin-authenticated .admin-nav__item { min-width: 0; min-height: 40px; justify-content: center; gap: 0; border: 1px solid rgba(255,255,255,.2); padding: 0 6px; font-size: 10px; }
   .admin-authenticated .admin-nav__item[data-view="structure"],
@@ -1016,7 +1094,7 @@ img { display: block; max-width: 100%; }
   .admin-authenticated .admin-topbar__actions { width: auto; min-width: 0; justify-content: flex-end; flex-wrap: nowrap; gap: 6px; margin-left: auto; }
   .admin-authenticated .last-refresh { display: none; }
   .admin-authenticated .status-badge { padding: 6px 8px; font-size: 9px; white-space: nowrap; }
-  .admin-authenticated #toggle-status { min-height: 36px; padding: 7px 10px; font-size: 10px; white-space: nowrap; }
+  .admin-authenticated #open-live-board { min-height: 36px; padding: 7px 10px; font-size: 10px; white-space: nowrap; }
   .admin-authenticated .readiness-panel,
   .admin-authenticated .site-footer--admin { display: none !important; }
   .admin-authenticated .admin-view { min-height: 0; padding: 9px 0 8px; overflow: hidden; }
@@ -1027,7 +1105,12 @@ img { display: block; max-width: 100%; }
   .admin-authenticated #view-overview .board-panel--unselected { display: none; }
   .admin-authenticated #view-overview .board-panel--qr { min-height: 0; padding: 14px; }
   .admin-authenticated #view-overview .qr-heading h2 { font-size: 17px; }
-  .admin-authenticated #view-overview .qr-frame { width: min(38dvh, 72vw, 280px); margin: 6px auto; padding: 10px; }
+  .admin-authenticated #view-overview .qr-portal { width: min(100%, 340px); margin: 5px auto; padding: 10px 11px 8px; }
+  .admin-authenticated #view-overview .qr-portal__label { margin-bottom: 5px; padding: 4px 8px; font-size: 9px; }
+  .admin-authenticated #view-overview .qr-frame { width: min(39dvh, 75vw, 294px); padding: 6px; }
+  .admin-authenticated #view-overview .qr-portal__instruction { margin-top: 5px; }
+  .admin-authenticated #view-overview .qr-portal__instruction strong { font-size: 11px; }
+  .admin-authenticated #view-overview .qr-portal__instruction span { font-size: 8px; }
   .admin-authenticated #view-overview .public-url { margin: 5px 0; font-size: 8px; }
   .admin-authenticated #view-overview .board-stage { margin-top: 4px; gap: 5px; padding: 8px 10px; }
   .admin-authenticated #view-overview .board-stage p { font-size: 9px; }
@@ -1041,14 +1124,15 @@ img { display: block; max-width: 100%; }
   .admin-authenticated #view-students .roster-card__heading { flex: 0 0 auto; margin-bottom: 9px; }
   .admin-authenticated #view-students .roster-card__heading h3 { font-size: 16px; }
   .admin-authenticated #view-students .roster-card__heading p { display: none; }
-  .admin-authenticated #view-students .roster-search { width: 100%; flex: 0 0 auto; margin-bottom: 8px; }
+  .admin-authenticated #view-students .roster-search { position: sticky; z-index: 2; top: 0; width: 100%; flex: 0 0 auto; margin-bottom: 8px; background: #fff; }
+  .admin-authenticated #view-students .roster-search input { min-width: 0; font-size: 16px; }
   .admin-authenticated #view-students .table-scroll--roster { min-height: 0; max-height: none; flex: 1; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none; }
   .admin-authenticated #view-students .table-scroll--roster::-webkit-scrollbar { display: none; }
   .admin-authenticated #view-students .roster-table,
   .admin-authenticated #view-students .roster-table tbody { display: block; width: 100%; min-width: 0; }
   .admin-authenticated #view-students .roster-table thead { display: none; }
   .admin-authenticated #view-students .roster-table tbody { display: grid; gap: 8px; }
-  .admin-authenticated #view-students .roster-table tr { display: grid; grid-template-columns: minmax(0,1fr) minmax(112px,auto); grid-template-rows: auto auto auto; gap: 1px 10px; border: 1px solid var(--rule); border-left: 3px solid var(--college); border-radius: 11px; padding: 10px 11px; background: #fff; }
+  .admin-authenticated #view-students .roster-table tr { display: grid; grid-template-columns: minmax(0,1fr) minmax(104px,116px); grid-template-rows: auto auto auto; gap: 2px 9px; border: 1px solid var(--rule); border-left: 3px solid var(--college); border-radius: 12px; padding: 11px; background: linear-gradient(135deg, #fff, #fdfafa); box-shadow: 0 4px 12px rgba(72,24,29,.045); }
   .admin-authenticated #view-students .roster-table td { display: block; min-width: 0; border: 0; padding: 0; }
   .admin-authenticated #view-students .roster-table td:nth-child(1) { grid-area: 3 / 1; color: var(--muted); font-family: Consolas, monospace; font-size: 10px; }
   .admin-authenticated #view-students .roster-table td:nth-child(2) { grid-area: 1 / 1; font-size: 15px; font-weight: 900; }
@@ -1057,7 +1141,7 @@ img { display: block; max-width: 100%; }
   .admin-authenticated #view-students .roster-table td:nth-child(5) { display: none; }
   .admin-authenticated #view-students .roster-table td:nth-child(6) { display: grid; grid-area: 1 / 2 / 4 / 3; align-content: center; }
   .admin-authenticated #view-students .activation-code-control { display: grid; min-width: 0; justify-items: stretch; gap: 5px; }
-  .admin-authenticated #view-students .activation-code-value { min-width: 0; justify-content: center; font-size: 12px; }
+  .admin-authenticated #view-students .activation-code-value { width: 100%; min-width: 0; justify-content: center; font-size: 13px; }
   .admin-authenticated #view-students .activation-code-control .button { width: 100%; }
 
   .live-board.is-presentation { height: 100dvh; grid-template-columns: 1fr; grid-template-rows: 64px minmax(0,1fr) 32px; grid-template-areas: "header" "qr" "footer"; gap: 6px; padding: 0 7px; }
@@ -1065,8 +1149,7 @@ img { display: block; max-width: 100%; }
   .live-board.is-presentation .board-panel--unselected { display: none; }
   .live-board.is-presentation .board-presentation-header { grid-template-columns: minmax(118px,1fr) auto auto auto; gap: 7px; margin: 0 -7px; padding: 0 8px; }
   .live-board.is-presentation .board-presentation-brand { gap: 0; }
-  .live-board.is-presentation .college-wordmark--board { width: 134px; height: 46px; }
-  .live-board.is-presentation .college-wordmark--board img { width: 145px; left: -10px; top: -5px; }
+  .live-board.is-presentation .college-wordmark--board { width: 134px; }
   .live-board.is-presentation .board-presentation-brand h1,
   .live-board.is-presentation .board-presentation-sync { display: none; }
   .live-board.is-presentation .board-header-phase { min-width: 66px; border-width: 1px; border-radius: 8px; padding: 7px; font-size: 12px; }
@@ -1074,7 +1157,8 @@ img { display: block; max-width: 100%; }
   .live-board.is-presentation .board-exit-fullscreen { min-height: 36px; padding: 7px 9px; font-size: 10px; }
   .live-board.is-presentation .board-panel--qr { display: flex; min-height: 0; padding: 9px 13px; }
   .live-board.is-presentation .qr-heading h2 { font-size: 17px; }
-  .live-board.is-presentation .qr-frame { width: min(42dvh, 78vw, 310px); margin: 2px auto; padding: 8px; }
+  .live-board.is-presentation .qr-portal { width: min(100%, 360px); margin: 2px auto; padding: 8px 10px 7px; }
+  .live-board.is-presentation .qr-frame { width: min(43dvh, 80vw, 324px); padding: 6px; }
   .live-board.is-presentation .board-stage { margin-top: 3px; gap: 4px; padding: 7px 9px; }
   .live-board.is-presentation .board-stage__label { font-size: 10px; }
   .live-board.is-presentation .board-stage__countdown { font-size: 24px; }
@@ -1085,7 +1169,7 @@ img { display: block; max-width: 100%; }
   .live-board.is-presentation .qr-notice small { font-size: 8px; }
   .live-board.is-presentation .board-presentation-footer { margin: 0 -7px; font-size: 9px; }
   .live-board.is-presentation.phase-countdown .board-countdown-overlay { min-height: 100dvh; }
-  .live-board.is-presentation .college-wordmark--countdown { width: min(78vw, 300px); height: 70px; }
+  .live-board.is-presentation .college-wordmark--countdown { width: min(78vw, 300px); }
   .live-board.is-presentation .countdown-content strong { font-size: clamp(150px, 32vh, 250px); }
   .live-board.is-presentation .countdown-content h2 { font-size: 20px; }
 
@@ -1106,7 +1190,8 @@ img { display: block; max-width: 100%; }
   .admin-authenticated #view-overview .live-board.is-presentation .board-panel--stats,
   .admin-authenticated #view-overview .live-board.is-presentation .board-panel--unselected { display: none; }
   .admin-authenticated #view-overview .live-board.is-presentation .board-panel--qr { display: flex; min-height: 0; justify-content: center; padding: 9px 13px; }
-  .admin-authenticated #view-overview .live-board.is-presentation .qr-frame { width: min(43dvh, 86vw, 340px); margin: 2px auto; padding: 8px; }
+  .admin-authenticated #view-overview .live-board.is-presentation .qr-portal { width: min(100%, 370px); margin: 2px auto; padding: 8px 10px 7px; }
+  .admin-authenticated #view-overview .live-board.is-presentation .qr-frame { width: min(44dvh, 86vw, 342px); padding: 6px; }
   .admin-authenticated #view-overview .live-board.is-presentation .board-stage { margin-top: 3px; gap: 4px; padding: 7px 9px; }
   .admin-authenticated #view-overview .live-board.is-presentation .qr-notice { margin-top: 3px; padding-top: 5px; }
 }
@@ -1134,6 +1219,9 @@ img { display: block; max-width: 100%; }
   .group-option { min-height: 55px; padding: 8px 10px; }
   .group-option.is-selected { padding: 7px 9px; }
   .success-card__actions { gap: 6px; margin-top: 10px; }
+  .result-card-preview { width: min(38vw, 138px); margin: 5px auto 4px; }
+  .result-card-preview figcaption { display: none; }
+  .student-body[data-student-view="success"] .result-card-preview { width: min(29vw, 100px); }
   .site-footer--student { font-size: 8px; }
 }
 
@@ -1152,8 +1240,6 @@ img { display: block; max-width: 100%; }
   }
   .student-body.student-keyboard-open .college-wordmark--mobile {
     width: min(41vw, 150px);
-    height: 34px;
-    transform: scale(.78);
   }
   .student-body.student-keyboard-open .student-clock { min-width: 76px; gap: 1px; }
   .student-body.student-keyboard-open .student-clock__status { font-size: 8px; }
@@ -1231,13 +1317,21 @@ img { display: block; max-width: 100%; }
   .live-board.is-presentation { grid-template-rows: 84px minmax(0,1fr) 48px; gap: 10px; }
   .live-board:fullscreen .board-presentation-header,
   .live-board.is-presentation .board-presentation-header { gap: 18px; }
-  .college-wordmark--board { width: 310px; height: 76px; transform: none; }
+  .college-wordmark--board { width: 310px; transform: none; }
   .live-board:fullscreen .board-panel,
   .live-board.is-presentation .board-panel { padding: 15px; }
+  .live-board:fullscreen .qr-heading h2,
+  .live-board.is-presentation .qr-heading h2 { margin-bottom: 8px; }
   .live-board:fullscreen .qr-frame,
-  .live-board.is-presentation .qr-frame { width: min(44vh, 90%, 430px); margin: 5px auto; padding: 9px; }
+  .live-board.is-presentation .qr-frame { width: min(38vh, 100%, 450px); padding: 6px; }
+  .live-board:fullscreen .qr-portal,
+  .live-board.is-presentation .qr-portal { width: min(100%, 500px); margin: 4px auto; padding: 9px 11px 8px; }
+  .live-board:fullscreen .qr-portal__label,
+  .live-board.is-presentation .qr-portal__label { margin-bottom: 4px; padding-top: 4px; padding-bottom: 4px; }
+  .live-board:fullscreen .qr-portal__instruction,
+  .live-board.is-presentation .qr-portal__instruction { margin-top: 5px; }
   .live-board:fullscreen .board-stage,
-  .live-board.is-presentation .board-stage { gap: 6px; padding: 9px 12px; }
+  .live-board.is-presentation .board-stage { margin-top: 4px; gap: 4px; padding: 6px 12px; }
   .live-board:fullscreen .board-stage .button,
   .live-board.is-presentation .board-stage .button { min-height: 48px; font-size: 18px; }
   .live-board:fullscreen .qr-notice,
@@ -1250,6 +1344,8 @@ img { display: block; max-width: 100%; }
   .live-board.is-presentation .group-progress { min-height: 170px; }
   .live-board:fullscreen .live-selection-feed,
   .live-board.is-presentation .live-selection-feed { height: 142px; max-height: 142px; flex-basis: 142px; }
+  .live-board:fullscreen .waiting-feed-shell,
+  .live-board.is-presentation .waiting-feed-shell { min-height: 132px; }
   .live-board:fullscreen .selection-feed-item,
   .live-board.is-presentation .selection-feed-item { min-height: 35px; padding-top: 5px; padding-bottom: 5px; }
 }

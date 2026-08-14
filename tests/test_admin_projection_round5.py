@@ -113,14 +113,14 @@ def test_phone_admin_has_only_two_primary_entries_and_card_roster() -> None:
     assert 'data-mobile-label="激活码查询"' in students
     assert '.admin-nav__item[data-view="structure"]' in css
     assert '.admin-nav__item[data-view="settings"]' in css
-    assert "grid-template-columns: minmax(0,1fr) minmax(112px,auto)" in css
+    assert "grid-template-columns: minmax(0,1fr) minmax(104px,116px)" in css
     assert "overflow-x: hidden" in css
     assert ".admin-authenticated #view-overview .live-board.is-presentation" in css
     assert "grid-template-columns: 1fr;" in css
     assert "shouldUsePresentationFallback" in javascript
     assert 'window.matchMedia("(max-width: 700px)").matches' in javascript
-    assert "mobileLookupWaiting" in javascript
-    assert "请输入姓名或 11 位学号，匹配后再显示个人激活码" in javascript
+    assert "mobileLookupWaiting" not in javascript
+    assert "const filtered = filteredRosterStudents(students)" in javascript
     assert "enterPresentationFallback" in javascript
 
 
@@ -145,7 +145,7 @@ def test_phone_admin_keeps_a_visible_safe_logout_and_a_fixed_login_viewport() ->
     assert ".admin-body:not(.admin-authenticated)" in phone_css
     assert "height: 100dvh" in phone_css
     assert "overflow: hidden" in phone_css
-    assert "grid-template-rows: 110px minmax(0,1fr)" in phone_css
+    assert "grid-template-rows: minmax(146px,19dvh) minmax(0,1fr)" in phone_css
     assert ".admin-login-card" in phone_css and "overflow-y: auto" in phone_css
 
 
@@ -162,7 +162,7 @@ def test_native_fullscreen_three_column_stage_fits_tablet_and_small_projector_wi
     assert ".board-presentation-footer" in responsive and "margin: 0 -12px" in responsive
     assert ".board-presentation-sync" in responsive and "display: none" in responsive
     assert "width: clamp(205px,28vw,310px)" in responsive
-    assert "aspect-ratio: 3808 / 909" in responsive
+    assert "aspect-ratio: 3808 / 909" in css
 
 
 def test_quota_inputs_save_after_idle_without_polling_rerender() -> None:
@@ -178,7 +178,7 @@ def test_quota_inputs_save_after_idle_without_polling_rerender() -> None:
     assert "scheduleQuotaSave(input, 0)" in javascript
     assert 'adminEls.quotaMatrix.addEventListener("input"' in javascript
     assert "structureFingerprint" in javascript
-    assert 'document.activeElement?.closest?.("#view-structure")' in javascript
+    assert 'document.activeElement?.closest?.("#major-editor, #group-editor, #quota-matrix")' in javascript
 
 
 def test_phone_activation_lookup_polls_only_public_phase_status() -> None:
@@ -427,9 +427,11 @@ eval(`
   const clearAllRevealedActivationCodes = () => { clearCalls += 1; };
   const stopRosterAutoScroll = () => {};
   const stopLiveFeedAutoScroll = () => {};
+  const stopWaitingFeedAutoScroll = () => {};
   const loadDashboard = () => {};
   const renderUnselectedList = () => {};
   const renderLiveSelectionFeed = () => {};
+  const renderWaitingStudentFeed = () => {};
   ${switchBlock}
   switchAdminView("overview");
   switchAdminView("students");

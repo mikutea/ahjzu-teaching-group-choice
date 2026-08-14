@@ -1,0 +1,230 @@
+:root {
+  color-scheme: light;
+  font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  background: #5f1d24;
+  color: #2d2527;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  position: relative;
+  min-height: 100svh;
+  overflow-x: hidden;
+  background:
+    radial-gradient(circle at 15% 8%, rgba(220, 181, 116, .24), transparent 30rem),
+    linear-gradient(155deg, #741f29 0%, #4b151b 100%);
+}
+
+.verification-grid {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: .12;
+  background-image:
+    linear-gradient(rgba(255,255,255,.2) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.2) 1px, transparent 1px);
+  background-size: 34px 34px;
+}
+
+.verification-shell {
+  position: relative;
+  width: min(100% - 28px, 560px);
+  margin: 0 auto;
+  padding: max(22px, env(safe-area-inset-top)) 0 20px;
+}
+
+.verification-brand {
+  padding: 0 12px 18px;
+  color: rgba(255, 255, 255, .82);
+}
+
+.verification-wordmark {
+  position: relative;
+  overflow: hidden;
+  width: min(100%, 440px);
+  aspect-ratio: 3808 / 909;
+}
+
+.verification-wordmark img {
+  position: absolute;
+  top: -16.72%;
+  left: -8.61%;
+  display: block;
+  width: 109.01%;
+  max-width: none;
+  height: auto;
+}
+
+.verification-brand p {
+  margin: 8px 0 0;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .16em;
+}
+
+.verification-card {
+  position: relative;
+  overflow: hidden;
+  padding: 30px 26px 26px;
+  border: 1px solid rgba(255, 255, 255, .7);
+  border-radius: 28px;
+  background: rgba(255, 253, 252, .98);
+  box-shadow: 0 28px 70px rgba(29, 3, 8, .34);
+}
+
+.verification-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 7px;
+  background: linear-gradient(90deg, #c9a363, #ead09d 52%, #b98949);
+}
+
+.verification-mark {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  margin-bottom: 18px;
+  padding: 7px 14px;
+  border-radius: 999px;
+  background: #e8f3ed;
+  color: #276d55;
+  font-size: 14px;
+  font-weight: 900;
+  letter-spacing: .08em;
+}
+
+[data-verification-status="revoked"] .verification-mark,
+[data-verification-status="error"] .verification-mark {
+  background: #fff1d9;
+  color: #9a5d0d;
+}
+
+[data-verification-status="invalid"] .verification-mark {
+  background: #f8e5e7;
+  color: #9e2e3a;
+}
+
+.verification-eyebrow {
+  margin: 0 0 8px;
+  color: #7f292f;
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: .16em;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(28px, 8vw, 40px);
+  line-height: 1.15;
+}
+
+.verification-message {
+  margin: 14px 0 22px;
+  color: #6d6264;
+  font-size: 15px;
+  line-height: 1.75;
+}
+
+.verification-details {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0 0 18px;
+}
+
+.verification-details[hidden] {
+  display: none;
+}
+
+.verification-details > div {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid #eadfe0;
+  border-radius: 16px;
+  background: #faf6f6;
+}
+
+.verification-details__wide {
+  grid-column: 1 / -1;
+}
+
+.verification-details dt {
+  margin-bottom: 7px;
+  color: #7c6f71;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.verification-details dd {
+  overflow-wrap: anywhere;
+  margin: 0;
+  font-size: 16px;
+  font-weight: 800;
+  line-height: 1.45;
+}
+
+.verification-code-row dd {
+  color: #7f292f;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  letter-spacing: .08em;
+}
+
+.verification-notice {
+  margin: 0;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: #fff6e8;
+  color: #6a5031;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.verification-home {
+  display: block;
+  margin-top: 18px;
+  padding: 13px 18px;
+  border-radius: 14px;
+  background: #7f292f;
+  color: #fff;
+  font-weight: 800;
+  text-align: center;
+  text-decoration: none;
+}
+
+footer {
+  position: relative;
+  padding: 0 20px max(18px, env(safe-area-inset-bottom));
+  color: rgba(255, 255, 255, .68);
+  font-size: 11px;
+  line-height: 1.6;
+  text-align: center;
+}
+
+@media (max-width: 380px) {
+  .verification-shell {
+    width: min(100% - 20px, 560px);
+  }
+
+  .verification-card {
+    padding: 26px 18px 20px;
+    border-radius: 22px;
+  }
+
+  .verification-details {
+    grid-template-columns: 1fr;
+  }
+
+  .verification-details__wide {
+    grid-column: auto;
+  }
+}

@@ -10,12 +10,16 @@
 <body class="admin-body">
   <section id="admin-login-view" class="admin-login-shell">
     <div class="admin-login-brand">
-      <div class="college-wordmark college-wordmark--login">
-        <img src="/brand/college-wordmark-official.png" alt="建筑与空间规划学院">
+      <div class="admin-login-brand__content">
+        <div class="college-wordmark college-wordmark--login">
+          <img src="/brand/college-wordmark-official.png" alt="建筑与空间规划学院">
+        </div>
+        <div class="admin-login-brand__copy">
+          <p class="eyebrow eyebrow--light">TEACHING ADMINISTRATION</p>
+          <h1>教学组抢选管理平台</h1>
+          <p>专业、教学组、配额和名单由学院独立管理</p>
+        </div>
       </div>
-      <p class="eyebrow eyebrow--light">TEACHING ADMINISTRATION</p>
-      <h1>教学组抢选管理平台</h1>
-      <p>专业、教学组、配额和名单由学院独立管理</p>
       <div class="architectural-lines" aria-hidden="true"></div>
     </div>
     <div class="admin-login-panel">
@@ -64,7 +68,7 @@
         <div class="admin-topbar__actions">
           <span id="last-refresh" class="last-refresh">尚未刷新</span>
           <span id="admin-status-badge" class="status-badge status-badge--closed">已关闭</span>
-          <button id="toggle-status" class="button button--primary" type="button">开放抢选</button>
+          <button id="open-live-board" class="button button--primary" type="button" title="进入全屏实时大屏，抢选开关位于大屏二维码下方">进入实时大屏</button>
         </div>
       </header>
 
@@ -114,6 +118,10 @@
                 <div class="progress-label"><span>候场完成率</span><strong id="waiting-rate">0%</strong></div>
                 <div class="progress-track"><span id="waiting-rate-bar"></span></div>
               </div>
+              <div class="waiting-feed-shell">
+                <div class="waiting-feed-shell__heading"><strong>实时进入候场</strong><span id="waiting-feed-state">实时更新</span></div>
+                <div id="waiting-student-feed" class="waiting-student-feed" aria-live="polite"></div>
+              </div>
               <p>学生完成身份核验后会自动进入候场；老师确认人员情况后，可在仍有人未进入时继续开始。</p>
             </div>
             <div class="board-subheading selection-only">
@@ -136,11 +144,15 @@
               </div>
               <button id="fullscreen-board" class="button button--outline" type="button">⛶ 全屏展示</button>
             </div>
-            <div class="qr-frame">
-              <img id="student-qr" alt="学生端二维码">
-              <div id="qr-placeholder" class="qr-placeholder">请先在系统设置中填写学生端访问地址</div>
-              <span class="qr-corner qr-corner--a"></span><span class="qr-corner qr-corner--b"></span>
-              <span class="qr-corner qr-corner--c"></span><span class="qr-corner qr-corner--d"></span>
+            <div class="qr-portal">
+              <div class="qr-portal__label"><span class="status-dot"></span><strong>学生抢选入口</strong></div>
+              <div class="qr-frame">
+                <img id="student-qr" alt="学生端二维码">
+                <div id="qr-placeholder" class="qr-placeholder">请先在系统设置中填写学生端访问地址</div>
+                <span class="qr-corner qr-corner--a"></span><span class="qr-corner qr-corner--b"></span>
+                <span class="qr-corner qr-corner--c"></span><span class="qr-corner qr-corner--d"></span>
+              </div>
+              <p class="qr-portal__instruction"><strong>扫码核验身份</strong><span>登录后自动进入候场，开放抢选后仍可扫码加入</span></p>
             </div>
             <p id="public-url-label" class="public-url">尚未设置访问地址</p>
             <div id="board-stage" class="board-stage board-stage--waiting" aria-live="polite" aria-atomic="true">
@@ -218,7 +230,7 @@
         </div>
         <div class="structure-grid">
           <section class="content-card">
-            <div class="content-card__heading"><div><h3>专业设置</h3><p id="major-count-label">0 个专业</p><p class="entity-status-help">“停用”不会删除历史记录，只会让该专业不再参与本场抢选；有在册学生时系统会阻止停用。</p></div></div>
+            <div class="content-card__heading"><div><h3>专业设置</h3><p id="major-count-label">0 个专业</p><p class="entity-status-help">名称输入后自动保存；“停用”不会删除历史记录，只会让该专业不再参与本场抢选，有在册学生时系统会阻止停用。</p></div></div>
             <form id="add-major-form" class="inline-add-form">
               <input name="name" maxlength="80" required placeholder="例如：室内设计">
               <button class="button button--primary" type="submit">＋ 新增专业</button>
@@ -226,7 +238,7 @@
             <div id="major-editor" class="entity-editor"></div>
           </section>
           <section class="content-card">
-            <div class="content-card__heading"><div><h3>教学组设置</h3><p id="group-count-label">0 个教学组</p><p class="entity-status-help">“停用”不会删除教学组；已有选择记录时系统会阻止停用。调整总容量时，专业配额矩阵会以各专业已选人数为下限自动重算，不会反向阻止容量设置。</p></div></div>
+            <div class="content-card__heading"><div><h3>教学组设置</h3><p id="group-count-label">0 个教学组</p><p class="entity-status-help">名称和总容量输入后自动保存；“停用”不会删除教学组，已有选择记录时系统会阻止停用。调整总容量时，专业配额矩阵会以各专业已选人数为下限自动重算。</p></div></div>
             <form id="add-group-form" class="inline-add-form inline-add-form--group">
               <input name="name" maxlength="80" required placeholder="例如：第七教学组">
               <input name="capacity" type="number" min="0" max="1000" step="1" inputmode="numeric" value="30" aria-label="总容量">
@@ -246,7 +258,7 @@
 
       <section id="view-students" class="admin-view is-hidden">
         <div class="page-heading">
-          <div><p class="eyebrow">ROSTER & RESULTS</p><h2>学生名单与结果</h2><p>导入只接受当前已建立的专业名称，真实名单不会进入公开仓库。</p></div>
+          <div><p class="eyebrow">ROSTER & RESULTS</p><h2>学生名单与结果</h2><p>导入时会按名单中的专业名称自动补充本场专业；真实名单不会进入公开仓库。</p></div>
         </div>
         <div class="student-admin-grid">
           <section class="content-card import-card">
@@ -293,7 +305,7 @@
           </div>
           <label class="compact-search roster-search">
             <span aria-hidden="true">⌕</span>
-            <input id="student-roster-search" type="search" placeholder="搜索姓名 / 学号 / 专业 / 教学组">
+            <input id="student-roster-search" type="search" placeholder="输入姓名、11 位学号或专业快速查找">
           </label>
           <div class="table-scroll table-scroll--roster">
             <table class="data-table roster-table">
