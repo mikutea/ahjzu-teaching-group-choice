@@ -111,6 +111,9 @@ const studentState = {
   lastPhase: null,
   resultCardInFlight: false,
   resultCardLogoPromise: null,
+  resultCardPreviewKey: null,
+  resultCardPreviewPendingKey: null,
+  resultCardPreviewUrl: null,
   serverClockEpochMs: null,
   serverClockMonotonicMs: null,
   serverClockSynchronized: false,
@@ -148,6 +151,8 @@ const studentEls = {
   successMessage: document.querySelector("#success-message"),
   successTime: document.querySelector("#success-time"),
   successBadge: document.querySelector("#success-major-badge"),
+  resultCardPreviewImage: document.querySelector("#result-card-preview-image"),
+  resultCardPreviewStatus: document.querySelector("#result-card-preview-status"),
   downloadResultCard: document.querySelector("#download-result-card"),
   clock: document.querySelector("#student-clock"),
   clockStatus: document.querySelector("#student-clock-status"),
@@ -555,6 +560,97 @@ function loadResultCardLogo() {
   return studentState.resultCardLogoPromise;
 }
 
+function resultCardSameOriginImageUrl(value) {
+  if (!value) return null;
+  try {
+    const url = new URL(String(value), window.location.href);
+    return url.origin === window.location.origin ? url.href : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function resultCardVerificationQrDataUrl(qrBlob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || "");
+      if (dataUrl.startsWith("data:image/png")) resolve(dataUrl);
+      else reject(new Error("防伪二维码加载失败，请检查网络后重试"));
+    };
+    reader.onerror = () => reject(new Error("防伪二维码加载失败，请检查网络后重试"));
+    reader.onabort = reader.onerror;
+    reader.readAsDataURL(qrBlob);
+  });
+}
+
+async function decodeResultCardVerificationQr(qrBlob) {
+  if (typeof createImageBitmap === "function") {
+    try {
+      return await createImageBitmap(qrBlob);
+    } catch (_error) {
+      // Older WebKit versions can expose createImageBitmap but reject PNG blobs.
+    }
+  }
+
+  const dataUrl = await resultCardVerificationQrDataUrl(qrBlob);
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("防伪二维码加载失败，请检查网络后重试"));
+    image.src = dataUrl;
+  });
+}
+
+async function loadResultCardVerificationQr(payload) {
+  const receipt = payload?.receipt;
+  const token = String(receipt?.token || "").trim();
+  const verificationCode = String(receipt?.verification_code || "").trim();
+  const verifyUrl = resultCardSameOriginImageUrl(receipt?.verify_url);
+  const qrImageUrl = resultCardSameOriginImageUrl(receipt?.qr_image_url);
+  if (!receipt || !token || !verificationCode || !verifyUrl || !qrImageUrl || !studentState.csrf) {
+    throw new Error("防伪核验信息不完整，请刷新页面后重试");
+  }
+
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    "X-CSRF-Token": studentState.csrf,
+  });
+  if (payload?.settings?.activity_id) {
+    headers.set("X-Activity-ID", String(payload.settings.activity_id));
+  }
+  let response;
+  try {
+    response = await fetch(qrImageUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ token }),
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+  } catch (_error) {
+    throw new Error("防伪二维码加载失败，请检查网络后重试");
+  }
+  if (!response.ok) {
+    let data = null;
+    if ((response.headers.get("content-type") || "").includes("application/json")) {
+      try { data = await response.json(); } catch (_error) { data = null; }
+    }
+    throw new Error(apiErrorDetails(data, response.status).message);
+  }
+  if (!(response.headers.get("content-type") || "").includes("image/png")) {
+    throw new Error("防伪二维码响应格式异常，请刷新页面后重试");
+  }
+  let qrBlob;
+  try {
+    qrBlob = await response.blob();
+  } catch (_error) {
+    throw new Error("防伪二维码加载失败，请检查网络后重试");
+  }
+  return decodeResultCardVerificationQr(qrBlob);
+}
+
 function resultCardBlob(canvas) {
   return new Promise((resolve, reject) => {
     if (typeof canvas.toBlob !== "function") {
@@ -568,105 +664,139 @@ function resultCardBlob(canvas) {
   });
 }
 
+function resultCardDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("凭证预览生成失败，可直接下载高清凭证"));
+    reader.readAsDataURL(blob);
+  });
+}
+
 async function createResultCardBlob(payload) {
   if (!payload?.selection || !payload?.student || !payload?.settings) {
     throw new Error("尚未读取到完整抢选结果，请刷新页面后重试");
   }
   if (document.fonts?.ready) await document.fonts.ready;
-  const logo = await loadResultCardLogo();
+  let verificationQr = null;
+  let verificationQrReleaseRequested = false;
+  const releaseVerificationQr = () => {
+    if (!verificationQr) return;
+    const currentQr = verificationQr;
+    verificationQr = null;
+    if (typeof currentQr.close === "function") currentQr.close();
+  };
+  try {
+  const logoPromise = Promise.resolve().then(() => loadResultCardLogo());
+  const verificationQrPromise = Promise.resolve()
+    .then(() => loadResultCardVerificationQr(payload))
+    .then((decodedQr) => {
+      verificationQr = decodedQr;
+      if (verificationQrReleaseRequested) releaseVerificationQr();
+      return decodedQr;
+    });
+  const [logo] = await Promise.all([logoPromise, verificationQrPromise]);
+  const receipt = payload.receipt || {};
+  const verificationCode = String(receipt.verification_code || "").trim();
+  const hasOnlineVerification = Boolean(verificationCode && receipt.verify_url);
+  const canScanVerify = hasOnlineVerification && Boolean(verificationQr);
   const canvas = document.createElement("canvas");
   canvas.width = 1080;
-  canvas.height = 1350;
+  canvas.height = 1920;
   const context = canvas.getContext("2d");
   if (!context) throw new Error("当前浏览器无法创建抢选结果凭证，请更换浏览器后重试");
 
-  context.fillStyle = "#eee5e2";
+  const pageGradient = context.createLinearGradient(0, 0, 1080, 1920);
+  pageGradient.addColorStop(0, "#6f2028");
+  pageGradient.addColorStop(0.56, "#8b3037");
+  pageGradient.addColorStop(1, "#4e171d");
+  context.fillStyle = pageGradient;
   context.fillRect(0, 0, canvas.width, canvas.height);
-  context.strokeStyle = "rgba(127, 41, 47, .05)";
-  context.lineWidth = 1;
-  for (let coordinate = 0; coordinate <= 1404; coordinate += 54) {
+
+  context.strokeStyle = "rgba(255, 255, 255, .08)";
+  context.lineWidth = 2;
+  for (let coordinate = -960; coordinate <= 2040; coordinate += 68) {
     context.beginPath();
     context.moveTo(coordinate, 0);
-    context.lineTo(coordinate, 1350);
-    context.stroke();
-    context.beginPath();
-    context.moveTo(0, coordinate);
-    context.lineTo(1080, coordinate);
+    context.lineTo(coordinate + 960, 1920);
     context.stroke();
   }
 
   context.save();
-  context.shadowColor = "rgba(72, 24, 29, .18)";
-  context.shadowBlur = 36;
-  context.shadowOffsetY = 16;
-  roundedRectangle(context, 48, 40, 984, 1270, 36);
+  context.shadowColor = "rgba(25, 4, 8, .34)";
+  context.shadowBlur = 44;
+  context.shadowOffsetY = 22;
+  roundedRectangle(context, 52, 42, 976, 1836, 42);
   context.fillStyle = "#fffdfc";
   context.fill();
   context.restore();
 
-  roundedRectangle(context, 48, 40, 984, 1270, 36);
-  context.strokeStyle = "rgba(127, 41, 47, .22)";
+  roundedRectangle(context, 52, 42, 976, 1836, 42);
+  context.strokeStyle = "rgba(255, 255, 255, .42)";
   context.lineWidth = 2;
   context.stroke();
 
   context.save();
-  roundedRectangle(context, 48, 40, 984, 274, 36);
+  roundedRectangle(context, 52, 42, 976, 336, 42);
   context.clip();
-  context.fillStyle = "#7f292f";
-  context.fillRect(48, 40, 984, 274);
+  const headerGradient = context.createLinearGradient(52, 42, 1028, 378);
+  headerGradient.addColorStop(0, "#7a252d");
+  headerGradient.addColorStop(1, "#4f171d");
+  context.fillStyle = headerGradient;
+  context.fillRect(52, 42, 976, 336);
   context.strokeStyle = "rgba(255, 255, 255, .12)";
   context.lineWidth = 2;
-  for (let x = -120; x < 1200; x += 96) {
+  for (let x = -160; x < 1240; x += 112) {
     context.beginPath();
-    context.moveTo(x, 314);
-    context.lineTo(x + 230, 40);
+    context.moveTo(x, 378);
+    context.lineTo(x + 280, 42);
     context.stroke();
   }
   context.restore();
 
-  roundedRectangle(context, 48, 40, 984, 12, 6);
+  roundedRectangle(context, 52, 42, 976, 14, 7);
   context.fillStyle = "#c9a363";
   context.fill();
 
   // Crop only the transparent margins around the official college wordmark.
-  context.drawImage(logo, 328, 152, 3808, 909, 96, 74, 888, 212);
+  context.drawImage(logo, 328, 152, 3808, 909, 96, 88, 888, 212);
 
   context.fillStyle = "#7f292f";
-  context.font = '800 22px "Microsoft YaHei", "PingFang SC", sans-serif';
-  context.fillText("TEACHING GROUP SELECTION · OFFICIAL RECEIPT", 92, 362);
+  context.font = '800 23px "Microsoft YaHei", "PingFang SC", sans-serif';
+  context.fillText("TEACHING GROUP SELECTION · RESULT RECEIPT", 100, 438);
   context.fillStyle = "#282123";
-  context.font = '900 56px "Microsoft YaHei", "PingFang SC", sans-serif';
-  context.fillText("抢选结果凭证", 92, 430);
+  context.font = '900 64px "Microsoft YaHei", "PingFang SC", sans-serif';
+  context.fillText("抢选结果凭证", 100, 516);
   context.fillStyle = "#6f6466";
-  context.font = '700 25px "Microsoft YaHei", "PingFang SC", sans-serif';
-  const activityBottom = drawWrappedCardText(context, payload.settings.activity_title, 92, 474, 896, 35, 2);
+  context.font = '700 27px "Microsoft YaHei", "PingFang SC", sans-serif';
+  const activityBottom = drawWrappedCardText(context, payload.settings.activity_title, 100, 568, 880, 38, 2);
 
-  const statusY = Math.max(536, activityBottom + 8);
-  roundedRectangle(context, 92, statusY, 896, 78, 18);
+  const statusY = Math.max(634, activityBottom + 22);
+  roundedRectangle(context, 100, statusY, 880, 86, 22);
   context.fillStyle = "#eaf4f0";
   context.fill();
   context.strokeStyle = "#bdd8ce";
   context.lineWidth = 2;
   context.stroke();
   context.fillStyle = "#2f7560";
-  context.font = '900 29px "Microsoft YaHei", "PingFang SC", sans-serif';
-  context.fillText("✓  服务器已确认本次抢选结果", 128, statusY + 51);
+  context.font = '900 30px "Microsoft YaHei", "PingFang SC", sans-serif';
+  context.fillText("✓  服务器已确认本次抢选记录", 138, statusY + 55);
 
-  const detailsY = statusY + 104;
-  roundedRectangle(context, 92, detailsY, 896, 430, 24);
+  const detailsY = statusY + 118;
+  roundedRectangle(context, 100, detailsY, 880, 574, 28);
   context.fillStyle = "#f8f3f3";
   context.fill();
   context.strokeStyle = "#c9aaad";
   context.lineWidth = 2;
   context.stroke();
 
-  const labelFont = '700 21px "Microsoft YaHei", "PingFang SC", sans-serif';
-  const valueFont = '900 33px "Microsoft YaHei", "PingFang SC", sans-serif';
+  const labelFont = '700 22px "Microsoft YaHei", "PingFang SC", sans-serif';
+  const valueFont = '900 35px "Microsoft YaHei", "PingFang SC", sans-serif';
   const detailRows = [
-    ["姓名", payload.student.name, 132, detailsY + 52, 360],
-    ["学号", payload.student.student_no, 570, detailsY + 52, 350],
-    ["专业", payload.student.major_name, 132, detailsY + 174, 360],
-    ["系统记录时间", formatStudentTime(payload.selection.selected_at), 570, detailsY + 174, 350],
+    ["姓名", payload.student.name, 140, detailsY + 60, 344],
+    ["学号", payload.student.student_no, 554, detailsY + 60, 370],
+    ["专业", payload.student.major_name, 140, detailsY + 208, 344],
+    ["系统记录时间", formatStudentTime(payload.selection.selected_at), 554, detailsY + 208, 370],
   ];
   for (const [label, value, x, y, maxWidth] of detailRows) {
     context.fillStyle = "#766d6e";
@@ -675,65 +805,154 @@ async function createResultCardBlob(payload) {
     context.fillStyle = "#2f292a";
     context.font = valueFont;
     if (label === "姓名" || label === "专业") {
-      drawFittedCardText(context, value, x, y + 43, maxWidth, 33, 2);
+      drawFittedCardText(context, value, x, y + 46, maxWidth, 35, 2);
     } else {
-      drawWrappedCardText(context, value, x, y + 43, maxWidth, 40, 2);
+      drawWrappedCardText(context, value, x, y + 46, maxWidth, 42, 2);
     }
   }
   context.strokeStyle = "#e4d7d8";
   context.beginPath();
-  context.moveTo(124, detailsY + 286);
-  context.lineTo(956, detailsY + 286);
+  context.moveTo(132, detailsY + 354);
+  context.lineTo(948, detailsY + 354);
   context.stroke();
   context.fillStyle = "#766d6e";
   context.font = labelFont;
-  context.fillText("已选教学组", 132, detailsY + 330);
+  context.fillText("已选教学组", 140, detailsY + 410);
   context.fillStyle = "#7f292f";
-  drawFittedCardText(context, payload.selection.group_name, 132, detailsY + 382, 800, 42, 2);
+  drawFittedCardText(context, payload.selection.group_name, 140, detailsY + 470, 780, 48, 2);
 
-  const verificationY = detailsY + 474;
-  roundedRectangle(context, 92, verificationY, 896, 116, 18);
+  const verificationY = detailsY + 608;
+  roundedRectangle(context, 100, verificationY, 880, 286, 28);
   context.fillStyle = "#fff8eb";
   context.fill();
   context.strokeStyle = "#ead1ac";
   context.lineWidth = 2;
   context.stroke();
   context.fillStyle = "#7f292f";
-  context.font = '900 24px "Microsoft YaHei", "PingFang SC", sans-serif';
-  context.fillText("核验提示", 126, verificationY + 39);
+  context.font = '900 27px "Microsoft YaHei", "PingFang SC", sans-serif';
+  context.fillText(hasOnlineVerification ? "在线核验" : "记录核对", 138, verificationY + 54);
+  context.fillStyle = "#766d6e";
+  context.font = '700 21px "Microsoft YaHei", "PingFang SC", sans-serif';
+  context.fillText("核验编号", 138, verificationY + 100);
+  context.fillStyle = "#2f292a";
+  context.font = '900 33px ui-monospace, "SFMono-Regular", Consolas, monospace';
+  context.fillText(verificationCode || "以系统导出记录为准", 138, verificationY + 143);
   context.fillStyle = "#766d6e";
   context.font = '600 21px "Microsoft YaHei", "PingFang SC", sans-serif';
   drawWrappedCardText(
     context,
-    "请妥善保存本凭证，便于后续核对；最终教学组安排以学院正式发布结果及系统导出记录为准。",
-    126,
-    verificationY + 76,
-    820,
-    31,
-    2,
+    canScanVerify
+      ? "扫码可核对服务端原始记录。请勿修改凭证图片，任何差异均以在线核验和学院导出结果为准。"
+      : hasOnlineVerification
+        ? "在线核验暂不可用，请保留核验编号，并以学院系统导出记录为准。"
+        : "请勿修改凭证图片；核对时以学院导出的系统原始记录为准。",
+    138,
+    verificationY + 188,
+    verificationQr ? 550 : 790,
+    32,
+    3,
   );
+
+  const watermarkText = verificationCode || `${payload.settings.activity_id || "CURRENT"} · SYSTEM RECORD`;
+  context.save();
+  roundedRectangle(context, 100, verificationY, 880, 286, 28);
+  context.clip();
+  context.translate(70, verificationY + 40);
+  context.rotate(-Math.PI / 12);
+  context.fillStyle = "rgba(127, 41, 47, .045)";
+  context.font = '800 17px ui-monospace, "SFMono-Regular", Consolas, monospace';
+  for (let row = -2; row < 8; row += 1) {
+    for (let column = -2; column < 7; column += 1) {
+      context.fillText(`AHJZU · ${watermarkText}`, column * 240, row * 48);
+    }
+  }
+  context.restore();
+
+  if (verificationQr) {
+    roundedRectangle(context, 734, verificationY + 34, 210, 210, 18);
+    context.fillStyle = "#ffffff";
+    context.fill();
+    context.strokeStyle = "#d8bba0";
+    context.lineWidth = 2;
+    context.stroke();
+    context.imageSmoothingEnabled = false;
+    try {
+      context.drawImage(verificationQr, 747, verificationY + 47, 184, 184);
+    } finally {
+      context.imageSmoothingEnabled = true;
+    }
+  }
 
   context.strokeStyle = "#c9aaad";
   context.setLineDash([8, 8]);
   context.beginPath();
-  context.moveTo(92, 1262);
-  context.lineTo(988, 1262);
+  context.moveTo(100, 1792);
+  context.lineTo(980, 1792);
   context.stroke();
   context.setLineDash([]);
   context.fillStyle = "#766d6e";
-  context.font = '600 20px "Microsoft YaHei", "PingFang SC", sans-serif';
+  context.font = '600 21px "Microsoft YaHei", "PingFang SC", sans-serif';
   context.textAlign = "center";
-  context.fillText("安徽建筑大学 · 建筑与空间规划学院  制作：Mikutea", 540, 1294);
+  context.fillText("安徽建筑大学 · 建筑与空间规划学院", 540, 1830);
+  context.font = '600 18px "Microsoft YaHei", "PingFang SC", sans-serif';
+  context.fillText("制作：Mikutea  ·  最终安排以学院正式发布结果为准", 540, 1861);
   context.textAlign = "start";
 
-  return resultCardBlob(canvas);
+  return await resultCardBlob(canvas);
+  } finally {
+    verificationQrReleaseRequested = true;
+    releaseVerificationQr();
+  }
+}
+
+function resultCardPreviewKey(payload) {
+  if (!payload?.selection || !payload?.student || !payload?.settings) return null;
+  return JSON.stringify([
+    payload.settings.activity_id,
+    payload.settings.activity_title,
+    payload.student.student_no,
+    payload.student.name,
+    payload.student.major_name,
+    payload.selection.group_id,
+    payload.selection.group_name,
+    payload.selection.selected_at,
+    payload.receipt?.verification_code || "",
+    payload.receipt?.qr_image_url || "",
+  ]);
+}
+
+async function ensureStudentResultCardPreview(payload) {
+  const key = resultCardPreviewKey(payload);
+  if (!key || key === studentState.resultCardPreviewKey || key === studentState.resultCardPreviewPendingKey) return;
+  studentState.resultCardPreviewPendingKey = key;
+  studentEls.resultCardPreviewImage.hidden = true;
+  studentEls.resultCardPreviewStatus.hidden = false;
+  studentEls.resultCardPreviewStatus.textContent = "正在生成 9:16 凭证预览…";
+  try {
+    const blob = await createResultCardBlob(payload);
+    if (key !== resultCardPreviewKey(studentState.payload)) return;
+    const nextUrl = await resultCardDataUrl(blob);
+    if (key !== resultCardPreviewKey(studentState.payload)) return;
+    studentState.resultCardPreviewUrl = nextUrl;
+    studentState.resultCardPreviewKey = key;
+    studentEls.resultCardPreviewImage.src = nextUrl;
+    studentEls.resultCardPreviewImage.hidden = false;
+    studentEls.resultCardPreviewStatus.hidden = true;
+  } catch (error) {
+    if (key !== resultCardPreviewKey(studentState.payload)) return;
+    studentEls.resultCardPreviewImage.hidden = true;
+    studentEls.resultCardPreviewStatus.hidden = false;
+    studentEls.resultCardPreviewStatus.textContent = error.message || "凭证预览生成失败，可点击下方按钮重试下载";
+  } finally {
+    if (studentState.resultCardPreviewPendingKey === key) studentState.resultCardPreviewPendingKey = null;
+  }
 }
 
 async function downloadStudentResultCard() {
   if (studentState.resultCardInFlight) return;
   studentState.resultCardInFlight = true;
   studentEls.downloadResultCard.disabled = true;
-  studentEls.downloadResultCard.textContent = "正在生成 1080 × 1350 凭证…";
+  studentEls.downloadResultCard.textContent = "正在生成手机高清凭证…";
   try {
     const blob = await createResultCardBlob(studentState.payload);
     const objectUrl = URL.createObjectURL(blob);
@@ -845,6 +1064,7 @@ function renderStudentPayload(payload) {
     studentEls.successView.classList.remove("is-hidden");
     studentEls.successMessage.textContent = `已成功选择「${payload.selection.group_name}」`;
     studentEls.successTime.textContent = formatStudentTime(payload.selection.selected_at);
+    void ensureStudentResultCardPreview(payload);
     return;
   }
 

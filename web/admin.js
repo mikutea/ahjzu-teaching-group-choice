@@ -7,11 +7,13 @@ const adminState = {
   pollTimer: null,
   messageTimer: null,
   loading: false,
+  dashboardLoadPromise: null,
   boardPageTimer: null,
   lastBoardPageAt: 0,
   boardPages: { groups: 0, students: 0 },
   rosterScrollFrame: null,
   rosterScrollLastTime: 0,
+  rosterScrollPosition: 0,
   rosterFingerprint: "",
   rosterLoopSetupFrame: null,
   liveFeedFingerprint: "",
@@ -19,7 +21,13 @@ const adminState = {
   structureFingerprint: "",
   liveFeedScrollFrame: null,
   liveFeedScrollLastTime: 0,
+  liveFeedScrollPosition: 0,
   liveFeedLoopSetupFrame: null,
+  waitingFeedFingerprint: "",
+  waitingFeedScrollFrame: null,
+  waitingFeedScrollLastTime: 0,
+  waitingFeedScrollPosition: 0,
+  waitingFeedLoopSetupFrame: null,
   revealedActivationCodes: new Map(),
   activationHideTimers: new Map(),
   phaseActionPending: false,
@@ -36,6 +44,7 @@ const adminState = {
   countdownLastSecond: null,
   countdownFinishedTarget: null,
   quotaSaveTimers: new Map(),
+  entitySaveTimers: new Map(),
 };
 
 const adminEls = {
@@ -45,7 +54,7 @@ const adminEls = {
   app: document.querySelector("#admin-app"),
   title: document.querySelector("#admin-title"),
   statusBadge: document.querySelector("#admin-status-badge"),
-  statusButton: document.querySelector("#toggle-status"),
+  statusButton: document.querySelector("#open-live-board"),
   readinessPanel: document.querySelector("#readiness-panel"),
   readinessIcon: document.querySelector("#readiness-icon"),
   readinessSummary: document.querySelector("#readiness-summary"),
@@ -65,6 +74,8 @@ const adminEls = {
   groupProgressPage: document.querySelector("#group-progress-page"),
   liveSelectionFeed: document.querySelector("#live-selection-feed"),
   liveFeedState: document.querySelector("#live-feed-state"),
+  waitingStudentFeed: document.querySelector("#waiting-student-feed"),
+  waitingFeedState: document.querySelector("#waiting-feed-state"),
   qr: document.querySelector("#student-qr"),
   qrPlaceholder: document.querySelector("#qr-placeholder"),
   publicUrl: document.querySelector("#public-url-label"),
@@ -283,15 +294,19 @@ function showAdminLogin() {
   clearAllRevealedActivationCodes();
   stopRosterAutoScroll();
   stopLiveFeedAutoScroll();
+  stopWaitingFeedAutoScroll();
   stopCountdownTicker();
   for (const timer of adminState.quotaSaveTimers.values()) clearTimeout(timer);
   adminState.quotaSaveTimers.clear();
+  for (const timer of adminState.entitySaveTimers.values()) clearTimeout(timer);
+  adminState.entitySaveTimers.clear();
   adminState.serverClockOffset = 0;
   adminState.serverClockSynchronized = false;
   adminState.dashboardClockSample = null;
   adminState.statusSyncLoading = false;
   adminState.rosterFingerprint = "";
   adminState.liveFeedFingerprint = "";
+  adminState.waitingFeedFingerprint = "";
   adminState.groupProgressFingerprint = "";
   adminState.structureFingerprint = "";
 }
@@ -349,7 +364,6 @@ function setCountdownNumber(seconds) {
   }
   void adminEls.boardOverlayCountdown.offsetWidth;
   for (const element of countdownElements) element.classList.add("is-ticking");
-  adminEls.statusButton.textContent = `倒计时 ${seconds} 秒`;
   adminEls.boardStart.textContent = `倒计时 ${seconds} 秒`;
 }
 
@@ -450,7 +464,7 @@ async function loadAdminSession() {
     const me = await adminApi("/api/admin/me");
     adminState.csrf = me.csrf_token;
     showAdminApp();
-    await loadDashboard();
+    await loadDashboard({ afterMutation: true });
     startAdminPolling();
   } catch (error) {
     if (error.status !== 401) adminEls.loginError.textContent = error.message;
@@ -458,34 +472,43 @@ async function loadAdminSession() {
   }
 }
 
-async function loadDashboard({ quiet = false } = {}) {
-  if (adminState.loading) return;
-  adminState.loading = true;
-  try {
-    const requestStartedAt = Date.now();
-    const dashboard = await adminApi("/api/admin/dashboard");
-    adminState.dashboardClockSample = { requestStartedAt, responseReceivedAt: Date.now() };
-    adminState.dashboard = dashboard;
-    renderDashboard(dashboard);
-    adminEls.lastRefresh.textContent = `刷新于 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
-    if (adminState.connectionInterrupted) {
-      adminState.connectionInterrupted = false;
-      showAdminToast("管理端实时连接已恢复", "success");
-    }
-  } catch (error) {
-    if (error.status === 401) {
-      showAdminLogin();
-      adminEls.loginError.textContent = "登录已失效，请重新登录";
-    } else if (!quiet) {
-      showAdminToast(error.message, "error");
-    } else if (!adminState.connectionInterrupted || Date.now() - adminState.lastBackgroundErrorAt >= 10_000) {
-      adminState.connectionInterrupted = true;
-      adminState.lastBackgroundErrorAt = Date.now();
-      showAdminToast(error.status === 0 ? "实时数据网络同步中断，系统会自动重试" : `${error.message}；系统会自动重试`, "error");
-    }
-  } finally {
-    adminState.loading = false;
+async function loadDashboard({ quiet = false, afterMutation = false } = {}) {
+  if (adminState.loading) {
+    if (!afterMutation) return adminState.dashboardLoadPromise;
+    try { await adminState.dashboardLoadPromise; } catch (_) { /* the forced refresh below reports its own result */ }
+    return loadDashboard({ quiet, afterMutation: false });
   }
+  adminState.loading = true;
+  const request = (async () => {
+    try {
+      const requestStartedAt = Date.now();
+      const dashboard = await adminApi("/api/admin/dashboard");
+      adminState.dashboardClockSample = { requestStartedAt, responseReceivedAt: Date.now() };
+      adminState.dashboard = dashboard;
+      renderDashboard(dashboard);
+      adminEls.lastRefresh.textContent = `刷新于 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
+      if (adminState.connectionInterrupted) {
+        adminState.connectionInterrupted = false;
+        showAdminToast("管理端实时连接已恢复", "success");
+      }
+    } catch (error) {
+      if (error.status === 401) {
+        showAdminLogin();
+        adminEls.loginError.textContent = "登录已失效，请重新登录";
+      } else if (!quiet) {
+        showAdminToast(error.message, "error");
+      } else if (!adminState.connectionInterrupted || Date.now() - adminState.lastBackgroundErrorAt >= 10_000) {
+        adminState.connectionInterrupted = true;
+        adminState.lastBackgroundErrorAt = Date.now();
+        showAdminToast(error.status === 0 ? "实时数据网络同步中断，系统会自动重试" : `${error.message}；系统会自动重试`, "error");
+      }
+    } finally {
+      adminState.loading = false;
+      adminState.dashboardLoadPromise = null;
+    }
+  })();
+  adminState.dashboardLoadPromise = request;
+  return request;
 }
 
 function mergeDashboardStatusSnapshot(snapshot) {
@@ -516,9 +539,9 @@ function mergeDashboardStatusSnapshot(snapshot) {
     adminEls.rosterCount.textContent = "活动已切换，正在同步新名单…";
     adminEls.statusBadge.className = "status-badge status-badge--closed";
     adminEls.statusBadge.textContent = "活动已切换";
-    adminEls.statusButton.textContent = "正在同步新活动";
-    adminEls.statusButton.disabled = true;
-    adminEls.statusButton.title = "另一管理端已切换当前活动，正在同步新名单";
+    adminEls.statusButton.textContent = "进入实时大屏";
+    adminEls.statusButton.disabled = false;
+    adminEls.statusButton.title = "活动已切换，进入大屏后会继续同步新名单";
     return null;
   }
   const settings = {
@@ -594,7 +617,24 @@ function startAdminPolling() {
   renderBoardClock();
 }
 
-function renderDashboard(data) {
+function structureEditorAutosaveBusy() {
+  return adminState.entitySaveTimers.size > 0
+    || adminState.quotaSaveTimers.size > 0
+    || Boolean(document.activeElement?.closest?.("#major-editor, #group-editor, #quota-matrix"))
+    || Boolean(adminEls.majorEditor.querySelector('.entity-row[data-saving="true"]'))
+    || Boolean(adminEls.groupEditor.querySelector('.entity-row[data-saving="true"]'))
+    || Boolean(adminEls.quotaMatrix.querySelector('input[data-saving="true"]'));
+}
+
+function renderLatestStructureAfterAutosave({ forceStructure = false } = {}) {
+  if (
+    adminState.currentView === "structure"
+    && adminState.dashboard
+    && (forceStructure || !structureEditorAutosaveBusy())
+  ) renderDashboard(adminState.dashboard, { forceStructure });
+}
+
+function renderDashboard(data, { forceStructure = false } = {}) {
   synchronizeServerClock(data);
   const phase = dashboardPhase(data);
   const displayMode = boardDisplayMode(data, phase);
@@ -605,8 +645,10 @@ function renderDashboard(data) {
     clearAllRevealedActivationCodes();
     stopRosterAutoScroll();
     stopLiveFeedAutoScroll();
+    stopWaitingFeedAutoScroll();
     adminState.rosterFingerprint = "";
     adminState.liveFeedFingerprint = "";
+    adminState.waitingFeedFingerprint = "";
     adminState.groupProgressFingerprint = "";
     adminState.structureFingerprint = "";
   }
@@ -648,6 +690,7 @@ function renderDashboard(data) {
   if (adminState.currentView === "overview") {
     renderGroupProgress(data.groups);
     renderLiveSelectionFeed(data.recent_selections || []);
+    renderWaitingStudentFeed(data.entered_students || []);
     renderQr(data.settings.public_base_url);
     renderUnselectedList();
     if (Date.now() - adminState.recentRenderedAt >= 5000) {
@@ -662,8 +705,7 @@ function renderDashboard(data) {
       ...data.groups.map((group) => [group.id, group.name, group.active, group.total_capacity, group.sort_order]),
       ...data.quotas.map((quota) => [quota.major_id, quota.group_id, quota.capacity, quota.selected_count]),
     ]);
-    const structureEditorHasFocus = Boolean(document.activeElement?.closest?.("#view-structure"));
-    if (!structureEditorHasFocus && structureFingerprint !== adminState.structureFingerprint) {
+    if ((forceStructure || !structureEditorAutosaveBusy()) && structureFingerprint !== adminState.structureFingerprint) {
       adminState.structureFingerprint = structureFingerprint;
       renderStructure(data, structureLocked);
     }
@@ -683,7 +725,7 @@ function renderDashboardPhaseStatus(data, phase = dashboardPhase(data), presence
   adminEls.boardHeaderPhase.textContent = badgeLabels[phase];
   adminEls.statusBadge.className = `status-badge status-badge--${phase === "open" ? "open" : phase === "countdown" ? "countdown" : "closed"}`;
   adminEls.statusBadge.textContent = badgeLabels[phase];
-  adminEls.statusButton.removeAttribute("title");
+  adminEls.statusButton.title = "进入全屏实时大屏，抢选开关位于大屏二维码下方";
   renderBoardStage(data, phase, presence);
   renderBoardClock();
 }
@@ -693,7 +735,6 @@ function renderBoardStage(data, phase, presence) {
   const readiness = normalizeReadiness(data.readiness);
   adminEls.boardStage.className = `board-stage board-stage--${phase}`;
   adminEls.boardNotice.classList.toggle("is-open", phase === "open");
-  adminEls.statusButton.disabled = adminState.phaseActionPending || phase === "countdown";
   adminEls.boardStart.disabled = adminState.phaseActionPending || phase === "countdown" || ((phase === "waiting" || phase === "closed") && !readiness.ready);
 
   if (phase === "countdown") {
@@ -701,7 +742,6 @@ function renderBoardStage(data, phase, presence) {
     adminEls.boardStageDetail.textContent = `已进入候场 ${presence.online} / ${total} 人，倒计时结束后同时进入抢选`;
     adminEls.boardStatus.textContent = "倒计时正在同步到全部学生端";
     adminEls.boardLiveNote.textContent = "请保持大屏与学生手机页面打开";
-    adminEls.statusButton.className = "button button--primary";
     adminEls.boardStart.className = "button button--primary button--wide";
     startCountdownTicker(data);
     return;
@@ -717,8 +757,6 @@ function renderBoardStage(data, phase, presence) {
     adminEls.boardStageDetail.textContent = `已完成 ${data.totals.selected} / ${total} 人，名额与名单每秒自动同步`;
     adminEls.boardStatus.textContent = "抢选正在进行，扫码仍可登录";
     adminEls.boardLiveNote.textContent = "扫码仍可登录 · 名额与名单实时更新";
-    adminEls.statusButton.textContent = "关闭抢选";
-    adminEls.statusButton.className = "button button--secondary";
     adminEls.boardStart.textContent = "关闭抢选";
     adminEls.boardStart.className = "button button--secondary button--wide";
     return;
@@ -730,8 +768,6 @@ function renderBoardStage(data, phase, presence) {
   adminEls.boardStageDetail.textContent = `已进入候场 ${presence.online} / ${total} 人，尚未进入 ${presence.absent} 人`;
   adminEls.boardStatus.textContent = isClosed ? "当前不可提交，可再次发起统一倒计时" : "候场数据实时更新";
   adminEls.boardLiveNote.textContent = "扫码入口持续开放，页面自动同步";
-  adminEls.statusButton.textContent = "开始 10 秒倒计时";
-  adminEls.statusButton.className = "button button--primary";
   adminEls.boardStart.textContent = readiness.ready ? "开始 10 秒倒计时" : "就绪检查未通过";
   adminEls.boardStart.className = "button button--primary button--wide";
 }
@@ -835,7 +871,7 @@ adminEls.activityList.addEventListener("click", async (event) => {
       activityId: adminState.dashboard?.settings.activity_id,
     });
     showAdminToast("历史归档已删除", "success");
-    await loadDashboard();
+    await loadDashboard({ afterMutation: true });
   } catch (error) {
     button.disabled = false;
     showAdminToast(error.message, "error");
@@ -893,7 +929,9 @@ function restoreLiveFeedScrollRatio(offset) {
   const list = adminEls.liveSelectionFeed;
   const loopHeight = Number(list.dataset.loopHeight || 0);
   const max = loopHeight > 0 ? loopHeight - 1 : Math.max(0, list.scrollHeight - list.clientHeight);
-  list.scrollTop = Math.min(max, Math.max(0, offset));
+  const restored = Math.min(max, Math.max(0, offset));
+  adminState.liveFeedScrollPosition = restored;
+  list.scrollTop = restored;
 }
 
 function stopLiveFeedAutoScroll() {
@@ -907,19 +945,24 @@ function stopLiveFeedAutoScroll() {
 function startLiveFeedAutoScroll() {
   stopLiveFeedAutoScroll();
   if (reducedMotionPreference.matches) return;
-  const loopHeight = Number(adminEls.liveSelectionFeed.dataset.loopHeight || 0);
+  const list = adminEls.liveSelectionFeed;
+  const loopHeight = Number(list.dataset.loopHeight || 0);
   if (loopHeight <= 0) return;
+  adminState.liveFeedScrollPosition = Math.max(0, list.scrollTop);
   const tick = (now) => {
     if (document.hidden || adminState.currentView !== "overview") {
       stopLiveFeedAutoScroll();
       return;
     }
-    const list = adminEls.liveSelectionFeed;
     const cycleHeight = Number(list.dataset.loopHeight || 0);
     if (cycleHeight > 0) {
       const elapsed = adminState.liveFeedScrollLastTime ? Math.min(80, now - adminState.liveFeedScrollLastTime) : 0;
-      const next = list.scrollTop + elapsed * 0.022;
-      list.scrollTop = next >= cycleHeight ? next - cycleHeight : next;
+      const domPosition = list.scrollTop % cycleHeight;
+      if (Math.abs(domPosition - adminState.liveFeedScrollPosition) > 2) {
+        adminState.liveFeedScrollPosition = domPosition;
+      }
+      adminState.liveFeedScrollPosition = (adminState.liveFeedScrollPosition + elapsed * 0.022) % cycleHeight;
+      list.scrollTop = adminState.liveFeedScrollPosition;
     }
     adminState.liveFeedScrollLastTime = now;
     adminState.liveFeedScrollFrame = requestAnimationFrame(tick);
@@ -1000,6 +1043,127 @@ function renderLiveSelectionFeed(rows, { force = false } = {}) {
   setupLiveFeedLoop(previousScrollRatio);
 }
 
+function captureWaitingFeedScrollOffset() {
+  const list = adminEls.waitingStudentFeed;
+  const loopHeight = Number(list.dataset.loopHeight || 0);
+  return loopHeight > 0 ? list.scrollTop % loopHeight : Math.max(0, list.scrollTop);
+}
+
+function restoreWaitingFeedScrollOffset(offset) {
+  const list = adminEls.waitingStudentFeed;
+  const loopHeight = Number(list.dataset.loopHeight || 0);
+  const max = loopHeight > 0 ? loopHeight - 1 : Math.max(0, list.scrollHeight - list.clientHeight);
+  const restored = Math.min(max, Math.max(0, offset));
+  adminState.waitingFeedScrollPosition = restored;
+  list.scrollTop = restored;
+}
+
+function stopWaitingFeedAutoScroll() {
+  if (adminState.waitingFeedScrollFrame) cancelAnimationFrame(adminState.waitingFeedScrollFrame);
+  if (adminState.waitingFeedLoopSetupFrame) cancelAnimationFrame(adminState.waitingFeedLoopSetupFrame);
+  adminState.waitingFeedScrollFrame = null;
+  adminState.waitingFeedLoopSetupFrame = null;
+  adminState.waitingFeedScrollLastTime = 0;
+}
+
+function startWaitingFeedAutoScroll() {
+  stopWaitingFeedAutoScroll();
+  if (reducedMotionPreference.matches) return;
+  const list = adminEls.waitingStudentFeed;
+  if (Number(list.dataset.loopHeight || 0) <= 0) return;
+  adminState.waitingFeedScrollPosition = Math.max(0, list.scrollTop);
+  const tick = (now) => {
+    if (document.hidden || adminState.currentView !== "overview" || boardDisplayMode() !== "waiting") {
+      stopWaitingFeedAutoScroll();
+      return;
+    }
+    const cycleHeight = Number(list.dataset.loopHeight || 0);
+    if (cycleHeight > 0) {
+      const elapsed = adminState.waitingFeedScrollLastTime ? Math.min(80, now - adminState.waitingFeedScrollLastTime) : 0;
+      const domPosition = list.scrollTop % cycleHeight;
+      if (Math.abs(domPosition - adminState.waitingFeedScrollPosition) > 2) {
+        adminState.waitingFeedScrollPosition = domPosition;
+      }
+      adminState.waitingFeedScrollPosition = (adminState.waitingFeedScrollPosition + elapsed * 0.026) % cycleHeight;
+      list.scrollTop = adminState.waitingFeedScrollPosition;
+    }
+    adminState.waitingFeedScrollLastTime = now;
+    adminState.waitingFeedScrollFrame = requestAnimationFrame(tick);
+  };
+  adminState.waitingFeedScrollFrame = requestAnimationFrame(tick);
+}
+
+function setupWaitingFeedLoop(previousOffset) {
+  if (adminState.waitingFeedLoopSetupFrame) cancelAnimationFrame(adminState.waitingFeedLoopSetupFrame);
+  adminState.waitingFeedLoopSetupFrame = requestAnimationFrame(() => {
+    adminState.waitingFeedLoopSetupFrame = null;
+    const list = adminEls.waitingStudentFeed;
+    list.querySelectorAll("[data-waiting-clone]").forEach((clone) => clone.remove());
+    delete list.dataset.loopHeight;
+    list.scrollTop = 0;
+    const originals = [...list.children];
+    const canLoop = originals.length > 1 && list.scrollHeight > list.clientHeight + 4;
+    adminEls.waitingFeedState.textContent = canLoop && !reducedMotionPreference.matches
+      ? "连续滚动"
+      : originals.length ? "实时更新" : "等待进入";
+    if (!canLoop || reducedMotionPreference.matches) {
+      restoreWaitingFeedScrollOffset(previousOffset);
+      stopWaitingFeedAutoScroll();
+      return;
+    }
+    const firstTop = originals[0].offsetTop;
+    const clones = originals.map((item) => {
+      const clone = item.cloneNode(true);
+      clone.dataset.waitingClone = "true";
+      clone.setAttribute("aria-hidden", "true");
+      return clone;
+    });
+    list.append(...clones);
+    const loopHeight = clones[0].offsetTop - firstTop;
+    if (loopHeight <= 0) return;
+    list.dataset.loopHeight = String(loopHeight);
+    restoreWaitingFeedScrollOffset(previousOffset);
+    startWaitingFeedAutoScroll();
+  });
+}
+
+function renderWaitingStudentFeed(rows, { force = false } = {}) {
+  const students = Array.isArray(rows) ? rows : [];
+  const fingerprint = JSON.stringify([
+    boardDisplayMode(),
+    ...students.map((student) => [student.id, student.name, student.major_name]),
+  ]);
+  if (!force && fingerprint === adminState.waitingFeedFingerprint) return;
+  const previousOffset = captureWaitingFeedScrollOffset();
+  adminState.waitingFeedFingerprint = fingerprint;
+  stopWaitingFeedAutoScroll();
+  if (!students.length) {
+    const empty = document.createElement("div");
+    empty.className = "waiting-feed-empty";
+    empty.textContent = "等待学生完成身份核验";
+    adminEls.waitingStudentFeed.replaceChildren(empty);
+    adminEls.waitingFeedState.textContent = "等待进入";
+    return;
+  }
+  const items = students.map((student) => {
+    const item = document.createElement("article");
+    item.className = "waiting-feed-item";
+    const marker = document.createElement("span");
+    marker.className = "waiting-feed-item__marker";
+    marker.textContent = "✓";
+    const detail = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = student.name;
+    const major = document.createElement("small");
+    major.textContent = student.major_name || "专业待同步";
+    detail.append(name, major);
+    item.append(marker, detail);
+    return item;
+  });
+  adminEls.waitingStudentFeed.replaceChildren(...items);
+  setupWaitingFeedLoop(previousOffset);
+}
+
 function renderQr(publicUrl) {
   adminEls.publicUrl.textContent = publicUrl || "尚未设置访问地址";
   if (publicUrl) {
@@ -1044,11 +1208,15 @@ function restoreRosterScrollRatio(offset) {
   const list = adminEls.unselectedList;
   const loopHeight = Number(list.dataset.loopHeight || 0);
   if (loopHeight > 0) {
-    list.scrollTop = Math.min(loopHeight - 1, Math.max(0, offset));
+    const restored = Math.min(loopHeight - 1, Math.max(0, offset));
+    adminState.rosterScrollPosition = restored;
+    list.scrollTop = restored;
     return;
   }
   const max = Math.max(0, list.scrollHeight - list.clientHeight);
-  list.scrollTop = Math.min(max, Math.max(0, offset));
+  const restored = Math.min(max, Math.max(0, offset));
+  adminState.rosterScrollPosition = restored;
+  list.scrollTop = restored;
 }
 
 function stopRosterAutoScroll() {
@@ -1064,19 +1232,24 @@ function startRosterAutoScroll() {
   adminState.rosterScrollFrame = null;
   adminState.rosterScrollLastTime = 0;
   if (reducedMotionPreference.matches) return;
-  const loopHeight = Number(adminEls.unselectedList.dataset.loopHeight || 0);
+  const list = adminEls.unselectedList;
+  const loopHeight = Number(list.dataset.loopHeight || 0);
   if (loopHeight <= 0) return;
+  adminState.rosterScrollPosition = Math.max(0, list.scrollTop);
   const tick = (now) => {
     if (document.hidden || adminState.currentView !== "overview") {
       stopRosterAutoScroll();
       return;
     }
-    const list = adminEls.unselectedList;
     const cycleHeight = Number(list.dataset.loopHeight || 0);
     if (cycleHeight > 0) {
       const elapsed = adminState.rosterScrollLastTime ? Math.min(80, now - adminState.rosterScrollLastTime) : 0;
-      const next = list.scrollTop + elapsed * 0.018;
-      list.scrollTop = next >= cycleHeight ? next - cycleHeight : next;
+      const domPosition = list.scrollTop % cycleHeight;
+      if (Math.abs(domPosition - adminState.rosterScrollPosition) > 2) {
+        adminState.rosterScrollPosition = domPosition;
+      }
+      adminState.rosterScrollPosition = (adminState.rosterScrollPosition + elapsed * 0.018) % cycleHeight;
+      list.scrollTop = adminState.rosterScrollPosition;
     }
     adminState.rosterScrollLastTime = now;
     adminState.rosterScrollFrame = requestAnimationFrame(tick);
@@ -1128,7 +1301,6 @@ function renderUnselectedList({ force = false } = {}) {
   adminEls.studentListKicker.textContent = isCheckIn ? "CHECK-IN LIST" : "WAITING LIST";
   adminEls.unselectedTitle.textContent = isCheckIn ? "尚未进入候场" : "当前未选学生";
   adminEls.unselectedCount.textContent = `${all.length} 人`;
-  adminEls.unselectedPage.textContent = visibleStudents.length ? "实时更新" : "";
   const fingerprint = JSON.stringify([
     mode,
     adminEls.unselectedSearch.value.trim().toLowerCase(),
@@ -1138,6 +1310,7 @@ function renderUnselectedList({ force = false } = {}) {
   adminState.rosterFingerprint = fingerprint;
   stopRosterAutoScroll();
   if (!filtered.length) {
+    adminEls.unselectedPage.textContent = "";
     const empty = document.createElement("div");
     empty.className = "empty-state";
     empty.textContent = all.length
@@ -1230,6 +1403,15 @@ function makeIconButton(action, text, title, danger = false) {
   return button;
 }
 
+function makeEntitySaveState() {
+  const state = document.createElement("span");
+  state.className = "entity-save-state is-saved";
+  state.setAttribute("role", "status");
+  state.setAttribute("aria-live", "polite");
+  state.textContent = "已保存";
+  return state;
+}
+
 function renderMajorEditor(majors, locked) {
   const rows = majors.map((major) => {
     const row = document.createElement("div");
@@ -1244,12 +1426,14 @@ function renderMajorEditor(majors, locked) {
     name.disabled = locked;
     name.setAttribute("aria-label", "专业名称");
     const status = makeEntityStatus(major.active, locked, "toggle-major-status");
-    const save = makeIconButton("save-major", "✓", "保存专业");
+    const saveState = makeEntitySaveState();
     const remove = makeIconButton("delete-major", "×", "删除专业", true);
-    save.disabled = locked;
     remove.disabled = locked;
-    row.append(drag, name, status, save, remove);
+    row.append(drag, name, status, saveState, remove);
     row._nameInput = name;
+    row._saveState = saveState;
+    row.dataset.entityKind = "major";
+    row.dataset.originalName = major.name;
     row.dataset.active = String(Boolean(major.active));
     return row;
   });
@@ -1282,13 +1466,16 @@ function renderGroupEditor(groups, locked) {
     capacity.setAttribute("aria-label", "教学组总容量");
     capacityWrap.append(capacity);
     const status = makeEntityStatus(group.active, locked, "toggle-group-status");
-    const save = makeIconButton("save-group", "✓", "保存教学组");
+    const saveState = makeEntitySaveState();
     const remove = makeIconButton("delete-group", "×", "删除教学组", true);
-    save.disabled = locked;
     remove.disabled = locked;
-    row.append(drag, name, capacityWrap, status, save, remove);
+    row.append(drag, name, capacityWrap, status, saveState, remove);
     row._nameInput = name;
     row._capacityInput = capacity;
+    row._saveState = saveState;
+    row.dataset.entityKind = "group";
+    row.dataset.originalName = group.name;
+    row.dataset.originalCapacity = String(group.total_capacity);
     row.dataset.active = String(Boolean(group.active));
     return row;
   });
@@ -1473,18 +1660,6 @@ function activationCodeFromResponse(result) {
 
 function renderStudentRoster(data = adminState.dashboard) {
   const students = Array.isArray(data?.students) ? data.students : [];
-  const rosterQuery = adminEls.rosterSearch.value.trim();
-  const mobileLookupWaiting = window.matchMedia("(max-width: 700px)").matches && !rosterQuery;
-  if (mobileLookupWaiting) {
-    adminEls.rosterCount.textContent = "输入条件查询";
-    const row = document.createElement("tr");
-    const cell = createCell("请输入姓名或 11 位学号，匹配后再显示个人激活码");
-    cell.colSpan = 6;
-    cell.className = "empty-state mobile-roster-lookup-hint";
-    row.append(cell);
-    adminEls.rosterBody.replaceChildren(row);
-    return;
-  }
   const filtered = filteredRosterStudents(students);
   adminEls.rosterCount.textContent = filtered.length === students.length
     ? `${students.length} 人`
@@ -1574,10 +1749,12 @@ function switchAdminView(viewName) {
   if (viewName !== "overview") {
     stopRosterAutoScroll();
     stopLiveFeedAutoScroll();
+    stopWaitingFeedAutoScroll();
     loadDashboard({ quiet: true });
   } else {
     renderUnselectedList({ force: true });
     renderLiveSelectionFeed(adminState.dashboard?.recent_selections || [], { force: true });
+    renderWaitingStudentFeed(adminState.dashboard?.entered_students || [], { force: true });
   }
 }
 
@@ -1599,7 +1776,7 @@ adminEls.loginForm.addEventListener("submit", async (event) => {
     const data = await adminApi("/api/admin/login", { method: "POST", body: JSON.stringify(Object.fromEntries(form.entries())) });
     adminState.csrf = data.csrf_token;
     showAdminApp();
-    await loadDashboard();
+    await loadDashboard({ afterMutation: true });
     startAdminPolling();
   } catch (error) {
     adminEls.loginError.textContent = error.message;
@@ -1647,7 +1824,6 @@ async function handleSelectionPhaseAction() {
   );
   if (!confirmed) return;
   adminState.phaseActionPending = true;
-  adminEls.statusButton.disabled = true;
   adminEls.boardStart.disabled = true;
   try {
     if (phase === "open") {
@@ -1664,7 +1840,7 @@ async function handleSelectionPhaseAction() {
       });
     }
     showAdminToast(phase === "open" ? "抢选已关闭" : "10 秒同步倒计时已开始", "success");
-    await loadDashboard();
+    await loadDashboard({ afterMutation: true });
   } catch (error) {
     showAdminToast(error.message, "error");
   } finally {
@@ -1673,7 +1849,6 @@ async function handleSelectionPhaseAction() {
   }
 }
 
-adminEls.statusButton.addEventListener("click", handleSelectionPhaseAction);
 adminEls.boardStart.addEventListener("click", handleSelectionPhaseAction);
 
 adminEls.unselectedSearch.addEventListener("input", renderUnselectedList);
@@ -1686,6 +1861,7 @@ reducedMotionPreference.addEventListener?.("change", () => {
   if (adminState.dashboard && adminState.currentView === "overview") {
     renderUnselectedList({ force: true });
     renderLiveSelectionFeed(adminState.dashboard.recent_selections || [], { force: true });
+    renderWaitingStudentFeed(adminState.dashboard.entered_students || [], { force: true });
   }
 });
 
@@ -1694,6 +1870,7 @@ function leavePresentationMode() {
   document.body.classList.remove("is-presentation");
   stopRosterAutoScroll();
   stopLiveFeedAutoScroll();
+  stopWaitingFeedAutoScroll();
 }
 
 function enterPresentationFallback() {
@@ -1710,6 +1887,7 @@ function updateFullscreenButton() {
   if (adminState.dashboard) {
     renderGroupProgress(adminState.dashboard.groups || []);
     renderLiveSelectionFeed(adminState.dashboard.recent_selections || [], { force: true });
+    renderWaitingStudentFeed(adminState.dashboard.entered_students || [], { force: true });
     renderUnselectedList({ force: true });
   }
 }
@@ -1720,13 +1898,11 @@ async function exitBoardFullscreen() {
   updateFullscreenButton();
 }
 
-fullscreenButton.addEventListener("click", async () => {
+async function enterBoardFullscreen() {
+  switchAdminView("overview");
   try {
-    if (document.fullscreenElement) {
-      await document.exitFullscreen();
-    } else if (liveBoard.classList.contains("is-presentation")) {
-      leavePresentationMode();
-    } else if (shouldUsePresentationFallback()) {
+    if (document.fullscreenElement || liveBoard.classList.contains("is-presentation")) return;
+    if (shouldUsePresentationFallback()) {
       enterPresentationFallback();
     } else {
       await liveBoard.requestFullscreen();
@@ -1736,7 +1912,17 @@ fullscreenButton.addEventListener("click", async () => {
     showAdminToast("浏览器未授予原生全屏，已切换为页面大屏模式", "success");
   }
   updateFullscreenButton();
+}
+
+fullscreenButton.addEventListener("click", async () => {
+  if (document.fullscreenElement || liveBoard.classList.contains("is-presentation")) {
+    await exitBoardFullscreen();
+    return;
+  }
+  await enterBoardFullscreen();
 });
+
+adminEls.statusButton.addEventListener("click", enterBoardFullscreen);
 
 document.addEventListener("fullscreenchange", () => {
   if (document.fullscreenElement) leavePresentationMode();
@@ -1778,7 +1964,7 @@ document.querySelector("#add-major-form").addEventListener("submit", async (even
     input.value = "";
     delete form.dataset.activityId;
     showAdminToast("专业已新增，配额矩阵已自动扩展", "success");
-    await loadDashboard();
+    await loadDashboard({ afterMutation: true });
   } catch (error) { showAdminToast(error.message, "error"); }
 });
 
@@ -1795,9 +1981,199 @@ document.querySelector("#add-group-form").addEventListener("submit", async (even
     form.elements.namedItem("name").value = "";
     delete form.dataset.activityId;
     showAdminToast("教学组已新增，所有专业已自动补齐零配额", "success");
-    await loadDashboard();
+    await loadDashboard({ afterMutation: true });
   } catch (error) { showAdminToast(error.message, "error"); }
 });
+
+function entityRowSaveKey(row) {
+  return `${row.dataset.entityKind}:${row.dataset.id}`;
+}
+
+function setEntitySaveState(row, state, text) {
+  if (!row?._saveState) return;
+  row._saveState.className = `entity-save-state is-${state}`;
+  row._saveState.textContent = text;
+}
+
+function entityRowHasChanges(row, { includeCapacity = true } = {}) {
+  if (row._nameInput.value.trim() !== row.dataset.originalName) return true;
+  return includeCapacity && row.dataset.entityKind === "group"
+    && row._capacityInput.value !== row.dataset.originalCapacity;
+}
+
+async function persistEntityRow(row, { refreshAfter = false, includeCapacity = false } = {}) {
+  if (!row?.isConnected) return;
+  const key = entityRowSaveKey(row);
+  clearTimeout(adminState.entitySaveTimers.get(key));
+  adminState.entitySaveTimers.delete(key);
+  if (row.dataset.saving === "true") {
+    row.dataset.saveQueued = "true";
+    if (includeCapacity) row.dataset.saveQueuedCapacity = "true";
+    if (refreshAfter) row.dataset.saveQueuedRefresh = "true";
+    return;
+  }
+
+  const submittedName = row._nameInput.value.trim();
+  const nameChanged = submittedName !== row.dataset.originalName;
+  if (nameChanged && !submittedName) {
+    row._nameInput.setCustomValidity("名称不能为空");
+    row._nameInput.reportValidity();
+    setEntitySaveState(row, "error", "名称不能为空");
+    return;
+  }
+  row._nameInput.setCustomValidity("");
+
+  let submittedCapacity = null;
+  const capacityChanged = includeCapacity
+    && row.dataset.entityKind === "group"
+    && row._capacityInput.value !== row.dataset.originalCapacity;
+  if (capacityChanged) {
+    submittedCapacity = Number(row._capacityInput.value);
+    if (!Number.isInteger(submittedCapacity) || submittedCapacity < 0 || submittedCapacity > 1000) {
+      row._capacityInput.setCustomValidity("请输入 0 至 1000 的整数");
+      row._capacityInput.reportValidity();
+      setEntitySaveState(row, "error", "容量格式有误");
+      return;
+    }
+    row._capacityInput.setCustomValidity("");
+  }
+
+  if (!nameChanged && !capacityChanged) {
+    setEntitySaveState(row, "saved", "已保存");
+    if (refreshAfter && adminState.dashboard) {
+      adminState.structureFingerprint = "";
+      renderDashboard(adminState.dashboard);
+    }
+    return;
+  }
+
+  const id = Number(row.dataset.id);
+  const editor = row.dataset.entityKind === "major" ? adminEls.majorEditor : adminEls.groupEditor;
+  const activityId = Number(editor.dataset.activityId);
+  const uiHasMovedFromRequestActivity = () => {
+    const dashboardActivityId = Number(adminState.dashboard?.settings?.activity_id);
+    const editorActivityId = Number(editor.dataset.activityId);
+    return Number.isInteger(dashboardActivityId)
+      && Number.isInteger(editorActivityId)
+      && dashboardActivityId !== activityId
+      && editorActivityId !== activityId;
+  };
+  const payload = {};
+  if (nameChanged) payload.name = submittedName;
+  if (capacityChanged) payload.total_capacity = submittedCapacity;
+  let activityCasConflict = false;
+  let activityCasRequiresRefresh = false;
+  row.dataset.saving = "true";
+  row.setAttribute("aria-busy", "true");
+  setEntitySaveState(row, "saving", "保存中…");
+  try {
+    const result = await adminApi(`/api/admin/${row.dataset.entityKind === "major" ? "majors" : "groups"}/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+      activityId,
+    });
+    if (nameChanged) row.dataset.originalName = submittedName;
+    if (capacityChanged) row.dataset.originalCapacity = String(submittedCapacity);
+    setEntitySaveState(row, "saved", "已自动保存");
+    if (result?.quotas_adjusted || result?.quota_adjustments?.length) {
+      showAdminToast("教学组容量已保存，专业配额已按已选下限自动重算", "success");
+    }
+    await loadDashboard({ quiet: true, afterMutation: true });
+  } catch (error) {
+    activityCasConflict = error.status === 409 && error.message.includes("当前活动已经变化");
+    if (activityCasConflict) {
+      activityCasRequiresRefresh = !uiHasMovedFromRequestActivity();
+      if (activityCasRequiresRefresh) {
+        for (const timer of adminState.entitySaveTimers.values()) clearTimeout(timer);
+        adminState.entitySaveTimers.clear();
+      }
+      delete row.dataset.saveQueued;
+      delete row.dataset.saveQueuedCapacity;
+      delete row.dataset.saveQueuedRefresh;
+      row._nameInput.value = row.dataset.originalName;
+      if (row.dataset.entityKind === "group") row._capacityInput.value = row.dataset.originalCapacity;
+    } else {
+      if (nameChanged && row._nameInput.value.trim() === submittedName) row._nameInput.value = row.dataset.originalName;
+      if (
+        capacityChanged
+        && Number(row._capacityInput.value) === submittedCapacity
+      ) row._capacityInput.value = row.dataset.originalCapacity;
+    }
+    setEntitySaveState(row, "error", "保存失败 · 已还原");
+    showAdminToast(`自动保存失败：${error.message}`, "error");
+    if (activityCasRequiresRefresh) {
+      await loadDashboard({ quiet: true, afterMutation: true });
+      if (uiHasMovedFromRequestActivity()) activityCasRequiresRefresh = false;
+    }
+  } finally {
+    delete row.dataset.saving;
+    row.removeAttribute("aria-busy");
+    const queued = !activityCasConflict
+      && (row.dataset.saveQueued === "true" || entityRowHasChanges(row, { includeCapacity: false }));
+    const queuedCapacity = row.dataset.saveQueuedCapacity === "true";
+    const queuedRefresh = refreshAfter || row.dataset.saveQueuedRefresh === "true";
+    delete row.dataset.saveQueued;
+    delete row.dataset.saveQueuedCapacity;
+    delete row.dataset.saveQueuedRefresh;
+    if (queued && row.isConnected) {
+      scheduleEntityRowSave(row, 0, { refreshAfter: queuedRefresh, includeCapacity: queuedCapacity });
+    }
+    if (!activityCasConflict || activityCasRequiresRefresh) {
+      renderLatestStructureAfterAutosave({ forceStructure: activityCasRequiresRefresh });
+    }
+  }
+}
+
+function scheduleEntityRowSave(row, delay = 360, { refreshAfter = false, includeCapacity = false } = {}) {
+  const key = entityRowSaveKey(row);
+  clearTimeout(adminState.entitySaveTimers.get(key));
+  adminState.entitySaveTimers.set(key, setTimeout(() => {
+    adminState.entitySaveTimers.delete(key);
+    persistEntityRow(row, { refreshAfter, includeCapacity });
+  }, delay));
+}
+
+function wireEntityAutosave(editor) {
+  editor.addEventListener("compositionstart", (event) => {
+    const input = event.target.closest(".entity-row input");
+    if (input === input?.closest(".entity-row")?._nameInput) input.dataset.composing = "true";
+  });
+  editor.addEventListener("compositionend", (event) => {
+    const input = event.target.closest(".entity-row input");
+    const row = input?.closest(".entity-row");
+    if (!row || input !== row._nameInput) return;
+    delete input.dataset.composing;
+    setEntitySaveState(row, "pending", "等待自动保存");
+    scheduleEntityRowSave(row);
+  });
+  editor.addEventListener("input", (event) => {
+    const input = event.target.closest(".entity-row input");
+    const row = input?.closest(".entity-row");
+    if (!row) return;
+    input.setCustomValidity("");
+    if (input === row._nameInput) {
+      setEntitySaveState(row, "pending", input.dataset.composing === "true" || event.isComposing ? "正在输入…" : "等待自动保存");
+      if (input.dataset.composing !== "true" && !event.isComposing) scheduleEntityRowSave(row);
+    } else {
+      setEntitySaveState(row, "pending", "离开输入框后保存容量");
+    }
+  });
+  editor.addEventListener("focusout", (event) => {
+    const row = event.target.closest(".entity-row");
+    if (!row) return;
+    const includeCapacity = event.target === row._capacityInput;
+    scheduleEntityRowSave(row, 0, { refreshAfter: true, includeCapacity });
+  });
+  editor.addEventListener("keydown", (event) => {
+    const input = event.target.closest(".entity-row input");
+    if (!input || event.key !== "Enter") return;
+    event.preventDefault();
+    input.blur();
+  });
+}
+
+wireEntityAutosave(adminEls.majorEditor);
+wireEntityAutosave(adminEls.groupEditor);
 
 adminEls.majorEditor.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-action]");
@@ -1806,10 +2182,7 @@ adminEls.majorEditor.addEventListener("click", async (event) => {
   const id = Number(row.dataset.id);
   const activityId = Number(adminEls.majorEditor.dataset.activityId);
   try {
-    if (button.dataset.action === "save-major") {
-      await adminApi(`/api/admin/majors/${id}`, { method: "PATCH", body: JSON.stringify({ name: row._nameInput.value }), activityId });
-      showAdminToast("专业名称已保存", "success");
-    } else if (button.dataset.action === "toggle-major-status") {
+    if (button.dataset.action === "toggle-major-status") {
       const nextActive = button.dataset.nextActive === "true";
       const actionName = nextActive ? "重新启用专业" : "停用专业";
       const actionMessage = nextActive
@@ -1824,7 +2197,7 @@ adminEls.majorEditor.addEventListener("click", async (event) => {
       await adminApi(`/api/admin/majors/${id}`, { method: "DELETE", body: JSON.stringify({}), activityId });
       showAdminToast("专业已删除，配额矩阵已同步缩减", "success");
     }
-    await loadDashboard();
+    await loadDashboard({ afterMutation: true });
   } catch (error) {
     button.disabled = false;
     showAdminToast(error.message, "error");
@@ -1838,15 +2211,7 @@ adminEls.groupEditor.addEventListener("click", async (event) => {
   const id = Number(row.dataset.id);
   const activityId = Number(adminEls.groupEditor.dataset.activityId);
   try {
-    if (button.dataset.action === "save-group") {
-      const result = await adminApi(`/api/admin/groups/${id}`, { method: "PATCH", body: JSON.stringify({ name: row._nameInput.value, total_capacity: Number(row._capacityInput.value) }), activityId });
-      showAdminToast(
-        result?.quotas_adjusted || result?.quota_adjustments?.length
-          ? "教学组容量已保存，专业配额已按已选下限自动重算"
-          : "教学组设置已保存，配额矩阵已同步复核",
-        "success",
-      );
-    } else if (button.dataset.action === "toggle-group-status") {
+    if (button.dataset.action === "toggle-group-status") {
       const nextActive = button.dataset.nextActive === "true";
       const actionName = nextActive ? "重新启用教学组" : "停用教学组";
       const actionMessage = nextActive
@@ -1861,7 +2226,7 @@ adminEls.groupEditor.addEventListener("click", async (event) => {
       await adminApi(`/api/admin/groups/${id}`, { method: "DELETE", body: JSON.stringify({}), activityId });
       showAdminToast("教学组已删除，配额矩阵已同步缩减", "success");
     }
-    await loadDashboard();
+    await loadDashboard({ afterMutation: true });
   } catch (error) {
     button.disabled = false;
     showAdminToast(error.message, "error");
@@ -1877,6 +2242,10 @@ async function persistQuotaInput(input) {
   const key = quotaInputKey(input);
   clearTimeout(adminState.quotaSaveTimers.get(key));
   adminState.quotaSaveTimers.delete(key);
+  if (input.dataset.saving === "true") {
+    input.dataset.saveQueued = "true";
+    return;
+  }
   const nextValue = Number(input.value);
   if (!Number.isInteger(nextValue) || nextValue < 0 || nextValue > 1000) {
     input.setCustomValidity("请输入 0 至 1000 的整数");
@@ -1887,18 +2256,46 @@ async function persistQuotaInput(input) {
   if (String(nextValue) === input.dataset.original) return;
   const activityId = Number(adminEls.quotaMatrix.dataset.activityId);
   const submittedValue = String(nextValue);
+  let activityCasConflict = false;
   input.dataset.saving = "true";
   input.setAttribute("aria-busy", "true");
   try {
     await adminApi(`/api/admin/quotas/${input.dataset.majorId}/${input.dataset.groupId}`, { method: "PUT", body: JSON.stringify({ capacity: nextValue }), activityId });
     input.dataset.original = submittedValue;
+    if (input.value === submittedValue) {
+      delete input.dataset.pending;
+      input.title = "";
+    } else {
+      input.dataset.pending = "true";
+      input.title = "按回车或离开输入框保存配额";
+    }
     showAdminToast("配额已保存", "success");
+    await loadDashboard({ quiet: true, afterMutation: true });
   } catch (error) {
-    if (input.value === submittedValue) input.value = input.dataset.original;
+    activityCasConflict = error.status === 409 && error.message.includes("当前活动已经变化");
+    if (activityCasConflict) {
+      for (const timer of adminState.quotaSaveTimers.values()) clearTimeout(timer);
+      adminState.quotaSaveTimers.clear();
+      delete input.dataset.saveQueued;
+      input.value = input.dataset.original;
+      delete input.dataset.pending;
+      input.title = "";
+    } else if (input.value === submittedValue) {
+      input.value = input.dataset.original;
+      delete input.dataset.pending;
+      input.title = "";
+    }
     showAdminToast(error.message, "error");
+    if (activityCasConflict) await loadDashboard({ quiet: true, afterMutation: true });
   } finally {
+    const queued = !activityCasConflict
+      && input.dataset.saveQueued === "true"
+      && input.value !== input.dataset.original;
+    delete input.dataset.saveQueued;
     delete input.dataset.saving;
     input.removeAttribute("aria-busy");
+    if (queued && input.isConnected) scheduleQuotaSave(input, 0);
+    renderLatestStructureAfterAutosave({ forceStructure: activityCasConflict });
   }
 }
 
@@ -1915,7 +2312,13 @@ adminEls.quotaMatrix.addEventListener("input", (event) => {
   const input = event.target.closest("input[data-major-id]");
   if (!input) return;
   input.setCustomValidity("");
-  scheduleQuotaSave(input);
+  input.dataset.pending = String(input.value !== input.dataset.original);
+  input.title = input.dataset.pending === "true" ? "按回车或离开输入框保存配额" : "";
+});
+
+adminEls.quotaMatrix.addEventListener("change", (event) => {
+  const input = event.target.closest("input[data-major-id]");
+  if (input) scheduleQuotaSave(input, 0);
 });
 
 adminEls.quotaMatrix.addEventListener("focusout", (event) => {
@@ -1938,7 +2341,7 @@ adminEls.settingsForm.addEventListener("submit", async (event) => {
     await adminApi("/api/admin/settings", { method: "PATCH", body: JSON.stringify(values), activityId });
     delete adminEls.settingsForm.dataset.activityId;
     showAdminToast("学生端访问地址已保存", "success");
-    await loadDashboard();
+    await loadDashboard({ afterMutation: true });
   } catch (error) { showAdminToast(error.message, "error"); }
 });
 
@@ -1971,7 +2374,7 @@ adminEls.newActivityForm.addEventListener("submit", async (event) => {
     delete form.dataset.activityId;
     form.elements.namedItem("copy_structure").checked = true;
     showAdminToast("旧活动已归档，新活动已创建", "success");
-    await loadDashboard();
+    await loadDashboard({ afterMutation: true });
   } catch (error) {
     showAdminToast(error.message, "error");
   } finally {
@@ -2027,13 +2430,19 @@ adminEls.importForm.addEventListener("submit", async (event) => {
   submit.textContent = `正在导入 ${files.length} 个文件…`;
   try {
     const result = (await adminApi(`/api/admin/students/import?${query}`, { method: "POST", body, activityId })) || {};
+    const createdMajors = (result.majors_created || []).map((major) => typeof major === "string" ? major : major?.name).filter(Boolean);
+    const reactivatedMajors = (result.majors_reactivated || []).map((major) => typeof major === "string" ? major : major?.name).filter(Boolean);
+    const majorNotes = [];
+    if (createdMajors.length) majorNotes.push(`已自动新增专业：${createdMajors.join("、")}（新专业配额默认为 0，请前往“专业与教学组”设置配额）`);
+    if (reactivatedMajors.length) majorNotes.push(`已重新启用专业：${reactivatedMajors.join("、")}`);
     adminEls.importResult.className = "import-result is-success";
-    adminEls.importResult.textContent = `已完成 ${files.length} 个文件：新增 ${result.created || 0} 人，更新 ${result.updated || 0} 人，停用 ${result.deactivated || 0} 人。个人激活码使用证件号后 6 位，未生成或下载随机凭据。`;
+    adminEls.importResult.textContent = `已完成 ${files.length} 个文件：新增 ${result.created || 0} 人，更新 ${result.updated || 0} 人，停用 ${result.deactivated || 0} 人。${majorNotes.length ? `${majorNotes.join("；")}。` : ""}个人激活码使用证件号后 6 位。`;
     adminEls.importForm.reset();
     delete adminEls.importForm.dataset.activityId;
     adminEls.importFileName.textContent = "可多选 CSV / XLS / XLSX";
-    showAdminToast("学生名单导入成功", "success");
-    await loadDashboard();
+    adminState.structureFingerprint = "";
+    showAdminToast(createdMajors.length ? `名单导入成功，已自动新增 ${createdMajors.length} 个专业，请设置配额` : "学生名单导入成功", "success");
+    await loadDashboard({ afterMutation: true });
   } catch (error) {
     adminEls.importResult.className = "import-result is-error";
     adminEls.importResult.textContent = `导入失败：${error.message}`;
@@ -2140,7 +2549,7 @@ adminEls.assignmentBody.addEventListener("click", async (event) => {
   try {
     await adminApi("/api/admin/selections", { method: "POST", body: JSON.stringify({ student_id: Number(row.dataset.studentId), group_id: groupId }), activityId });
     showAdminToast("补位已写入并记录审计日志", "success");
-    await loadDashboard();
+    await loadDashboard({ afterMutation: true });
   } catch (error) {
     button.disabled = false;
     showAdminToast(error.message, "error");
@@ -2192,7 +2601,7 @@ adminEls.recentBody.addEventListener("click", async (event) => {
   try {
     await adminApi("/api/admin/selections/revoke", { method: "POST", body: JSON.stringify({ student_id: Number(button.dataset.studentId), reason: "管理员在管理端撤销" }), activityId });
     showAdminToast("选择已撤销，名额已释放", "success");
-    await loadDashboard();
+    await loadDashboard({ afterMutation: true });
   } catch (error) {
     button.disabled = false;
     showAdminToast(error.message, "error");
@@ -2208,6 +2617,7 @@ document.addEventListener("visibilitychange", () => {
   if (adminState.currentView === "overview") {
     adminState.rosterFingerprint = "";
     adminState.liveFeedFingerprint = "";
+    adminState.waitingFeedFingerprint = "";
     loadDashboard({ quiet: true });
   } else if (adminState.currentView === "students" && mobileAdminQuery.matches) {
     loadDashboardStatusSnapshot({ quiet: true });

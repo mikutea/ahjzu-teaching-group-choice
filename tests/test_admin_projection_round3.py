@@ -135,12 +135,22 @@ def test_roster_has_reveal_only_contract_and_template_has_no_public_accounts():
 
 def test_board_logo_crop_matches_official_asset_transparency_bounds():
     _, _, css = _sources()
-    logo_block = css.split(".college-wordmark--board {", 1)[1].split(
-        ".board-presentation-brand h1", 1
-    )[0]
+    container = css.split(".college-wordmark {", 1)[1].split(".college-wordmark img", 1)[0]
+    image = css.split(".college-wordmark img {", 1)[1].split(".college-wordmark--mobile", 1)[0]
 
-    assert "width: clamp(310px,22vw,390px)" in logo_block
-    assert "height: clamp(76px,5.3vw,92px)" in logo_block
-    assert "width: 106.8%" in logo_block
-    assert "left: -7%" in logo_block
-    assert "top: -16.5%" in logo_block
+    assert "aspect-ratio: 3808 / 909" in container
+    assert "overflow: visible" in container
+    assert "width: 108.4623%" in image
+    assert "left: -8.3204%" in image
+    assert "top: -16.3881%" in image
+    assert "pointer-events: none" in image
+    assert "user-select: none" in image
+
+    # Source PNG 4151x1487, alpha bbox (328,152)-(4136,1061).
+    scale = 108.4623 / 100
+    left = -8.3204 / 100
+    top = -16.3881 / 100
+    assert abs(left + scale * 328 / 4151 - 0.0025) < 1e-5
+    assert abs(left + scale * 4136 / 4151 - 0.9975) < 1e-5
+    assert abs(top + 0.995 * 152 / 909 - 0.0025) < 1e-5
+    assert abs(top + 0.995 * 1061 / 909 - 0.9975) < 1e-5

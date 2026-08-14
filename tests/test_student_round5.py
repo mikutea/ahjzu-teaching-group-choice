@@ -288,9 +288,10 @@ def test_result_receipt_and_professional_labels_are_clear_and_secret_free() -> N
         "async function downloadStudentResultCard", 1
     )[0]
     assert "canvas.width = 1080" in card_source
-    assert "canvas.height = 1350" in card_source
+    assert "canvas.height = 1920" in card_source
     assert "抢选结果凭证" in card_source
-    assert "核验提示" in card_source
+    assert "在线核验" in card_source
+    assert "核验编号" in card_source
     assert "payload.settings.activity_title" in card_source
     assert "payload.student.name" in card_source
     assert "payload.student.student_no" in card_source
@@ -299,6 +300,9 @@ def test_result_receipt_and_professional_labels_are_clear_and_secret_free() -> N
     assert 'label === "姓名" || label === "专业"' in card_source
     assert "drawFittedCardText(context, payload.selection.group_name" in card_source
     assert "payload.selection.selected_at" in card_source
+    assert "receipt.verification_code" in card_source
+    assert "receipt.verify_url" in card_source
+    assert "verificationQr" in card_source
     assert '"/brand/college-wordmark-official.png"' in javascript
     assert "activation_code" not in card_source
     assert "个人激活码" not in card_source
