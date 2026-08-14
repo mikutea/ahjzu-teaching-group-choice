@@ -678,10 +678,24 @@ async function createResultCardBlob(payload) {
     throw new Error("尚未读取到完整抢选结果，请刷新页面后重试");
   }
   if (document.fonts?.ready) await document.fonts.ready;
-  const [logo, verificationQr] = await Promise.all([
-    loadResultCardLogo(),
-    loadResultCardVerificationQr(payload),
-  ]);
+  let verificationQr = null;
+  let verificationQrReleaseRequested = false;
+  const releaseVerificationQr = () => {
+    if (!verificationQr) return;
+    const currentQr = verificationQr;
+    verificationQr = null;
+    if (typeof currentQr.close === "function") currentQr.close();
+  };
+  try {
+  const logoPromise = Promise.resolve().then(() => loadResultCardLogo());
+  const verificationQrPromise = Promise.resolve()
+    .then(() => loadResultCardVerificationQr(payload))
+    .then((decodedQr) => {
+      verificationQr = decodedQr;
+      if (verificationQrReleaseRequested) releaseVerificationQr();
+      return decodedQr;
+    });
+  const [logo] = await Promise.all([logoPromise, verificationQrPromise]);
   const receipt = payload.receipt || {};
   const verificationCode = String(receipt.verification_code || "").trim();
   const hasOnlineVerification = Boolean(verificationCode && receipt.verify_url);
@@ -866,7 +880,6 @@ async function createResultCardBlob(payload) {
       context.drawImage(verificationQr, 747, verificationY + 47, 184, 184);
     } finally {
       context.imageSmoothingEnabled = true;
-      if (typeof verificationQr.close === "function") verificationQr.close();
     }
   }
 
@@ -885,7 +898,11 @@ async function createResultCardBlob(payload) {
   context.fillText("制作：Mikutea  ·  最终安排以学院正式发布结果为准", 540, 1861);
   context.textAlign = "start";
 
-  return resultCardBlob(canvas);
+  return await resultCardBlob(canvas);
+  } finally {
+    verificationQrReleaseRequested = true;
+    releaseVerificationQr();
+  }
 }
 
 function resultCardPreviewKey(payload) {
