@@ -588,7 +588,10 @@ def test_projection_and_roster_ui_dom_contract_and_guidance_copy():
     assert "个人激活码固定为证件号后 6 位" in admin_html
     assert "系统不会随机生成或批量重置" in admin_html
     assert "导出本场完整结果" in admin_html
-    assert "扫码仍可登录 · 名额与名单实时更新" in admin_js
+    assert "名额与名单每秒自动同步" in admin_js
+    assert 'class="board-stage__summary"' in admin_html
+    assert "qr-notice" not in admin_html
+    assert "boardNotice" not in admin_js
     template_block = admin_js.split('document.querySelector("#download-template")', 1)[1].split("for (const [anchor", 1)[0]
     assert '[["学号", "姓名", "专业名称", "证件号"]]' in template_block
     assert "示例学生" not in template_block

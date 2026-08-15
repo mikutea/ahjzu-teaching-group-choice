@@ -160,14 +160,14 @@
             </div>
             <p id="public-url-label" class="public-url">尚未设置访问地址</p>
             <div id="board-stage" class="board-stage board-stage--waiting" aria-live="polite" aria-atomic="true">
-              <div>
+              <div class="board-stage__summary">
+                <span class="status-dot" aria-hidden="true"></span>
                 <span id="board-stage-label" class="board-stage__label">候场中</span>
                 <strong id="board-countdown-value" class="board-stage__countdown">READY</strong>
               </div>
               <p id="board-stage-detail">学生扫码核验后将在手机端等待</p>
               <button id="board-start-countdown" class="button button--primary button--wide" type="button">开始 10 秒倒计时</button>
             </div>
-            <div class="qr-notice"><span class="status-dot"></span><strong id="board-status-text">候场数据实时更新</strong><small id="board-live-note">扫码入口持续开放，页面自动同步</small></div>
           </section>
 
           <section class="board-panel board-panel--unselected" aria-labelledby="unselected-title">

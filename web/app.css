@@ -473,20 +473,19 @@ img { display: block; max-width: 100%; }
 .qr-portal__instruction strong { color: var(--ink); font-size: 13px; }
 .qr-portal__instruction span { color: var(--muted); font-size: 10px; line-height: 1.55; }
 .public-url { margin: 12px 0 10px; color: var(--muted); font-family: Consolas, monospace; font-size: 10px; overflow-wrap: anywhere; }
-.qr-notice { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 4px 10px; border-top: 1px solid var(--rule); padding-top: 12px; text-align: left; }
-.qr-notice .status-dot { grid-row: 1 / 3; margin-left: 3px; color: var(--danger); box-shadow: 0 0 0 3px rgba(166,50,50,.1); }
-.qr-notice.is-open .status-dot { color: var(--success); box-shadow: 0 0 0 3px rgba(47,117,96,.1); }
-.qr-notice strong { font-size: 11px; }
-.qr-notice small { color: var(--muted); font-size: 9px; }
 .board-stage { display: grid; gap: 8px; margin-top: 10px; border: 1px solid var(--rule); border-radius: 13px; padding: 12px; text-align: left; background: var(--college-soft); }
-.board-stage > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.board-stage__summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.board-stage__summary .status-dot { flex: 0 0 auto; color: var(--danger); box-shadow: 0 0 0 3px rgba(166,50,50,.1); }
+.board-stage__summary .board-stage__label { margin-right: auto; }
 .board-stage__label { color: var(--muted); font-size: 10px; font-weight: 800; }
 .board-stage__countdown { color: var(--college); font-size: 25px; line-height: 1; letter-spacing: .04em; }
 .board-stage p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
 .board-stage--countdown { border: 2px solid #d9a75f; background: linear-gradient(135deg, #fffaf0, #fff4df); box-shadow: 0 10px 28px rgba(127,41,47,.14), inset 0 0 0 5px rgba(255,255,255,.7); }
 .board-stage--countdown .board-stage__label { color: var(--college); font-size: 12px; }
+.board-stage--countdown .status-dot { color: var(--warning); box-shadow: 0 0 0 3px rgba(212,148,60,.14); }
 .board-stage--countdown .board-stage__countdown { color: var(--college); font-size: 54px; text-shadow: 0 4px 18px rgba(127,41,47,.2); }
 .board-stage--open { border-color: #bdd8ce; background: var(--success-soft); }
+.board-stage--open .status-dot { color: var(--success); box-shadow: 0 0 0 3px rgba(47,117,96,.12); }
 .board-stage--open .board-stage__countdown { color: var(--success); }
 
 .panel-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
@@ -769,7 +768,7 @@ img { display: block; max-width: 100%; }
 }
 .live-board:fullscreen .college-wordmark--board,
 .live-board.is-presentation .college-wordmark--board {
-  width: clamp(210px,14vw,265px);
+  width: clamp(180px,11vw,225px);
 }
 .board-presentation-brand h1 { min-width: 0; margin: 0; border-left: 1px solid rgba(255,255,255,.4); padding-left: 18px; font-size: clamp(23px,1.8vw,33px); line-height: 1.12; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .board-header-phase { min-width: 124px; border: 2px solid rgba(255,255,255,.84); border-radius: 12px; padding: 10px 16px; text-align: center; font-size: clamp(21px,1.7vw,31px); }
@@ -915,12 +914,6 @@ img { display: block; max-width: 100%; }
 .live-board.is-presentation .board-stage p { font-size: 14px; }
 .live-board:fullscreen .board-stage .button,
 .live-board.is-presentation .board-stage .button { min-height: 58px; font-size: 21px; }
-.live-board:fullscreen .qr-notice,
-.live-board.is-presentation .qr-notice { margin-top: 10px; }
-.live-board:fullscreen .qr-notice strong,
-.live-board.is-presentation .qr-notice strong { font-size: 15px; }
-.live-board:fullscreen .qr-notice small,
-.live-board.is-presentation .qr-notice small { font-size: 12px; }
 .live-board:fullscreen .waiting-overview,
 .live-board.is-presentation .waiting-overview { align-content: stretch; gap: clamp(13px,2vh,24px); }
 .live-board:fullscreen .waiting-overview__metrics,
@@ -974,7 +967,7 @@ img { display: block; max-width: 100%; }
   .live-board.is-presentation .board-presentation-brand { min-width: 0; gap: 12px; }
   .live-board:fullscreen .college-wordmark--board,
   .live-board.is-presentation .college-wordmark--board {
-    width: clamp(205px,28vw,310px);
+    width: clamp(165px,19vw,205px);
   }
   .live-board:fullscreen .board-presentation-brand h1,
   .live-board.is-presentation .board-presentation-brand h1 { padding-left: 12px; font-size: clamp(17px,2.1vw,27px); }
@@ -1126,7 +1119,6 @@ img { display: block; max-width: 100%; }
   .live-board:not(:fullscreen):not(.is-presentation) .board-stage { gap: 4px; margin-top: 3px; padding: 8px 10px; }
   .live-board:not(:fullscreen):not(.is-presentation) .board-stage p { font-size: 9px; }
   .live-board:not(:fullscreen):not(.is-presentation) .board-stage .button { min-height: 38px; padding: 8px 12px; font-size: 11px; }
-  .live-board:not(:fullscreen):not(.is-presentation) .qr-notice { gap: 2px 8px; margin-top: 4px; padding-top: 6px; }
   .live-board:not(:fullscreen):not(.is-presentation) .compact-search { margin-bottom: 7px; }
   .live-board:not(:fullscreen):not(.is-presentation) .unselected-list { min-height: 0; margin-bottom: 8px; }
 }
@@ -1196,7 +1188,6 @@ img { display: block; max-width: 100%; }
   .admin-authenticated #view-overview .board-stage { margin-top: 4px; gap: 5px; padding: 8px 10px; }
   .admin-authenticated #view-overview .board-stage p { font-size: 9px; }
   .admin-authenticated #view-overview .board-stage .button { min-height: 38px; font-size: 11px; }
-  .admin-authenticated #view-overview .qr-notice { margin-top: 5px; padding-top: 7px; }
 
   .admin-authenticated #view-students:not(.is-hidden) { display: flex; height: 100%; min-height: 0; flex-direction: column; }
   .admin-authenticated #view-students > .page-heading,
@@ -1230,7 +1221,7 @@ img { display: block; max-width: 100%; }
   .live-board.is-presentation .board-panel--unselected { display: none; }
   .live-board.is-presentation .board-presentation-header { grid-template-columns: minmax(118px,1fr) auto auto auto; gap: 7px; margin: 0 -7px; padding: 0 8px; }
   .live-board.is-presentation .board-presentation-brand { gap: 0; }
-  .live-board.is-presentation .college-wordmark--board { width: 134px; }
+  .live-board.is-presentation .college-wordmark--board { width: 118px; }
   .live-board.is-presentation .board-presentation-brand h1,
   .live-board.is-presentation .board-presentation-sync { display: none; }
   .live-board.is-presentation .board-header-phase { min-width: 66px; border-width: 1px; border-radius: 8px; padding: 7px; font-size: 12px; }
@@ -1245,9 +1236,6 @@ img { display: block; max-width: 100%; }
   .live-board.is-presentation .board-stage__countdown { font-size: 24px; }
   .live-board.is-presentation .board-stage p { font-size: 9px; }
   .live-board.is-presentation .board-stage .button { min-height: 38px; font-size: 11px; }
-  .live-board.is-presentation .qr-notice { margin-top: 3px; padding-top: 5px; }
-  .live-board.is-presentation .qr-notice strong { font-size: 10px; }
-  .live-board.is-presentation .qr-notice small { font-size: 8px; }
   .live-board.is-presentation .board-presentation-footer { margin: 0 -7px; font-size: 9px; }
   .live-board.is-presentation.phase-countdown .board-countdown-overlay { min-height: 100dvh; }
   .live-board.is-presentation .college-wordmark--countdown { width: min(78vw, 300px); }
@@ -1274,7 +1262,6 @@ img { display: block; max-width: 100%; }
   .admin-authenticated #view-overview .live-board.is-presentation .qr-portal { width: min(100%, 370px); margin: 2px auto; padding: 8px 10px 7px; }
   .admin-authenticated #view-overview .live-board.is-presentation .qr-frame { width: min(44dvh, 86vw, 342px); padding: 6px; }
   .admin-authenticated #view-overview .live-board.is-presentation .board-stage { margin-top: 3px; gap: 4px; padding: 7px 9px; }
-  .admin-authenticated #view-overview .live-board.is-presentation .qr-notice { margin-top: 3px; padding-top: 5px; }
 }
 
 @media (max-width: 700px) and (max-height: 720px) {
@@ -1306,7 +1293,7 @@ img { display: block; max-width: 100%; }
   .site-footer--student { font-size: 8px; }
   .admin-authenticated #view-overview .live-board.is-presentation { grid-template-rows: 58px minmax(0,1fr) 28px; gap: 4px; }
   .admin-authenticated #view-overview .live-board.is-presentation .board-presentation-header { gap: 5px; }
-  .admin-authenticated #view-overview .live-board.is-presentation .college-wordmark--board { width: 128px; }
+  .admin-authenticated #view-overview .live-board.is-presentation .college-wordmark--board { width: 112px; }
   .admin-authenticated #view-overview .live-board.is-presentation .board-panel--qr { padding: 6px 9px; }
   .admin-authenticated #view-overview .live-board.is-presentation .qr-heading .panel-kicker { display: none; }
   .admin-authenticated #view-overview .live-board.is-presentation .qr-heading h2 { font-size: 15px; }
@@ -1316,8 +1303,6 @@ img { display: block; max-width: 100%; }
   .admin-authenticated #view-overview .live-board.is-presentation .board-stage { padding: 5px 7px; }
   .admin-authenticated #view-overview .live-board.is-presentation .board-stage p { display: none; }
   .admin-authenticated #view-overview .live-board.is-presentation .board-stage .button { min-height: 34px; padding: 5px 8px; }
-  .admin-authenticated #view-overview .live-board.is-presentation .qr-notice { grid-template-columns: auto 1fr; padding-top: 3px; }
-  .admin-authenticated #view-overview .live-board.is-presentation .qr-notice small { display: none; }
 }
 
 /* Keep identity verification reachable when the mobile keyboard reduces the
@@ -1414,7 +1399,7 @@ img { display: block; max-width: 100%; }
   .live-board.is-presentation .board-presentation-header { gap: 18px; }
   .live-board:fullscreen .college-wordmark--board,
   .live-board.is-presentation .college-wordmark--board {
-    width: clamp(205px,16vw,235px);
+    width: clamp(175px,13vw,205px);
     transform: none;
   }
   .live-board:fullscreen .board-panel,
@@ -1437,10 +1422,6 @@ img { display: block; max-width: 100%; }
   .live-board.is-presentation .board-stage .button { min-height: 44px; font-size: 17px; }
   .live-board:fullscreen .board-stage p,
   .live-board.is-presentation .board-stage p { display: none; }
-  .live-board:fullscreen .qr-notice,
-  .live-board.is-presentation .qr-notice { margin-top: 6px; padding-top: 8px; }
-  .live-board:fullscreen .qr-notice small,
-  .live-board.is-presentation .qr-notice small { display: none; }
   .live-board:fullscreen .group-progress__row,
   .live-board.is-presentation .group-progress__row,
   .live-board:fullscreen .student-list-item,
@@ -1458,6 +1439,10 @@ img { display: block; max-width: 100%; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
   .waiting-visual__ring, .board-presentation-sync .status-dot { animation: none !important; }
+  .live-board:fullscreen .group-progress,
+  .live-board.is-presentation .group-progress,
+  .live-board:fullscreen .waiting-student-feed,
+  .live-board.is-presentation .waiting-student-feed,
   .live-board:fullscreen .live-selection-feed,
   .live-board.is-presentation .live-selection-feed,
   .live-board:fullscreen .unselected-list,
