@@ -1875,6 +1875,7 @@ function switchAdminView(viewName) {
     stopWaitingFeedAutoScroll();
     loadDashboard({ quiet: true });
   } else {
+    renderGroupProgress(adminState.dashboard?.groups || [], { force: true });
     renderUnselectedList({ force: true });
     renderLiveSelectionFeed(adminState.dashboard?.recent_selections || [], { force: true });
     renderWaitingStudentFeed(adminState.dashboard?.entered_students || [], { force: true });
@@ -2273,9 +2274,11 @@ async function persistEntityRow(row, { refreshAfter = false, includeCapacity = f
   } finally {
     delete row.dataset.saving;
     row.removeAttribute("aria-busy");
+    const capacityStillDirty = row.dataset.entityKind === "group"
+      && row._capacityInput.value !== row.dataset.originalCapacity;
+    const queuedCapacity = row.dataset.saveQueuedCapacity === "true" || capacityStillDirty;
     const queued = !activityCasConflict
-      && (row.dataset.saveQueued === "true" || entityRowHasChanges(row, { includeCapacity: false }));
-    const queuedCapacity = row.dataset.saveQueuedCapacity === "true";
+      && (row.dataset.saveQueued === "true" || entityRowHasChanges(row, { includeCapacity: queuedCapacity }));
     const queuedRefresh = refreshAfter || row.dataset.saveQueuedRefresh === "true";
     delete row.dataset.saveQueued;
     delete row.dataset.saveQueuedCapacity;
@@ -2292,10 +2295,24 @@ async function persistEntityRow(row, { refreshAfter = false, includeCapacity = f
 
 function scheduleEntityRowSave(row, delay = 360, { refreshAfter = false, includeCapacity = false } = {}) {
   const key = entityRowSaveKey(row);
+  const capacityDirty = row.dataset.entityKind === "group"
+    && row._capacityInput.value !== row.dataset.originalCapacity;
+  const scheduledCapacity = includeCapacity
+    || capacityDirty
+    || row.dataset.saveScheduledCapacity === "true";
+  const scheduledRefresh = refreshAfter
+    || scheduledCapacity
+    || row.dataset.saveScheduledRefresh === "true";
+  if (scheduledCapacity) row.dataset.saveScheduledCapacity = "true";
+  if (scheduledRefresh) row.dataset.saveScheduledRefresh = "true";
   clearTimeout(adminState.entitySaveTimers.get(key));
   adminState.entitySaveTimers.set(key, setTimeout(() => {
     adminState.entitySaveTimers.delete(key);
-    persistEntityRow(row, { refreshAfter, includeCapacity });
+    const pendingCapacity = row.dataset.saveScheduledCapacity === "true";
+    const pendingRefresh = row.dataset.saveScheduledRefresh === "true";
+    delete row.dataset.saveScheduledCapacity;
+    delete row.dataset.saveScheduledRefresh;
+    persistEntityRow(row, { refreshAfter: pendingRefresh, includeCapacity: pendingCapacity });
   }, delay));
 }
 
@@ -2644,12 +2661,17 @@ adminEls.quotaMatrix.addEventListener("keydown", (event) => {
   next?.select();
 });
 
+function quotaClipboardRows(clipboard) {
+  const withoutTerminalLineEndings = clipboard.replace(/(?:\r\n|\r|\n)+$/, "");
+  return withoutTerminalLineEndings.split(/\r\n|\r|\n/).map((line) => line.split("\t"));
+}
+
 adminEls.quotaMatrix.addEventListener("paste", async (event) => {
   const start = event.target.closest("input[data-major-id]");
   const clipboard = event.clipboardData?.getData("text/plain") || "";
   if (!start || (!clipboard.includes("\t") && !/[\r\n]/.test(clipboard))) return;
   event.preventDefault();
-  const rows = clipboard.trim().split(/\r?\n/).map((line) => line.split("\t"));
+  const rows = quotaClipboardRows(clipboard);
   const capacityByInput = new Map();
   for (const [rowOffset, values] of rows.entries()) {
     for (const [columnOffset, rawValue] of values.entries()) {
@@ -2657,9 +2679,10 @@ adminEls.quotaMatrix.addEventListener("paste", async (event) => {
         Number(start.dataset.rowIndex) + rowOffset,
         Number(start.dataset.columnIndex) + columnOffset,
       );
-      const capacity = Number(rawValue.trim());
-      if (!input || input.disabled || !Number.isInteger(capacity) || capacity < 0 || capacity > 1000) {
-        showAdminToast("粘贴区域超出当前矩阵，或包含 0 至 1000 之外的非整数", "error");
+      const normalizedValue = rawValue.trim();
+      const capacity = Number(normalizedValue);
+      if (!input || input.disabled || !normalizedValue || !Number.isInteger(capacity) || capacity < 0 || capacity > 1000) {
+        showAdminToast("粘贴区域超出当前矩阵，或包含空单元格、0 至 1000 之外的非整数", "error");
         return;
       }
       capacityByInput.set(input, capacity);
@@ -2978,6 +3001,7 @@ document.addEventListener("visibilitychange", () => {
     adminState.rosterFingerprint = "";
     adminState.liveFeedFingerprint = "";
     adminState.waitingFeedFingerprint = "";
+    adminState.groupProgressFingerprint = "";
     loadDashboard({ quiet: true });
   } else if (adminState.currentView === "students" && mobileAdminQuery.matches) {
     loadDashboardStatusSnapshot({ quiet: true });
