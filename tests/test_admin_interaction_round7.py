@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -27,11 +28,38 @@ def test_bootstrap_never_persists_the_plaintext_admin_password() -> None:
     assert "sed -i 's/^ADMIN_INITIAL_PASSWORD=.*/ADMIN_INITIAL_PASSWORD=/' .env" in script
     assert "trap bootstrap_exit EXIT" in script
     assert 'docker compose rm -sf app' in script
-    assert 'elif [[ ! -s data/teaching-choice.db ]]' in script
+    assert "database_bootstrap_state()" in script
+    assert "sqlite3 -readonly -batch -noheader" in script
+    assert "PRAGMA user_version" in script
+    assert "SELECT COUNT(*) FROM admin_users" in script
+    assert 'CURRENT_SCHEMA_VERSION="$(awk' in script
+    assert '"${schema_version}" == "${CURRENT_SCHEMA_VERSION}"' in script
+    assert 'elif [[ "${DATABASE_BOOTSTRAP_STATE}" == "empty" ]]' in script
+    assert 'elif [[ ! -s data/teaching-choice.db ]]' not in script
     assert 'docker compose up -d --force-recreate --wait --wait-timeout 180 app' in script
     handoff_index = script.index("首次登录密码")
     first_compose_index = script.index("docker compose up -d --build")
     assert handoff_index < first_compose_index
+
+
+def test_bootstrap_treats_a_nonempty_wal_shell_as_uninitialized(tmp_path: Path) -> None:
+    database_path = tmp_path / "wal-shell.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+
+    assert database_path.stat().st_size > 0
+    with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True) as connection:
+        schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        application_tables = connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchone()[0]
+    assert schema_version == 0
+    assert application_tables == 0
+
+    script = (ROOT / "deploy" / "bootstrap.sh").read_text(encoding="utf-8")
+    assert '"${schema_version}" == "0" && "${application_tables}" == "0"' in script
+    assert "printf 'empty\\n'" in script
 
 
 def test_structure_editor_has_one_save_summary_and_large_matrix_tools() -> None:

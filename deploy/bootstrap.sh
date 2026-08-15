@@ -19,7 +19,7 @@ if [[ ! -f "${APP_DIR}/docker-compose.yml" ]]; then
 fi
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 curl openssl
+DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 curl openssl sqlite3
 systemctl enable --now docker
 
 cd "${APP_DIR}"
@@ -27,12 +27,64 @@ mkdir -p data
 chown -R 10001:10001 data
 chmod 750 data
 
+CURRENT_SCHEMA_VERSION="$(awk '$1 == "SCHEMA_VERSION" && $2 == "=" && $3 ~ /^[0-9]+$/ { print $3; exit }' server/database.py)"
+if [[ ! "${CURRENT_SCHEMA_VERSION}" =~ ^[0-9]+$ ]]; then
+  echo "无法从 server/database.py 读取当前数据库结构版本" >&2
+  exit 1
+fi
+
 BOOTSTRAP_PASSWORD_ACTIVE=false
 
 scrub_initial_password() {
   if [[ -f .env ]]; then
     sed -i 's/^ADMIN_INITIAL_PASSWORD=.*/ADMIN_INITIAL_PASSWORD=/' .env || true
   fi
+}
+
+database_bootstrap_state() {
+  local database_path="data/teaching-choice.db"
+  local schema_version=""
+  local application_tables=""
+  local admin_table=""
+  local admin_rows=""
+
+  if [[ ! -s "${database_path}" ]]; then
+    printf 'empty\n'
+    return
+  fi
+  schema_version="$(sqlite3 -readonly -batch -noheader "${database_path}" 'PRAGMA user_version;' 2>/dev/null)" || {
+    printf 'invalid\n'
+    return
+  }
+  application_tables="$(sqlite3 -readonly -batch -noheader "${database_path}" \
+    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%';" 2>/dev/null)" || {
+    printf 'invalid\n'
+    return
+  }
+  admin_table="$(sqlite3 -readonly -batch -noheader "${database_path}" \
+    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'admin_users';" 2>/dev/null)" || {
+    printf 'invalid\n'
+    return
+  }
+
+  # Opening SQLite and enabling WAL can leave a nonempty file before the
+  # atomic schema transaction commits. That shell is safe to initialize again.
+  if [[ "${schema_version}" == "0" && "${application_tables}" == "0" ]]; then
+    printf 'empty\n'
+    return
+  fi
+  if [[ "${schema_version}" == "${CURRENT_SCHEMA_VERSION}" && "${admin_table}" == "1" ]]; then
+    admin_rows="$(sqlite3 -readonly -batch -noheader "${database_path}" \
+      'SELECT COUNT(*) FROM admin_users;' 2>/dev/null)" || {
+      printf 'invalid\n'
+      return
+    }
+    if [[ "${admin_rows}" =~ ^[0-9]+$ && "${admin_rows}" -gt 0 ]]; then
+      printf 'initialized\n'
+      return
+    fi
+  fi
+  printf 'invalid\n'
 }
 
 bootstrap_exit() {
@@ -65,8 +117,14 @@ fi
 # exact legacy artifact and keep the new plaintext credential terminal-only.
 rm -f -- /root/teaching-choice-initial-password.txt
 
+DATABASE_BOOTSTRAP_STATE="$(database_bootstrap_state)"
+if [[ "${DATABASE_BOOTSTRAP_STATE}" == "invalid" ]]; then
+  echo "数据库不是可安全初始化的空壳，也不是含管理员账号的当前结构；请从受控备份恢复" >&2
+  exit 1
+fi
+
 if [[ ! -f .env ]]; then
-  if [[ -s data/teaching-choice.db ]]; then
+  if [[ "${DATABASE_BOOTSTRAP_STATE}" == "initialized" ]]; then
     echo "检测到现有数据库但缺少 .env，无法安全恢复应用密钥；请从受控备份恢复 .env" >&2
     exit 1
   fi
@@ -90,7 +148,7 @@ if [[ ! -f .env ]]; then
     echo "SEED_DEMO_STRUCTURE=false"
     echo "APP_VERSION=$(git rev-parse --short HEAD 2>/dev/null || echo local)"
   } > .env
-elif [[ ! -s data/teaching-choice.db ]]; then
+elif [[ "${DATABASE_BOOTSTRAP_STATE}" == "empty" ]]; then
   # A previous first-run attempt may have failed before creating the database.
   # Its exit trap scrubbed .env, so generate and hand off a fresh credential.
   ADMIN_PASSWORD_VALUE="$(openssl rand -base64 18 | tr -d '\n')"
