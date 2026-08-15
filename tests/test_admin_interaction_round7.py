@@ -81,8 +81,8 @@ def test_structure_editor_has_one_save_summary_and_large_matrix_tools() -> None:
     assert "renderStructureSaveSummary" in javascript
     assert 'adminEls.quotaMatrix.addEventListener("paste"' in javascript
     assert 'adminApi("/api/admin/quotas/batch"' in javascript
-    assert '/assets/app.css?v=20260816-round7' in html
-    assert '/assets/admin.js?v=20260816-round7' in html
+    assert '/assets/app.css?v=20260816-round8' in html
+    assert '/assets/admin.js?v=20260816-round8' in html
 
 
 def test_board_groups_and_waiting_students_use_continuous_loops() -> None:
@@ -106,11 +106,19 @@ def test_board_groups_and_waiting_students_use_continuous_loops() -> None:
 
 def test_board_qr_uses_one_compact_stage_and_reduced_motion_stays_reachable() -> None:
     html, javascript, css = _web_sources()
-    stage = html.split('id="board-stage"', 1)[1].split("</div>", 2)[0]
+    portal = html.split('class="qr-portal"', 1)[1].split("</section>", 1)[0]
+    stage = portal.split('id="board-stage"', 1)[1].split("</div>", 2)[0]
     reduced_motion = css.split("@media (prefers-reduced-motion: reduce)", 1)[1]
 
     assert 'class="board-stage__summary"' in stage
     assert 'class="status-dot"' in stage
+    assert portal.count('class="status-dot"') == 1
+    assert portal.index('id="board-stage"') < portal.index('class="qr-frame"')
+    assert portal.index('class="qr-frame"') < portal.index('id="board-stage-detail"')
+    assert portal.index('id="board-stage-detail"') < portal.index('id="board-start-countdown"')
+    assert 'class="qr-portal__action button button--primary button--wide"' in portal
+    assert 'adminEls.boardStage.className = `qr-portal__status board-stage--${phase}`' in javascript
+    assert javascript.count('adminEls.boardStart.className = "qr-portal__action button') == 3
     assert "qr-notice" not in html
     assert "qr-notice" not in css
     assert "boardNotice" not in javascript
