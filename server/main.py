@@ -2075,9 +2075,21 @@ def create_app(config: Config | None = None) -> FastAPI:
                     (now_text, identity.token_hash, write_cutoff),
                 )
                 connection.commit()
+            has_selection = bool(
+                connection.execute(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1 FROM selections
+                        WHERE student_id = ? AND revoked_at IS NULL
+                    )
+                    """,
+                    (identity.subject_id,),
+                ).fetchone()[0]
+            )
             settings = setting_dict(connection)
             return {
                 "ok": True,
+                "has_selection": has_selection,
                 "server_now": settings["server_now"],
                 "selection_opens_at": settings["selection_opens_at"],
                 "phase": settings["phase"],

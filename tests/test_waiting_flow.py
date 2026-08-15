@@ -324,10 +324,25 @@ def test_waiting_room_presence_heartbeat_and_absent_roster(
         )
         assert heartbeat.status_code == 200, heartbeat.text
         assert "server_now" in heartbeat.json()
+        assert heartbeat.json()["has_selection"] is False
         refreshed = client.get("/api/admin/dashboard").json()
         assert refreshed["presence"]["total"] == 3
         assert refreshed["presence"]["online_count"] == 1
         assert refreshed["presence"]["absent_count"] == 2
+
+        group_id = refreshed["groups"][0]["id"]
+        assigned = client.post(
+            "/api/admin/selections",
+            headers=admin_headers,
+            json={"student_id": login["student"]["id"], "group_id": group_id},
+        )
+        assert assigned.status_code == 200, assigned.text
+        selected_heartbeat = student.post(
+            "/api/student/heartbeat",
+            headers=student_headers(login, activity_id),
+        )
+        assert selected_heartbeat.status_code == 200, selected_heartbeat.text
+        assert selected_heartbeat.json()["has_selection"] is True
 
         no_csrf = student.post(
             "/api/student/heartbeat",
