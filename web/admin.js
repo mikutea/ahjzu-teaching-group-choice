@@ -83,9 +83,6 @@ const adminEls = {
   qr: document.querySelector("#student-qr"),
   qrPlaceholder: document.querySelector("#qr-placeholder"),
   publicUrl: document.querySelector("#public-url-label"),
-  boardNotice: document.querySelector(".qr-notice"),
-  boardStatus: document.querySelector("#board-status-text"),
-  boardLiveNote: document.querySelector("#board-live-note"),
   boardStage: document.querySelector("#board-stage"),
   boardStageLabel: document.querySelector("#board-stage-label"),
   boardStageDetail: document.querySelector("#board-stage-detail"),
@@ -736,14 +733,11 @@ function renderBoardStage(data, phase, presence) {
   const total = Number(data.totals?.students || 0);
   const readiness = normalizeReadiness(data.readiness);
   adminEls.boardStage.className = `board-stage board-stage--${phase}`;
-  adminEls.boardNotice.classList.toggle("is-open", phase === "open");
   adminEls.boardStart.disabled = adminState.phaseActionPending || phase === "countdown" || ((phase === "waiting" || phase === "closed") && !readiness.ready);
 
   if (phase === "countdown") {
     adminEls.boardStageLabel.textContent = "全体同步倒计时";
     adminEls.boardStageDetail.textContent = `已进入候场 ${presence.online} / ${total} 人，倒计时结束后同时进入抢选`;
-    adminEls.boardStatus.textContent = "倒计时正在同步到全部学生端";
-    adminEls.boardLiveNote.textContent = "请保持大屏与学生手机页面打开";
     adminEls.boardStart.className = "button button--primary button--wide";
     startCountdownTicker(data);
     return;
@@ -757,8 +751,6 @@ function renderBoardStage(data, phase, presence) {
     adminEls.boardStageLabel.textContent = "抢选进行中";
     adminEls.boardCountdown.textContent = "LIVE";
     adminEls.boardStageDetail.textContent = `已完成 ${data.totals.selected} / ${total} 人，名额与名单每秒自动同步`;
-    adminEls.boardStatus.textContent = "抢选正在进行，扫码仍可登录";
-    adminEls.boardLiveNote.textContent = "扫码仍可登录 · 名额与名单实时更新";
     adminEls.boardStart.textContent = "关闭抢选";
     adminEls.boardStart.className = "button button--secondary button--wide";
     return;
@@ -768,8 +760,6 @@ function renderBoardStage(data, phase, presence) {
   adminEls.boardStageLabel.textContent = isClosed ? "抢选已关闭" : "扫码候场中";
   adminEls.boardCountdown.textContent = "READY";
   adminEls.boardStageDetail.textContent = `已进入候场 ${presence.online} / ${total} 人，尚未进入 ${presence.absent} 人`;
-  adminEls.boardStatus.textContent = isClosed ? "当前不可提交，可再次发起统一倒计时" : "候场数据实时更新";
-  adminEls.boardLiveNote.textContent = "扫码入口持续开放，页面自动同步";
   adminEls.boardStart.textContent = readiness.ready ? "开始 10 秒倒计时" : "就绪检查未通过";
   adminEls.boardStart.className = "button button--primary button--wide";
 }
@@ -2536,7 +2526,10 @@ async function applyQuotaBatch(capacityByInput, label) {
     value: input.value,
     original: input.dataset.original,
     key: quotaInputKey(input),
+    submitted: String(capacityByInput.get(input)),
   }));
+  const inputsToReschedule = new Set();
+  let activityCasConflict = false;
   for (const snapshot of snapshots) {
     clearTimeout(adminState.quotaSaveTimers.get(snapshot.key));
     adminState.quotaSaveTimers.delete(snapshot.key);
@@ -2562,31 +2555,58 @@ async function applyQuotaBatch(capacityByInput, label) {
       activityId,
     });
     for (const [input, capacity] of entries) {
-      input.dataset.original = String(capacity);
-      input.dataset.saveState = "saved";
-      delete input.dataset.pending;
-      input.title = "";
+      const submitted = String(capacity);
+      input.dataset.original = submitted;
+      if (input.value === submitted) {
+        input.dataset.saveState = "saved";
+        delete input.dataset.pending;
+        input.title = "";
+      } else {
+        input.dataset.pending = "true";
+        input.dataset.saveState = "pending";
+        input.title = "等待自动保存最新配额";
+        inputsToReschedule.add(input);
+      }
     }
     showAdminToast(`${label}已一次性保存 ${entries.length} 个配额`, "success");
     await loadDashboard({ quiet: true, afterMutation: true });
   } catch (error) {
+    activityCasConflict = error.status === 409 && error.message.includes("当前活动已经变化");
     for (const snapshot of snapshots) {
-      snapshot.input.value = snapshot.original;
-      snapshot.input.dataset.saveState = "error";
-      delete snapshot.input.dataset.pending;
-      snapshot.input.title = "批量保存失败，已还原";
+      if (activityCasConflict) {
+        snapshot.input.value = snapshot.original;
+        snapshot.input.dataset.saveState = "error";
+        delete snapshot.input.dataset.pending;
+        snapshot.input.title = "活动已切换，未重放旧活动编辑";
+        continue;
+      }
+      const latestValue = snapshot.input.value === snapshot.submitted
+        ? snapshot.value
+        : snapshot.input.value;
+      snapshot.input.value = latestValue;
+      if (latestValue !== snapshot.original) {
+        snapshot.input.dataset.pending = "true";
+        snapshot.input.dataset.saveState = "pending";
+        snapshot.input.title = "批量保存失败，等待自动保存原编辑";
+        inputsToReschedule.add(snapshot.input);
+      } else {
+        snapshot.input.dataset.saveState = "error";
+        delete snapshot.input.dataset.pending;
+        snapshot.input.title = "批量保存失败，未改变原配额";
+      }
     }
     showAdminToast(`批量保存失败：${error.message}`, "error");
-    if (error.status === 409 && error.message.includes("当前活动已经变化")) {
-      await loadDashboard({ quiet: true, afterMutation: true });
-    }
+    if (activityCasConflict) await loadDashboard({ quiet: true, afterMutation: true });
   } finally {
     for (const [input] of entries) {
       delete input.dataset.saving;
       input.removeAttribute("aria-busy");
     }
+    for (const input of inputsToReschedule) {
+      if (input.isConnected) scheduleQuotaSave(input, 0);
+    }
     notifyQuotaStructureSaveSummary();
-    renderLatestStructureAfterAutosave();
+    renderLatestStructureAfterAutosave({ forceStructure: activityCasConflict });
   }
 }
 

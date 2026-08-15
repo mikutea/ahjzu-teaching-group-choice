@@ -27,6 +27,30 @@ mkdir -p data
 chown -R 10001:10001 data
 chmod 750 data
 
+BOOTSTRAP_PASSWORD_ACTIVE=false
+
+scrub_initial_password() {
+  if [[ -f .env ]]; then
+    sed -i 's/^ADMIN_INITIAL_PASSWORD=.*/ADMIN_INITIAL_PASSWORD=/' .env || true
+  fi
+}
+
+bootstrap_exit() {
+  local status=$?
+  trap - EXIT
+  scrub_initial_password
+  if [[ "${BOOTSTRAP_PASSWORD_ACTIVE}" == true ]]; then
+    # A failed compose/health step may leave the bootstrap password in the
+    # container configuration even after .env is scrubbed. Remove only that
+    # failed app container; the next run recreates it from the clean env.
+    docker compose rm -sf app >/dev/null 2>&1 || true
+  fi
+  ADMIN_PASSWORD_VALUE=""
+  exit "${status}"
+}
+
+trap bootstrap_exit EXIT
+
 if [[ -z "${PUBLIC_URL}" ]]; then
   PRIMARY_IP="$(hostname -I | awk '{print $1}')"
   PUBLIC_URL="http://${PRIMARY_IP}"
@@ -42,8 +66,13 @@ fi
 rm -f -- /root/teaching-choice-initial-password.txt
 
 if [[ ! -f .env ]]; then
+  if [[ -s data/teaching-choice.db ]]; then
+    echo "检测到现有数据库但缺少 .env，无法安全恢复应用密钥；请从受控备份恢复 .env" >&2
+    exit 1
+  fi
   APP_SECRET_VALUE="$(openssl rand -hex 32)"
   ADMIN_PASSWORD_VALUE="$(openssl rand -base64 18 | tr -d '\n')"
+  BOOTSTRAP_PASSWORD_ACTIVE=true
   install -m 600 /dev/null .env
   {
     echo "ENVIRONMENT=production"
@@ -61,6 +90,27 @@ if [[ ! -f .env ]]; then
     echo "SEED_DEMO_STRUCTURE=false"
     echo "APP_VERSION=$(git rev-parse --short HEAD 2>/dev/null || echo local)"
   } > .env
+elif [[ ! -s data/teaching-choice.db ]]; then
+  # A previous first-run attempt may have failed before creating the database.
+  # Its exit trap scrubbed .env, so generate and hand off a fresh credential.
+  ADMIN_PASSWORD_VALUE="$(openssl rand -base64 18 | tr -d '\n')"
+  BOOTSTRAP_PASSWORD_ACTIVE=true
+  if grep -q '^ADMIN_INITIAL_PASSWORD=' .env; then
+    sed -i "s|^ADMIN_INITIAL_PASSWORD=.*|ADMIN_INITIAL_PASSWORD=${ADMIN_PASSWORD_VALUE}|" .env
+  else
+    printf 'ADMIN_INITIAL_PASSWORD=%s\n' "${ADMIN_PASSWORD_VALUE}" >> .env
+  fi
+else
+  # Existing databases authenticate against the stored password hash and never
+  # need the bootstrap plaintext again.
+  scrub_initial_password
+fi
+chmod 600 .env
+
+if [[ -n "${ADMIN_PASSWORD_VALUE}" ]]; then
+  printf '首次登录账号：admin\n首次登录密码：%s\n管理端：%s/admin\n' "${ADMIN_PASSWORD_VALUE}" "${PUBLIC_URL}"
+  echo "请立即保存到受控密码管理器；服务器不会保留该明文密码。"
+  echo "凭据已在首次构建前交接；若本次部署失败，请重新运行脚本并使用届时显示的新密码。"
 fi
 
 docker compose up -d --build
@@ -77,14 +127,12 @@ for attempt in $(seq 1 36); do
   sleep 5
 done
 
-if [[ -n "${ADMIN_PASSWORD_VALUE}" ]]; then
-  printf '首次登录账号：admin\n首次登录密码：%s\n管理端：%s/admin\n' "${ADMIN_PASSWORD_VALUE}" "${PUBLIC_URL}"
-  echo "请立即保存到受控密码管理器；服务器不会保留该明文密码。"
-fi
-
-# 数据库已初始化后，从运行环境中移除初始明文密码。
-sed -i 's/^ADMIN_INITIAL_PASSWORD=.*/ADMIN_INITIAL_PASSWORD=/' .env
-docker compose up -d
+# 数据库已初始化后，清除 .env 中的明文并强制重建 app 容器，确保
+# docker inspect 也无法读取首次密码。任一步失败仍由 EXIT trap 清理。
+scrub_initial_password
+docker compose up -d --force-recreate --wait --wait-timeout 180 app
+BOOTSTRAP_PASSWORD_ACTIVE=false
+ADMIN_PASSWORD_VALUE=""
 
 sed "s|@APP_DIR@|${APP_DIR}|g" deploy/teaching-choice-backup.service \
   > /etc/systemd/system/teaching-choice-backup.service

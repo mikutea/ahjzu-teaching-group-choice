@@ -161,7 +161,7 @@ def test_native_fullscreen_three_column_stage_fits_tablet_and_small_projector_wi
     assert "grid-template-columns: minmax(0,1fr) auto auto auto" in responsive
     assert ".board-presentation-footer" in responsive and "margin: 0 -12px" in responsive
     assert ".board-presentation-sync" in responsive and "display: none" in responsive
-    assert "width: clamp(205px,28vw,310px)" in responsive
+    assert "width: clamp(165px,19vw,205px)" in responsive
     assert "aspect-ratio: 3808 / 909" in css
 
 

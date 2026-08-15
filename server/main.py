@@ -3267,7 +3267,19 @@ def create_app(config: Config | None = None) -> FastAPI:
                     )
 
             now = utc_now()
-            for (major_id, group_id), capacity in desired.items():
+            # SQLite validates the group-capacity invariant after every row.
+            # Apply releases before allocations so a valid redistribution is
+            # never rejected solely because the request listed an increase
+            # before its compensating decrease.
+            ordered_updates = sorted(
+                desired.items(),
+                key=lambda item: (
+                    item[1] > current[item[0]],
+                    item[0][1],
+                    item[0][0],
+                ),
+            )
+            for (major_id, group_id), capacity in ordered_updates:
                 connection.execute(
                     """
                     UPDATE quotas SET capacity = ?, updated_at = ?
