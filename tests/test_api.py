@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi.testclient import TestClient
 
+import server.main as server_main
+
 from .conftest import (
     admin_login,
     fictional_activation_code,
@@ -623,3 +625,87 @@ def test_one_hundred_fifty_students_competing_for_thirty_seats_never_oversells(a
         )
         assert cell["selected_count"] == 30
         assert final["totals"] == {"students": 150, "selected": 30, "unselected": 120}
+
+
+def test_successful_selection_releases_write_lock_before_full_projection(
+    app,
+    monkeypatch,
+):
+    with TestClient(app) as admin_client:
+        csrf = admin_login(admin_client)
+        dashboard = admin_client.get("/api/admin/dashboard").json()
+        activity_id = int(dashboard["settings"]["activity_id"])
+        major = dashboard["majors"][0]
+        group = dashboard["groups"][0]
+        admin_headers = {
+            "X-CSRF-Token": csrf,
+            "X-Activity-ID": str(activity_id),
+        }
+        student_no = "20270000999"
+        imported = admin_client.post(
+            "/api/admin/students/import",
+            headers=admin_headers,
+            files={
+                "files": (
+                    "student.csv",
+                    (
+                        "学号,姓名,专业,证件号\n"
+                        f"{student_no},事务学生,{major['name']},"
+                        f"{fictional_document_number(student_no)}\n"
+                    ).encode("utf-8"),
+                    "text/csv",
+                )
+            },
+        )
+        assert imported.status_code == 200, imported.text
+        open_selection_now(admin_client, admin_headers)
+
+        with TestClient(app) as student_client:
+            login = student_client.post(
+                "/api/student/login",
+                json={
+                    "student_no": student_no,
+                    "name": "事务学生",
+                    "activation_code": fictional_activation_code(student_no),
+                },
+            )
+            assert login.status_code == 200, login.text
+
+            traces: list[list[str]] = []
+            original_connect = server_main.connect
+
+            def traced_connect(database_path):
+                connection = original_connect(database_path)
+                statements: list[str] = []
+                traces.append(statements)
+                connection.set_trace_callback(statements.append)
+                return connection
+
+            monkeypatch.setattr(server_main, "connect", traced_connect)
+            selected = student_client.post(
+                "/api/student/select",
+                headers={
+                    "X-CSRF-Token": login.json()["csrf_token"],
+                    "X-Activity-ID": str(activity_id),
+                },
+                json={"group_id": group["id"]},
+            )
+            assert selected.status_code == 200, selected.text
+
+        selection_trace = next(
+            statements
+            for statements in traces
+            if any("INSERT INTO SELECTIONS" in " ".join(sql.upper().split()) for sql in statements)
+        )
+        normalized = [" ".join(sql.upper().split()) for sql in selection_trace]
+        insert_index = next(
+            index for index, sql in enumerate(normalized) if "INSERT INTO SELECTIONS" in sql
+        )
+        commit_index = normalized.index("COMMIT", insert_index)
+        read_begin_index = normalized.index("BEGIN", commit_index + 1)
+        projection_index = next(
+            index
+            for index, sql in enumerate(normalized)
+            if index > insert_index and "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY" in sql
+        )
+        assert insert_index < commit_index < read_begin_index < projection_index

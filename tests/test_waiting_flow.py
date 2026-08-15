@@ -4,12 +4,17 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 
 import server.main as main_module
 from server.database import connect
 
-from .conftest import fictional_activation_code, fictional_document_number
+from .conftest import (
+    fictional_activation_code,
+    fictional_document_number,
+    open_selection_now,
+)
 
 
 FIXED_ORGANIZATION = "安徽建筑大学 · 建筑与空间规划学院"
@@ -430,6 +435,169 @@ def test_countdown_uses_server_clock_and_opens_atomically_without_sleeping(
         assert after_close["selection_opens_at"] is None
     finally:
         student.close()
+
+
+def test_selection_projection_failure_returns_committed_fallback(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    app_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    activity_id = int(dashboard["settings"]["activity_id"])
+    major_name = dashboard["majors"][0]["name"]
+    group_id = int(dashboard["groups"][0]["id"])
+    document_number = fictional_document_number("ROLLBACK-RESPONSE")
+    imported = import_roster(
+        client,
+        admin_headers,
+        major_name,
+        [("20530000011", "Projection Failure", document_number)],
+    )
+    assert imported.status_code == 200, imported.text
+    open_selection_now(client, admin_headers)
+
+    with TestClient(app, raise_server_exceptions=False) as student:
+        login = student.post(
+            "/api/student/login",
+            json={
+                "student_no": "20530000011",
+                "name": "Projection Failure",
+                "activation_code": document_number[-6:],
+            },
+        )
+        assert login.status_code == 200, login.text
+        login_payload = login.json()
+        original_connect = main_module.connect
+        projection_failure_triggered = False
+
+        class ProjectionFailingConnection:
+            def __init__(self, database_path):
+                self._connection = original_connect(database_path)
+                self._write_committed = False
+
+            def execute(self, sql, *args, **kwargs):
+                nonlocal projection_failure_triggered
+                normalized = " ".join(str(sql).upper().split())
+                if (
+                    self._write_committed
+                    and "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY" in normalized
+                ):
+                    projection_failure_triggered = True
+                    raise RuntimeError("synthetic post-commit projection failure")
+                return self._connection.execute(sql, *args, **kwargs)
+
+            def commit(self):
+                self._connection.commit()
+                self._write_committed = True
+
+            def rollback(self):
+                return self._connection.rollback()
+
+            def close(self):
+                return self._connection.close()
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+        monkeypatch.setattr(main_module, "connect", ProjectionFailingConnection)
+        selected = student.post(
+            "/api/student/select",
+            headers=student_headers(login_payload, activity_id),
+            json={"group_id": group_id},
+        )
+        assert selected.status_code == 200, selected.text
+        payload = selected.json()
+        assert projection_failure_triggered is True
+        assert payload["selection"]["group_id"] == group_id
+        assert payload["receipt"]["token"]
+        assert payload["groups"] == []
+        verified = student.post(
+            "/api/public/receipts/verify",
+            json={"token": payload["receipt"]["token"]},
+        )
+        assert verified.status_code == 200, verified.text
+        assert verified.json()["valid"] is True
+
+    connection = connect(app_config.database_path)
+    try:
+        student_id = int(
+            connection.execute(
+                "SELECT id FROM students WHERE student_no = ?", ("20530000011",)
+            ).fetchone()["id"]
+        )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM selections WHERE student_id = ?", (student_id,)
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM audit_logs WHERE action = 'selection.create' AND entity_type = 'selection'"
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_countdown_freezes_admin_assignment_and_revocation(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    app_config,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    major_name = dashboard["majors"][0]["name"]
+    group_id = int(dashboard["groups"][0]["id"])
+    imported = import_roster(
+        client,
+        admin_headers,
+        major_name,
+        [
+            ("20530000012", "Assigned Before Countdown", fictional_document_number("ASSIGN-BEFORE")),
+            ("20530000013", "Blocked During Countdown", fictional_document_number("ASSIGN-DURING")),
+        ],
+    )
+    assert imported.status_code == 200, imported.text
+    connection = connect(app_config.database_path)
+    try:
+        rows = connection.execute(
+            "SELECT id, student_no FROM students WHERE student_no IN (?, ?)",
+            ("20530000012", "20530000013"),
+        ).fetchall()
+        ids = {row["student_no"]: int(row["id"]) for row in rows}
+    finally:
+        connection.close()
+
+    assigned = client.post(
+        "/api/admin/selections",
+        headers=admin_headers,
+        json={"student_id": ids["20530000012"], "group_id": group_id},
+    )
+    assert assigned.status_code == 200, assigned.text
+    started = client.post("/api/admin/countdown", headers=admin_headers)
+    assert started.status_code == 200, started.text
+    assert started.json()["phase"] == "countdown"
+
+    blocked_assign = client.post(
+        "/api/admin/selections",
+        headers=admin_headers,
+        json={"student_id": ids["20530000013"], "group_id": group_id},
+    )
+    assert blocked_assign.status_code == 409
+    assert "倒计时" in blocked_assign.json()["detail"]
+    blocked_revoke = client.post(
+        "/api/admin/selections/revoke",
+        headers=admin_headers,
+        json={"student_id": ids["20530000012"], "reason": "synthetic countdown guard"},
+    )
+    assert blocked_revoke.status_code == 409
+    assert "倒计时" in blocked_revoke.json()["detail"]
+
+    connection = connect(app_config.database_path)
+    try:
+        active = connection.execute(
+            "SELECT student_id FROM selections WHERE revoked_at IS NULL ORDER BY student_id"
+        ).fetchall()
+        assert [int(row["student_id"]) for row in active] == [ids["20530000012"]]
+    finally:
+        connection.close()
 
 
 def test_cancelling_countdown_returns_to_waiting_and_clears_schedule(
