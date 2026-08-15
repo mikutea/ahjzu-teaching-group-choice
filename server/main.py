@@ -387,6 +387,16 @@ class QuotaUpdate(StrictModel):
     capacity: int = Field(ge=0, le=1000)
 
 
+class QuotaBatchItem(StrictModel):
+    major_id: int = Field(gt=0)
+    group_id: int = Field(gt=0)
+    capacity: int = Field(ge=0, le=1000)
+
+
+class QuotaBatchUpdate(StrictModel):
+    quotas: list[QuotaBatchItem] = Field(min_length=1, max_length=2000)
+
+
 class StudentSelect(StrictModel):
     group_id: int = Field(gt=0)
 
@@ -1617,15 +1627,21 @@ def create_app(config: Config | None = None) -> FastAPI:
                 raise HTTPException(status_code=403, detail="不能代替其他学生提交选择")
             if operator != str(identity.subject_id):
                 raise HTTPException(status_code=403, detail="操作人身份校验失败")
+            phase = activity_phase(activity)
+            if source == "admin" and phase == "countdown":
+                raise HTTPException(
+                    status_code=409,
+                    detail="统一倒计时期间不能管理员补位，请等待倒计时结束",
+                )
             if require_open:
-                phase = activity_phase(activity)
                 if phase == "countdown":
                     raise HTTPException(status_code=409, detail="统一倒计时尚未结束，请等待开抢")
                 if phase != "open":
                     raise HTTPException(status_code=409, detail="抢选尚未开放或已经结束")
             student = connection.execute(
                 """
-                SELECT s.id, s.major_id, s.active, m.active AS major_active
+                SELECT s.id, s.student_no, s.name, s.major_id, s.active,
+                       m.name AS major_name, m.active AS major_active
                 FROM students s JOIN majors m ON m.id = s.major_id
                 WHERE s.id = ?
                 """,
@@ -1640,7 +1656,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             if existing:
                 raise HTTPException(status_code=409, detail="你已经完成选择，不能重复提交")
             group = connection.execute(
-                "SELECT id, active, total_capacity FROM teaching_groups WHERE id = ?",
+                "SELECT id, name, active, total_capacity FROM teaching_groups WHERE id = ?",
                 (group_id,),
             ).fetchone()
             if not group or not group["active"]:
@@ -1668,6 +1684,12 @@ def create_app(config: Config | None = None) -> FastAPI:
             ).fetchone()["count"]
             if major_selected >= quota["capacity"] or total_selected >= group["total_capacity"]:
                 raise HTTPException(status_code=409, detail="该教学组名额刚刚已满，请选择其他教学组")
+            # Receipt generation is part of the successful selection contract.  Validate
+            # its trusted public origin before inserting anything so a broken setting
+            # still fails atomically, while the expensive per-student projection can be
+            # built after the short write transaction has committed.
+            settings = setting_dict(connection)
+            selection_receipt_public_origin(settings)
             now = utc_now()
             selection = connection.execute(
                 """
@@ -1677,18 +1699,61 @@ def create_app(config: Config | None = None) -> FastAPI:
                 """,
                 (student_id, group_id, now, source, operator),
             )
+            selection_id = int(selection.lastrowid)
+            receipt = build_selection_receipt(
+                settings=settings,
+                selection_id=selection_id,
+                student_id=student_id,
+                group_id=group_id,
+                selected_at=now,
+                student_no=str(student["student_no"]),
+                student_name=str(student["name"]),
+                major_name=str(student["major_name"]),
+                group_name=str(group["name"]),
+            )
+            committed_payload = {
+                "server_now": settings["server_now"],
+                "selection_opens_at": settings["selection_opens_at"],
+                "phase": settings["phase"],
+                "student_login_allowed": settings["student_login_allowed"],
+                "status_message": settings["status_message"],
+                "student": {
+                    "id": student_id,
+                    "student_no": student["student_no"],
+                    "name": student["name"],
+                    "major_id": student["major_id"],
+                    "major_name": student["major_name"],
+                },
+                "selection": {
+                    "group_id": group_id,
+                    "selected_at": now,
+                    "group_name": group["name"],
+                },
+                "receipt": receipt,
+                "groups": [],
+                "settings": settings,
+            }
             audit(
                 connection,
                 actor_type=source,
                 actor_id=operator,
                 action="selection.create",
                 entity_type="selection",
-                entity_id=selection.lastrowid,
+                entity_id=selection_id,
                 details={"student_id": student_id, "group_id": group_id},
             )
-            payload = student_payload_from_connection(connection, student_id)
             connection.commit()
-            return payload
+            # The correlated availability projection is intentionally outside the
+            # serialized writer section.  The committed payload above is complete
+            # enough to acknowledge success if that best-effort read projection fails.
+            try:
+                connection.execute("BEGIN")
+                response_payload = student_payload_from_connection(connection, student_id)
+                connection.commit()
+                return response_payload
+            except Exception:
+                connection.rollback()
+                return committed_payload
         except Exception:
             connection.rollback()
             raise
@@ -3182,6 +3247,124 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.close()
         return {"ok": True}
 
+    @app.put("/api/admin/quotas/batch")
+    def update_quotas_batch(payload: QuotaBatchUpdate, request: Request):
+        identity = require_session(request, "admin", csrf=True)
+        desired: dict[tuple[int, int], int] = {}
+        for item in payload.quotas:
+            key = (item.major_id, item.group_id)
+            if key in desired:
+                raise HTTPException(status_code=400, detail="批量配额中存在重复单元格")
+            desired[key] = item.capacity
+
+        connection = connect(config.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            require_expected_activity(request, connection, identity=identity)
+            ensure_closed(connection)
+
+            current: dict[tuple[int, int], int] = {}
+            selected: dict[tuple[int, int], int] = {}
+            affected_group_ids = sorted({group_id for _, group_id in desired})
+            for major_id, group_id in desired:
+                row = connection.execute(
+                    "SELECT capacity FROM quotas WHERE major_id = ? AND group_id = ?",
+                    (major_id, group_id),
+                ).fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="批量配额包含不存在的单元格")
+                current[(major_id, group_id)] = int(row["capacity"])
+                selected[(major_id, group_id)] = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) AS count
+                        FROM selections se JOIN students s ON s.id = se.student_id
+                        WHERE s.major_id = ? AND se.group_id = ? AND se.revoked_at IS NULL
+                        """,
+                        (major_id, group_id),
+                    ).fetchone()["count"]
+                )
+                if desired[(major_id, group_id)] < selected[(major_id, group_id)]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "批量配额不能小于当前已选人数："
+                            f"专业 {major_id} / 教学组 {group_id} 已选 "
+                            f"{selected[(major_id, group_id)]} 人"
+                        ),
+                    )
+
+            for group_id in affected_group_ids:
+                group = connection.execute(
+                    "SELECT name, total_capacity FROM teaching_groups WHERE id = ?",
+                    (group_id,),
+                ).fetchone()
+                if not group:
+                    raise HTTPException(status_code=404, detail="批量配额包含不存在的教学组")
+                final_total = 0
+                for quota in connection.execute(
+                    "SELECT major_id, capacity FROM quotas WHERE group_id = ?",
+                    (group_id,),
+                ).fetchall():
+                    key = (int(quota["major_id"]), group_id)
+                    final_total += desired.get(key, int(quota["capacity"]))
+                if final_total > int(group["total_capacity"]):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"{group['name']}各专业配额合计 {final_total}，"
+                            f"不能超过教学组总容量 {group['total_capacity']}"
+                        ),
+                    )
+
+            now = utc_now()
+            # SQLite validates the group-capacity invariant after every row.
+            # Apply releases before allocations so a valid redistribution is
+            # never rejected solely because the request listed an increase
+            # before its compensating decrease.
+            ordered_updates = sorted(
+                desired.items(),
+                key=lambda item: (
+                    item[1] > current[item[0]],
+                    item[0][1],
+                    item[0][0],
+                ),
+            )
+            for (major_id, group_id), capacity in ordered_updates:
+                connection.execute(
+                    """
+                    UPDATE quotas SET capacity = ?, updated_at = ?
+                    WHERE major_id = ? AND group_id = ?
+                    """,
+                    (capacity, now, major_id, group_id),
+                )
+            audit(
+                connection,
+                actor_type="admin",
+                actor_id=identity.subject_id,
+                action="quota.batch.update",
+                entity_type="quota_batch",
+                entity_id=str(len(desired)),
+                details={
+                    "updates": [
+                        {
+                            "major_id": major_id,
+                            "group_id": group_id,
+                            "from": current[(major_id, group_id)],
+                            "to": capacity,
+                        }
+                        for (major_id, group_id), capacity in desired.items()
+                    ]
+                },
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return {"ok": True, "updated_count": len(desired)}
+
     @app.put("/api/admin/quotas/{major_id}/{group_id}")
     def update_quota(major_id: int, group_id: int, payload: QuotaUpdate, request: Request):
         identity = require_session(request, "admin", csrf=True)
@@ -3655,7 +3838,12 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            require_expected_activity(request, connection, identity=identity)
+            activity = require_expected_activity(request, connection, identity=identity)
+            if activity_phase(activity) == "countdown":
+                raise HTTPException(
+                    status_code=409,
+                    detail="统一倒计时期间不能撤销选择，请等待倒计时结束",
+                )
             selection = connection.execute(
                 """
                 SELECT id, group_id FROM selections

@@ -161,7 +161,7 @@ def test_native_fullscreen_three_column_stage_fits_tablet_and_small_projector_wi
     assert "grid-template-columns: minmax(0,1fr) auto auto auto" in responsive
     assert ".board-presentation-footer" in responsive and "margin: 0 -12px" in responsive
     assert ".board-presentation-sync" in responsive and "display: none" in responsive
-    assert "width: clamp(205px,28vw,310px)" in responsive
+    assert "width: clamp(165px,19vw,205px)" in responsive
     assert "aspect-ratio: 3808 / 909" in css
 
 
@@ -183,7 +183,7 @@ def test_quota_inputs_save_after_idle_then_refresh_latest_dashboard() -> None:
     assert 'document.activeElement?.closest?.("#major-editor, #group-editor, #quota-matrix")' in javascript
 
 
-def test_phone_activation_lookup_polls_only_public_phase_status() -> None:
+def test_non_overview_admin_views_poll_only_public_phase_status() -> None:
     _, javascript, _ = _sources()
     status_sync = javascript.split("async function loadDashboardStatusSnapshot", 1)[1].split(
         "function startAdminPolling", 1
@@ -196,8 +196,8 @@ def test_phone_activation_lookup_polls_only_public_phase_status() -> None:
     )[0]
 
     assert 'adminApi("/api/public/status")' in status_sync
-    assert 'adminState.currentView !== "students"' in status_sync
-    assert "mobileAdminQuery.matches" in status_sync
+    assert 'adminState.currentView === "overview"' in status_sync
+    assert 'adminState.currentView !== "students"' not in status_sync
     assert "mergeDashboardStatusSnapshot" in status_sync
     assert "clearAllRevealedActivationCodes()" in status_merge
     assert "renderDashboardPhaseStatus" in status_sync
@@ -205,7 +205,7 @@ def test_phone_activation_lookup_polls_only_public_phase_status() -> None:
     assert "renderStudentRoster" not in status_sync
     assert "renderAssignmentTable" not in status_sync
     assert "activation_code" not in status_sync
-    assert 'adminState.currentView === "students" && mobileAdminQuery.matches' in polling
+    assert 'else loadDashboardStatusSnapshot({ quiet: true });' in polling
     assert "loadDashboardStatusSnapshot({ quiet: true })" in polling
     assert 'adminState.currentView === "overview"' in polling
 
@@ -432,6 +432,7 @@ eval(`
   const stopWaitingFeedAutoScroll = () => {};
   const loadDashboard = () => {};
   const renderUnselectedList = () => {};
+  const renderGroupProgress = () => {};
   const renderLiveSelectionFeed = () => {};
   const renderWaitingStudentFeed = () => {};
   ${switchBlock}
