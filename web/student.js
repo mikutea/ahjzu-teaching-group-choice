@@ -1122,7 +1122,7 @@ function mergePublicStatusIntoStudentPayload(payload, status) {
     student_login_allowed: status.student_login_allowed,
     status_message: status.status_message,
   };
-  return {
+  const merged = {
     ...payload,
     status: status.status,
     phase: status.phase,
@@ -1132,6 +1132,8 @@ function mergePublicStatusIntoStudentPayload(payload, status) {
     status_message: status.status_message,
     settings,
   };
+  rememberStudentResponseClockTiming(merged, studentResponseClockTimings.get(status));
+  return merged;
 }
 
 async function loadPublicInfo() {
@@ -1175,17 +1177,17 @@ function startStudentPolling() {
       let data;
       if (!hadSelection && phaseBeforePoll !== "open") {
         const publicStatus = await studentApi("/api/public/status");
+        synchronizeStudentClock(publicStatus);
         const currentActivityId = studentState.payload?.settings?.activity_id;
         if (String(publicStatus.activity_id) !== String(currentActivityId)) {
+          data = await studentApi("/api/student/me");
+        } else if (studentPhase(publicStatus) === "open") {
           data = await studentApi("/api/student/me");
         } else {
           data = mergePublicStatusIntoStudentPayload(studentState.payload, publicStatus);
           renderStudentPayload(data);
-          if (studentPhase(data) !== "open") {
-            markStudentConnectionHealthy();
-            return;
-          }
-          data = await studentApi("/api/student/me");
+          markStudentConnectionHealthy();
+          return;
         }
       } else {
         data = await studentApi("/api/student/me");
@@ -1232,7 +1234,6 @@ function tickStudentCountdown() {
     return;
   }
   if (phase === "open" && !studentEls.waitingView.classList.contains("is-hidden")) {
-    renderStudentPayload(payload);
     if (studentState.boundaryRefreshPending || studentState.pollInFlight) return;
     studentState.boundaryRefreshPending = true;
     studentApi("/api/student/me")
