@@ -476,6 +476,80 @@ eval(mergeBlock + pollingBlock);
     assert result["phase"] == "open"
 
 
+def test_waiting_heartbeat_refreshes_private_state_after_admin_backfill() -> None:
+    _, _, javascript = _student_sources()
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const pollingBlock = "function startStudentPolling" + source
+  .split("function startStudentPolling", 2)[1]
+  .split("function tickStudentCountdown", 1)[0];
+const calls = [];
+const renders = [];
+let heartbeatCallback = null;
+const studentState = {
+  csrf: "csrf",
+  payload: {
+    phase: "waiting",
+    selection: null,
+    groups: [{id: 1, name: "第一教学组", full: false}],
+    student: {id: 11},
+    settings: {activity_id: 7, status: "closed"},
+  },
+  selectedGroupId: null,
+  pollTimer: null,
+  heartbeatTimer: null,
+  pollInFlight: false,
+  heartbeatInFlight: false,
+  lastSelectedSyncAt: 0,
+};
+global.clearInterval = () => {};
+global.setInterval = (callback, delay) => {
+  if (delay === 5000) heartbeatCallback = callback;
+  return delay;
+};
+function studentMonotonicNow() { return 1000; }
+function studentPhase(payload) { return payload.phase; }
+function synchronizeStudentClock() {}
+function markStudentConnectionHealthy() {}
+function handleStudentSessionExpired() { throw new Error("unexpected expiry"); }
+function reportStudentConnectionIssue(error) { throw error; }
+function showStudentMessage() {}
+function mergePublicStatusIntoStudentPayload(payload) { return payload; }
+function renderStudentPayload(payload) {
+  studentState.payload = payload;
+  renders.push(payload.selection?.group_name || null);
+}
+const responses = [
+  {ok: true, has_selection: true, phase: "waiting"},
+  {
+    csrf_token: "next-csrf",
+    phase: "waiting",
+    selection: {group_id: 3, group_name: "管理员补录教学组", selected_at: "2026-08-15T15:00:00Z"},
+    groups: [{id: 3, name: "管理员补录教学组", full: false}],
+    student: {id: 11},
+    settings: {activity_id: 7, status: "closed"},
+  },
+];
+async function studentApi(path) {
+  calls.push(path);
+  return responses.shift();
+}
+eval(pollingBlock);
+(async () => {
+  startStudentPolling();
+  await heartbeatCallback();
+  process.stdout.write(JSON.stringify({calls, renders, csrf: studentState.csrf, selection: studentState.payload.selection}));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    result = _run_node(script)
+
+    assert result["calls"] == ["/api/student/heartbeat", "/api/student/me"]
+    assert result["renders"] == ["管理员补录教学组"]
+    assert result["csrf"] == "next-csrf"
+    assert result["selection"]["group_id"] == 3
+
+
 def test_countdown_boundary_keeps_waiting_view_until_private_snapshot_arrives() -> None:
     _, _, javascript = _student_sources()
     script = r"""

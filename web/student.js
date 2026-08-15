@@ -1212,8 +1212,19 @@ function startStudentPolling() {
     if (studentState.heartbeatInFlight || !studentState.payload || studentState.payload.selection) return;
     studentState.heartbeatInFlight = true;
     try {
-      await studentApi("/api/student/heartbeat", { method: "POST", body: JSON.stringify({}) });
+      const heartbeat = await studentApi("/api/student/heartbeat", { method: "POST", body: JSON.stringify({}) });
       markStudentConnectionHealthy();
+      if (heartbeat.has_selection === true && !studentState.payload?.selection && !studentState.pollInFlight) {
+        studentState.pollInFlight = true;
+        try {
+          const data = await studentApi("/api/student/me");
+          if (data.csrf_token) studentState.csrf = data.csrf_token;
+          markStudentConnectionHealthy();
+          renderStudentPayload(data);
+        } finally {
+          studentState.pollInFlight = false;
+        }
+      }
     } catch (error) {
       if (error.status === 401) handleStudentSessionExpired();
       else reportStudentConnectionIssue(error);
