@@ -3944,6 +3944,10 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/", include_in_schema=False)
     def student_page():
-        return FileResponse(WEB_ROOT / "index.html", media_type="text/html")
+        return FileResponse(
+            WEB_ROOT / "index.html",
+            media_type="text/html",
+            headers={"Cache-Control": "public, max-age=60, must-revalidate"},
+        )
 
     return app

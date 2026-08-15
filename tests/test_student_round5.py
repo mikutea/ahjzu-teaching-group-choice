@@ -221,6 +221,7 @@ eval(`
     assert result["monotonicAfterStale"] is True
     assert result["paths"] == [
         "/api/public/info",
+        "/api/public/status",
         "/api/student/login",
         "/api/student/me",
     ]
@@ -365,3 +366,88 @@ def test_success_view_keeps_syncing_for_administrator_revocation() -> None:
     assert "pollStartedAt - studentState.lastSelectedSyncAt < 5000" in polling_block
     assert "hadSelection && !data.selection" in polling_block
     assert "原选择已被管理员撤销" in polling_block
+
+
+def test_waiting_poll_uses_lightweight_public_status_until_selection_opens() -> None:
+    _, _, javascript = _student_sources()
+    merge_block = javascript.split(
+        "function mergePublicStatusIntoStudentPayload", 1
+    )[1].split("async function loadPublicInfo", 1)[0]
+    polling_block = javascript.split("function startStudentPolling", 1)[1].split(
+        "function tickStudentCountdown", 1
+    )[0]
+
+    assert 'studentApi("/api/public/status")' in polling_block
+    assert 'studentApi("/api/student/me")' in polling_block
+    assert "mergePublicStatusIntoStudentPayload" in polling_block
+    assert "activity_id" in merge_block
+    assert "selection_opens_at" in merge_block
+
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const mergeBlock = "function mergePublicStatusIntoStudentPayload" + source
+  .split("function mergePublicStatusIntoStudentPayload", 2)[1]
+  .split("async function loadPublicInfo", 1)[0];
+const pollingBlock = "function startStudentPolling" + source
+  .split("function startStudentPolling", 2)[1]
+  .split("function tickStudentCountdown", 1)[0];
+const calls = [];
+const renders = [];
+let intervalCallback = null;
+let now = 1000;
+const studentState = {
+  pollTimer: null,
+  heartbeatTimer: null,
+  pollInFlight: false,
+  heartbeatInFlight: false,
+  lastSelectedSyncAt: 0,
+  selectedGroupId: null,
+  csrf: "csrf",
+  payload: {
+    phase: "waiting",
+    selection_opens_at: null,
+    selection: null,
+    groups: [{id: 1, name: "一组", full: false}],
+    student: {id: 1},
+    settings: {activity_id: 7, activity_title: "压力测试", status: "closed"},
+  },
+};
+global.clearInterval = () => {};
+global.setInterval = (callback, delay) => {
+  if (delay === 1000) intervalCallback = callback;
+  return delay;
+};
+function studentMonotonicNow() { return now; }
+function studentPhase(payload) { return payload.phase; }
+function markStudentConnectionHealthy() {}
+function handleStudentSessionExpired() { throw new Error("unexpected expiry"); }
+function reportStudentConnectionIssue(error) { throw error; }
+function renderStudentPayload(payload) { studentState.payload = payload; renders.push(payload.phase); }
+const responses = [
+  {activity_id: 7, status: "closed", phase: "waiting", server_now: "2026-08-15T00:00:00Z", selection_opens_at: null, student_login_allowed: true, status_message: "waiting"},
+  {activity_id: 7, status: "open", phase: "open", server_now: "2026-08-15T00:00:01Z", selection_opens_at: "2026-08-15T00:00:01Z", student_login_allowed: true, status_message: "open"},
+  {csrf_token: "csrf", phase: "open", selection_opens_at: "2026-08-15T00:00:01Z", selection: null, groups: [{id: 1, name: "一组", full: false}], student: {id: 1}, settings: {activity_id: 7, activity_title: "压力测试", status: "open"}},
+  {csrf_token: "csrf", phase: "open", selection_opens_at: "2026-08-15T00:00:01Z", selection: null, groups: [{id: 1, name: "一组", full: false}], student: {id: 1}, settings: {activity_id: 7, activity_title: "压力测试", status: "open"}},
+];
+async function studentApi(path) { calls.push(path); return responses.shift(); }
+eval(mergeBlock + pollingBlock);
+(async () => {
+  startStudentPolling();
+  await intervalCallback();
+  await intervalCallback();
+  now = 2000;
+  await intervalCallback();
+  process.stdout.write(JSON.stringify({calls, renders, phase: studentState.payload.phase}));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    result = _run_node(script)
+
+    assert result["calls"] == [
+        "/api/public/status",
+        "/api/public/status",
+        "/api/student/me",
+        "/api/student/me",
+    ]
+    assert result["renders"] == ["waiting", "open", "open", "open"]
+    assert result["phase"] == "open"
