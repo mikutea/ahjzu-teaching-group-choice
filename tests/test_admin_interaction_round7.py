@@ -118,6 +118,98 @@ def test_board_qr_uses_one_compact_stage_and_reduced_motion_stays_reachable() ->
     assert "overflow-y: auto" in reduced_motion
 
 
+def test_overview_return_and_visibility_restore_restart_group_scrolling() -> None:
+    _, javascript, _ = _web_sources()
+    switch_view = javascript.split("function switchAdminView", 1)[1].split(
+        'document.querySelectorAll(".admin-nav__item").forEach((button) => button.addEventListener', 1
+    )[0]
+    visibility = javascript.split('document.addEventListener("visibilitychange"', 1)[1]
+
+    assert 'renderGroupProgress(adminState.dashboard?.groups || [], { force: true })' in switch_view
+    assert 'adminState.groupProgressFingerprint = ""' in visibility
+
+
+def test_entity_name_reschedule_keeps_dirty_group_capacity() -> None:
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const scheduleSource = "function scheduleEntityRowSave" + source
+  .split("function scheduleEntityRowSave", 2)[1]
+  .split("function wireEntityAutosave", 1)[0];
+const adminState = {entitySaveTimers: new Map()};
+let scheduledCallback = null;
+const cleared = [];
+const persisted = [];
+function entityRowSaveKey(row) { return `${row.dataset.entityKind}:${row.dataset.id}`; }
+function clearTimeout(handle) { if (handle) cleared.push(handle); }
+function setTimeout(callback, delay) { scheduledCallback = callback; return {delay}; }
+function persistEntityRow(row, options) { persisted.push(options); }
+eval(scheduleSource);
+
+const row = {
+  dataset: {entityKind: "group", id: "9", originalCapacity: "10"},
+  _capacityInput: {value: "12"},
+};
+scheduleEntityRowSave(row, 650, {refreshAfter: true, includeCapacity: true});
+scheduleEntityRowSave(row, 360);
+scheduledCallback();
+
+row._capacityInput.value = "10";
+scheduleEntityRowSave(row, 360);
+scheduledCallback();
+console.log(JSON.stringify({persisted, cleared: cleared.length, dataset: row.dataset}));
+"""
+    execution = subprocess.run(
+        ["node", "-e", script, str(ROOT / "web" / "admin.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = json.loads(execution.stdout)
+
+    assert result["persisted"] == [
+        {"refreshAfter": True, "includeCapacity": True},
+        {"refreshAfter": False, "includeCapacity": False},
+    ]
+    assert result["cleared"] == 1
+    assert "saveScheduledCapacity" not in result["dataset"]
+    assert "saveScheduledRefresh" not in result["dataset"]
+
+
+def test_quota_clipboard_preserves_edge_cells_and_rejects_empty_values() -> None:
+    _, javascript, _ = _web_sources()
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const parserSource = "function quotaClipboardRows" + source
+  .split("function quotaClipboardRows", 2)[1]
+  .split('adminEls.quotaMatrix.addEventListener("paste"', 1)[0];
+eval(parserSource);
+console.log(JSON.stringify({
+  leading: quotaClipboardRows("\t5\r\n"),
+  trailing: quotaClipboardRows("5\t\r\n"),
+  matrix: quotaClipboardRows("1\t2\r\n3\t4\r\n"),
+}));
+"""
+    execution = subprocess.run(
+        ["node", "-e", script, str(ROOT / "web" / "admin.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    parsed = json.loads(execution.stdout)
+
+    assert parsed["leading"] == [["", "5"]]
+    assert parsed["trailing"] == [["5", ""]]
+    assert parsed["matrix"] == [["1", "2"], ["3", "4"]]
+    paste_handler = javascript.split('adminEls.quotaMatrix.addEventListener("paste"', 1)[1].split(
+        'adminEls.quotaBatchForm.addEventListener("submit"', 1
+    )[0]
+    assert "clipboard.trim()" not in paste_handler
+    assert "!normalizedValue" in paste_handler
+    assert "包含空单元格" in paste_handler
+
+
 def test_countdown_response_starts_the_overlay_before_dashboard_refresh() -> None:
     _, javascript, _ = _web_sources()
     action = javascript.split("async function handleSelectionPhaseAction", 1)[1].split(

@@ -432,6 +432,7 @@ eval(`
   const stopWaitingFeedAutoScroll = () => {};
   const loadDashboard = () => {};
   const renderUnselectedList = () => {};
+  const renderGroupProgress = () => {};
   const renderLiveSelectionFeed = () => {};
   const renderWaitingStudentFeed = () => {};
   ${switchBlock}
