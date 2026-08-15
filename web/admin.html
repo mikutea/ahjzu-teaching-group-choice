@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#7f292f">
   <title>教学组抢选 · 管理端</title>
-  <link rel="stylesheet" href="/assets/app.css?v=20260816-round7">
+  <link rel="stylesheet" href="/assets/app.css?v=20260816-round8">
 </head>
 <body class="admin-body">
   <section id="admin-login-view" class="admin-login-shell">
@@ -149,25 +149,23 @@
               <button id="fullscreen-board" class="button button--outline" type="button">⛶ 全屏展示</button>
             </div>
             <div class="qr-portal">
-              <div class="qr-portal__label"><span class="status-dot"></span><strong>学生抢选入口</strong></div>
+              <div id="board-stage" class="qr-portal__status board-stage--waiting" aria-live="polite" aria-atomic="true">
+                <div class="board-stage__summary">
+                  <span class="status-dot" aria-hidden="true"></span>
+                  <span id="board-stage-label" class="board-stage__label">候场中</span>
+                  <strong id="board-countdown-value" class="board-stage__countdown">READY</strong>
+                </div>
+              </div>
               <div class="qr-frame">
                 <img id="student-qr" alt="学生端二维码">
                 <div id="qr-placeholder" class="qr-placeholder">请先在系统设置中填写学生端访问地址</div>
                 <span class="qr-corner qr-corner--a"></span><span class="qr-corner qr-corner--b"></span>
                 <span class="qr-corner qr-corner--c"></span><span class="qr-corner qr-corner--d"></span>
               </div>
-              <p class="qr-portal__instruction"><strong>扫码核验身份</strong><span>登录后自动进入候场，开放抢选后仍可扫码加入</span></p>
+              <p class="qr-portal__instruction"><strong>扫码核验身份</strong><span id="board-stage-detail" role="status" aria-live="polite" aria-atomic="true">学生扫码核验后将在手机端等待</span></p>
+              <button id="board-start-countdown" class="qr-portal__action button button--primary button--wide" type="button">开始 10 秒倒计时</button>
             </div>
             <p id="public-url-label" class="public-url">尚未设置访问地址</p>
-            <div id="board-stage" class="board-stage board-stage--waiting" aria-live="polite" aria-atomic="true">
-              <div class="board-stage__summary">
-                <span class="status-dot" aria-hidden="true"></span>
-                <span id="board-stage-label" class="board-stage__label">候场中</span>
-                <strong id="board-countdown-value" class="board-stage__countdown">READY</strong>
-              </div>
-              <p id="board-stage-detail">学生扫码核验后将在手机端等待</p>
-              <button id="board-start-countdown" class="button button--primary button--wide" type="button">开始 10 秒倒计时</button>
-            </div>
           </section>
 
           <section class="board-panel board-panel--unselected" aria-labelledby="unselected-title">
@@ -414,6 +412,6 @@
     </form>
   </dialog>
 
-  <script src="/assets/admin.js?v=20260816-round7" defer></script>
+  <script src="/assets/admin.js?v=20260816-round8" defer></script>
 </body>
 </html>
