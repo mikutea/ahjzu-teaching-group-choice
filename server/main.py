@@ -1640,7 +1640,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                     raise HTTPException(status_code=409, detail="抢选尚未开放或已经结束")
             student = connection.execute(
                 """
-                SELECT s.id, s.major_id, s.active, m.active AS major_active
+                SELECT s.id, s.student_no, s.name, s.major_id, s.active,
+                       m.name AS major_name, m.active AS major_active
                 FROM students s JOIN majors m ON m.id = s.major_id
                 WHERE s.id = ?
                 """,
@@ -1655,7 +1656,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             if existing:
                 raise HTTPException(status_code=409, detail="你已经完成选择，不能重复提交")
             group = connection.execute(
-                "SELECT id, active, total_capacity FROM teaching_groups WHERE id = ?",
+                "SELECT id, name, active, total_capacity FROM teaching_groups WHERE id = ?",
                 (group_id,),
             ).fetchone()
             if not group or not group["active"]:
@@ -1687,7 +1688,8 @@ def create_app(config: Config | None = None) -> FastAPI:
             # its trusted public origin before inserting anything so a broken setting
             # still fails atomically, while the expensive per-student projection can be
             # built after the short write transaction has committed.
-            selection_receipt_public_origin(setting_dict(connection))
+            settings = setting_dict(connection)
+            selection_receipt_public_origin(settings)
             now = utc_now()
             selection = connection.execute(
                 """
@@ -1697,18 +1699,61 @@ def create_app(config: Config | None = None) -> FastAPI:
                 """,
                 (student_id, group_id, now, source, operator),
             )
+            selection_id = int(selection.lastrowid)
+            receipt = build_selection_receipt(
+                settings=settings,
+                selection_id=selection_id,
+                student_id=student_id,
+                group_id=group_id,
+                selected_at=now,
+                student_no=str(student["student_no"]),
+                student_name=str(student["name"]),
+                major_name=str(student["major_name"]),
+                group_name=str(group["name"]),
+            )
+            committed_payload = {
+                "server_now": settings["server_now"],
+                "selection_opens_at": settings["selection_opens_at"],
+                "phase": settings["phase"],
+                "student_login_allowed": settings["student_login_allowed"],
+                "status_message": settings["status_message"],
+                "student": {
+                    "id": student_id,
+                    "student_no": student["student_no"],
+                    "name": student["name"],
+                    "major_id": student["major_id"],
+                    "major_name": student["major_name"],
+                },
+                "selection": {
+                    "group_id": group_id,
+                    "selected_at": now,
+                    "group_name": group["name"],
+                },
+                "receipt": receipt,
+                "groups": [],
+                "settings": settings,
+            }
             audit(
                 connection,
                 actor_type=source,
                 actor_id=operator,
                 action="selection.create",
                 entity_type="selection",
-                entity_id=selection.lastrowid,
+                entity_id=selection_id,
                 details={"student_id": student_id, "group_id": group_id},
             )
-            response_payload = student_payload_from_connection(connection, student_id)
             connection.commit()
-            return response_payload
+            # The correlated availability projection is intentionally outside the
+            # serialized writer section.  The committed payload above is complete
+            # enough to acknowledge success if that best-effort read projection fails.
+            try:
+                connection.execute("BEGIN")
+                response_payload = student_payload_from_connection(connection, student_id)
+                connection.commit()
+                return response_payload
+            except Exception:
+                connection.rollback()
+                return committed_payload
         except Exception:
             connection.rollback()
             raise
