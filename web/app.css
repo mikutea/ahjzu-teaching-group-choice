@@ -1439,12 +1439,8 @@ img { display: block; max-width: 100%; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
   .waiting-visual__ring, .board-presentation-sync .status-dot { animation: none !important; }
-  .live-board:fullscreen .group-progress,
-  .live-board.is-presentation .group-progress,
-  .live-board:fullscreen .waiting-student-feed,
-  .live-board.is-presentation .waiting-student-feed,
-  .live-board:fullscreen .live-selection-feed,
-  .live-board.is-presentation .live-selection-feed,
-  .live-board:fullscreen .unselected-list,
-  .live-board.is-presentation .unselected-list { overflow-y: auto; }
+  .group-progress,
+  .waiting-student-feed,
+  .live-selection-feed,
+  .unselected-list { overflow-y: auto; }
 }

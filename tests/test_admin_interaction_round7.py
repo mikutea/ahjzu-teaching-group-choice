@@ -37,6 +37,8 @@ def test_bootstrap_never_persists_the_plaintext_admin_password() -> None:
     assert 'elif [[ "${DATABASE_BOOTSTRAP_STATE}" == "empty" ]]' in script
     assert 'elif [[ ! -s data/teaching-choice.db ]]' not in script
     assert 'docker compose up -d --force-recreate --wait --wait-timeout 180 app' in script
+    assert 'sed -i "s|^ADMIN_INITIAL_PASSWORD=.*|ADMIN_INITIAL_PASSWORD=${ADMIN_PASSWORD_VALUE}|"' not in script
+    assert "write_initial_password_without_argv()" in script
     handoff_index = script.index("首次登录密码")
     first_compose_index = script.index("docker compose up -d --build")
     assert handoff_index < first_compose_index
@@ -116,6 +118,10 @@ def test_board_qr_uses_one_compact_stage_and_reduced_motion_stays_reachable() ->
     assert ".group-progress" in reduced_motion
     assert ".waiting-student-feed" in reduced_motion
     assert "overflow-y: auto" in reduced_motion
+    assert "\n  .group-progress," in reduced_motion
+    assert "\n  .waiting-student-feed," in reduced_motion
+    assert ".live-board:fullscreen .group-progress" not in reduced_motion
+    assert ".live-board.is-presentation .waiting-student-feed" not in reduced_motion
 
 
 def test_overview_return_and_visibility_restore_restart_group_scrolling() -> None:
@@ -176,6 +182,80 @@ console.log(JSON.stringify({persisted, cleared: cleared.length, dataset: row.dat
     assert "saveScheduledRefresh" not in result["dataset"]
 
 
+def test_equivalent_capacity_is_canonicalized_without_resave_loop() -> None:
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const saveFunctions = "function entityRowSaveKey" + source
+  .split("function entityRowSaveKey", 2)[1]
+  .split("function wireEntityAutosave", 1)[0];
+const scheduled = [];
+const requests = [];
+const adminState = {
+  dashboard: {settings: {activity_id: 7}},
+  entitySaveTimers: new Map(),
+};
+const adminEls = {
+  majorEditor: {dataset: {activityId: "7"}},
+  groupEditor: {dataset: {activityId: "7"}},
+};
+const row = {
+  dataset: {
+    entityKind: "group",
+    id: "3",
+    originalName: "第一教学组",
+    originalCapacity: "10",
+  },
+  isConnected: true,
+  _nameInput: {value: "第一教学组", setCustomValidity() {}, reportValidity() {}},
+  _capacityInput: {value: "010", setCustomValidity() {}, reportValidity() {}},
+  setAttribute() {},
+  removeAttribute() {},
+};
+function clearTimeout() {}
+function setTimeout(callback) { scheduled.push(callback); return callback; }
+async function adminApi(path, options) {
+  requests.push({path, payload: JSON.parse(options.body)});
+  return {};
+}
+async function loadDashboard() {}
+function renderLatestStructureAfterAutosave() {}
+function showAdminToast() {}
+function renderDashboard() {}
+eval(saveFunctions);
+(async () => {
+  await persistEntityRow(row, {includeCapacity: true});
+  process.stdout.write(JSON.stringify({
+    requests,
+    scheduled: scheduled.length,
+    value: row._capacityInput.value,
+    original: row.dataset.originalCapacity,
+    saving: row.dataset.saving === "true",
+  }));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    execution = subprocess.run(
+        ["node", "-e", script, str(ROOT / "web" / "admin.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = json.loads(execution.stdout)
+
+    assert result == {
+        "requests": [
+            {
+                "path": "/api/admin/groups/3",
+                "payload": {"total_capacity": 10},
+            }
+        ],
+        "scheduled": 0,
+        "value": "10",
+        "original": "10",
+        "saving": False,
+    }
+
+
 def test_quota_clipboard_preserves_edge_cells_and_rejects_empty_values() -> None:
     _, javascript, _ = _web_sources()
     script = r"""
@@ -188,6 +268,7 @@ eval(parserSource);
 console.log(JSON.stringify({
   leading: quotaClipboardRows("\t5\r\n"),
   trailing: quotaClipboardRows("5\t\r\n"),
+  trailingEmptyRow: quotaClipboardRows("5\r\n\r\n"),
   matrix: quotaClipboardRows("1\t2\r\n3\t4\r\n"),
 }));
 """
@@ -201,6 +282,7 @@ console.log(JSON.stringify({
 
     assert parsed["leading"] == [["", "5"]]
     assert parsed["trailing"] == [["5", ""]]
+    assert parsed["trailingEmptyRow"] == [["5"], [""]]
     assert parsed["matrix"] == [["1", "2"], ["3", "4"]]
     paste_handler = javascript.split('adminEls.quotaMatrix.addEventListener("paste"', 1)[1].split(
         'adminEls.quotaBatchForm.addEventListener("submit"', 1
