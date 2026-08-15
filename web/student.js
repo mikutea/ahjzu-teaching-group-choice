@@ -66,6 +66,7 @@ function professionalBadge(majorName) {
 
 const STUDENT_CLOCK_SYNC_PATHS = new Set([
   "/api/public/info",
+  "/api/public/status",
   "/api/student/login",
   "/api/student/me",
 ]);
@@ -1109,6 +1110,32 @@ function renderStudentPayload(payload) {
     : "请选择一个仍有名额的教学组";
 }
 
+function mergePublicStatusIntoStudentPayload(payload, status) {
+  if (!payload || !status) return payload;
+  const settings = {
+    ...payload.settings,
+    activity_id: status.activity_id,
+    status: status.status,
+    phase: status.phase,
+    server_now: status.server_now,
+    selection_opens_at: status.selection_opens_at,
+    student_login_allowed: status.student_login_allowed,
+    status_message: status.status_message,
+  };
+  const merged = {
+    ...payload,
+    status: status.status,
+    phase: status.phase,
+    server_now: status.server_now,
+    selection_opens_at: status.selection_opens_at,
+    student_login_allowed: status.student_login_allowed,
+    status_message: status.status_message,
+    settings,
+  };
+  rememberStudentResponseClockTiming(merged, studentResponseClockTimings.get(status));
+  return merged;
+}
+
 async function loadPublicInfo() {
   try {
     const data = await studentApi("/api/public/info");
@@ -1146,7 +1173,26 @@ function startStudentPolling() {
     studentState.pollInFlight = true;
     try {
       const hadSelection = Boolean(studentState.payload?.selection);
-      const data = await studentApi("/api/student/me");
+      const phaseBeforePoll = studentPhase(studentState.payload);
+      let data;
+      if (!hadSelection && phaseBeforePoll !== "open") {
+        const publicStatus = await studentApi("/api/public/status");
+        synchronizeStudentClock(publicStatus);
+        const currentActivityId = studentState.payload?.settings?.activity_id;
+        if (String(publicStatus.activity_id) !== String(currentActivityId)) {
+          data = await studentApi("/api/student/me");
+        } else if (studentPhase(publicStatus) === "open") {
+          data = await studentApi("/api/student/me");
+        } else {
+          data = mergePublicStatusIntoStudentPayload(studentState.payload, publicStatus);
+          renderStudentPayload(data);
+          markStudentConnectionHealthy();
+          return;
+        }
+      } else {
+        data = await studentApi("/api/student/me");
+      }
+      if (data.csrf_token) studentState.csrf = data.csrf_token;
       markStudentConnectionHealthy();
       const selectedStillAvailable = data.groups.some((group) => group.id === studentState.selectedGroupId && !group.full);
       if (!selectedStillAvailable) studentState.selectedGroupId = null;
@@ -1166,8 +1212,19 @@ function startStudentPolling() {
     if (studentState.heartbeatInFlight || !studentState.payload || studentState.payload.selection) return;
     studentState.heartbeatInFlight = true;
     try {
-      await studentApi("/api/student/heartbeat", { method: "POST", body: JSON.stringify({}) });
+      const heartbeat = await studentApi("/api/student/heartbeat", { method: "POST", body: JSON.stringify({}) });
       markStudentConnectionHealthy();
+      if (heartbeat.has_selection === true && !studentState.payload?.selection && !studentState.pollInFlight) {
+        studentState.pollInFlight = true;
+        try {
+          const data = await studentApi("/api/student/me");
+          if (data.csrf_token) studentState.csrf = data.csrf_token;
+          markStudentConnectionHealthy();
+          renderStudentPayload(data);
+        } finally {
+          studentState.pollInFlight = false;
+        }
+      }
     } catch (error) {
       if (error.status === 401) handleStudentSessionExpired();
       else reportStudentConnectionIssue(error);
@@ -1188,8 +1245,7 @@ function tickStudentCountdown() {
     return;
   }
   if (phase === "open" && !studentEls.waitingView.classList.contains("is-hidden")) {
-    renderStudentPayload(payload);
-    if (studentState.boundaryRefreshPending) return;
+    if (studentState.boundaryRefreshPending || studentState.pollInFlight) return;
     studentState.boundaryRefreshPending = true;
     studentApi("/api/student/me")
       .then((latest) => renderStudentPayload(latest))
