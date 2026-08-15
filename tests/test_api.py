@@ -627,7 +627,7 @@ def test_one_hundred_fifty_students_competing_for_thirty_seats_never_oversells(a
         assert final["totals"] == {"students": 150, "selected": 30, "unselected": 120}
 
 
-def test_successful_selection_builds_projection_before_committing(
+def test_successful_selection_releases_write_lock_before_full_projection(
     app,
     monkeypatch,
 ):
@@ -702,9 +702,10 @@ def test_successful_selection_builds_projection_before_committing(
             index for index, sql in enumerate(normalized) if "INSERT INTO SELECTIONS" in sql
         )
         commit_index = normalized.index("COMMIT", insert_index)
+        read_begin_index = normalized.index("BEGIN", commit_index + 1)
         projection_index = next(
             index
             for index, sql in enumerate(normalized)
             if index > insert_index and "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY" in sql
         )
-        assert insert_index < projection_index < commit_index
+        assert insert_index < commit_index < read_begin_index < projection_index
