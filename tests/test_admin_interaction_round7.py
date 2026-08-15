@@ -116,6 +116,7 @@ def test_board_qr_uses_one_compact_stage_and_reduced_motion_stays_reachable() ->
     assert portal.index('id="board-stage"') < portal.index('class="qr-frame"')
     assert portal.index('class="qr-frame"') < portal.index('id="board-stage-detail"')
     assert portal.index('id="board-stage-detail"') < portal.index('id="board-start-countdown"')
+    assert 'id="board-stage-detail" role="status" aria-live="polite" aria-atomic="true"' in portal
     assert 'class="qr-portal__action button button--primary button--wide"' in portal
     assert 'adminEls.boardStage.className = `qr-portal__status board-stage--${phase}`' in javascript
     assert javascript.count('adminEls.boardStart.className = "qr-portal__action button') == 3
