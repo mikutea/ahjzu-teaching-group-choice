@@ -732,13 +732,13 @@ function renderDashboardPhaseStatus(data, phase = dashboardPhase(data), presence
 function renderBoardStage(data, phase, presence) {
   const total = Number(data.totals?.students || 0);
   const readiness = normalizeReadiness(data.readiness);
-  adminEls.boardStage.className = `board-stage board-stage--${phase}`;
+  adminEls.boardStage.className = `qr-portal__status board-stage--${phase}`;
   adminEls.boardStart.disabled = adminState.phaseActionPending || phase === "countdown" || ((phase === "waiting" || phase === "closed") && !readiness.ready);
 
   if (phase === "countdown") {
     adminEls.boardStageLabel.textContent = "全体同步倒计时";
     adminEls.boardStageDetail.textContent = `已进入候场 ${presence.online} / ${total} 人，倒计时结束后同时进入抢选`;
-    adminEls.boardStart.className = "button button--primary button--wide";
+    adminEls.boardStart.className = "qr-portal__action button button--primary button--wide";
     startCountdownTicker(data);
     return;
   }
@@ -752,7 +752,7 @@ function renderBoardStage(data, phase, presence) {
     adminEls.boardCountdown.textContent = "LIVE";
     adminEls.boardStageDetail.textContent = `已完成 ${data.totals.selected} / ${total} 人，名额与名单每秒自动同步`;
     adminEls.boardStart.textContent = "关闭抢选";
-    adminEls.boardStart.className = "button button--secondary button--wide";
+    adminEls.boardStart.className = "qr-portal__action button button--secondary button--wide";
     return;
   }
 
@@ -761,7 +761,7 @@ function renderBoardStage(data, phase, presence) {
   adminEls.boardCountdown.textContent = "READY";
   adminEls.boardStageDetail.textContent = `已进入候场 ${presence.online} / ${total} 人，尚未进入 ${presence.absent} 人`;
   adminEls.boardStart.textContent = readiness.ready ? "开始 10 秒倒计时" : "就绪检查未通过";
-  adminEls.boardStart.className = "button button--primary button--wide";
+  adminEls.boardStart.className = "qr-portal__action button button--primary button--wide";
 }
 
 function normalizeReadiness(readiness) {

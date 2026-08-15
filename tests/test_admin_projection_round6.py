@@ -1295,5 +1295,6 @@ def test_short_desktop_projection_compacts_qr_before_hiding_countdown_action() -
 
     assert "width: min(41vh, 100%, 470px)" in compact
     assert ".qr-heading h2" in compact and "margin-bottom: 8px" in compact
-    assert ".board-stage" in compact and "margin-top: 4px" in compact
+    assert ".qr-portal__status" in compact and "margin-bottom: 4px" in compact
+    assert ".qr-portal__action" in compact and "margin-top: 4px" in compact
     assert "min-height: 44px" in compact
