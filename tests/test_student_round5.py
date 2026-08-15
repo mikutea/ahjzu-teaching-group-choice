@@ -405,6 +405,7 @@ const studentState = {
   pollInFlight: false,
   heartbeatInFlight: false,
   lastSelectedSyncAt: 0,
+  preparedCountdownKey: null,
   selectedGroupId: null,
   csrf: "csrf",
   payload: {
@@ -438,19 +439,23 @@ function renderStudentPayload(payload) {
   renderedTimingTags.push(studentResponseClockTimings.get(payload)?.tag || null);
 }
 const waitingStatus = {activity_id: 7, status: "closed", phase: "waiting", server_now: "2026-08-15T00:00:00Z", selection_opens_at: null, student_login_allowed: true, status_message: "waiting"};
-const openStatus = {activity_id: 7, status: "open", phase: "open", server_now: "2026-08-15T00:00:01Z", selection_opens_at: "2026-08-15T00:00:01Z", student_login_allowed: true, status_message: "open"};
+const countdownStatus = {activity_id: 7, status: "open", phase: "countdown", server_now: "2026-08-15T00:00:01Z", selection_opens_at: "2026-08-15T00:00:10Z", student_login_allowed: true, status_message: "countdown"};
+const openStatus = {activity_id: 7, status: "open", phase: "open", server_now: "2026-08-15T00:00:11Z", selection_opens_at: "2026-08-15T00:00:10Z", student_login_allowed: true, status_message: "open"};
 studentResponseClockTimings.set(waitingStatus, {tag: "waiting-rtt"});
+studentResponseClockTimings.set(countdownStatus, {tag: "countdown-rtt"});
 studentResponseClockTimings.set(openStatus, {tag: "open-rtt"});
 const responses = [
   waitingStatus,
+  countdownStatus,
+  {csrf_token: "csrf", phase: "countdown", selection_opens_at: "2026-08-15T00:00:10Z", selection: null, groups: [{id: 1, name: "当前教学组", full: false}], student: {id: 1}, settings: {activity_id: 7, activity_title: "压力测试", status: "open"}},
   openStatus,
-  {csrf_token: "csrf", phase: "open", selection_opens_at: "2026-08-15T00:00:01Z", selection: null, groups: [{id: 1, name: "当前教学组", full: false}], student: {id: 1}, settings: {activity_id: 7, activity_title: "压力测试", status: "open"}},
-  {csrf_token: "csrf", phase: "open", selection_opens_at: "2026-08-15T00:00:01Z", selection: null, groups: [{id: 1, name: "当前教学组", full: false}], student: {id: 1}, settings: {activity_id: 7, activity_title: "压力测试", status: "open"}},
+  {csrf_token: "csrf", phase: "open", selection_opens_at: "2026-08-15T00:00:10Z", selection: null, groups: [{id: 1, name: "当前教学组", full: false}], student: {id: 1}, settings: {activity_id: 7, activity_title: "压力测试", status: "open"}},
 ];
 async function studentApi(path) { calls.push(path); return responses.shift(); }
 eval(mergeBlock + pollingBlock);
 (async () => {
   startStudentPolling();
+  await intervalCallback();
   await intervalCallback();
   await intervalCallback();
   now = 2000;
@@ -464,14 +469,17 @@ eval(mergeBlock + pollingBlock);
         "/api/public/status",
         "/api/public/status",
         "/api/student/me",
+        "/api/public/status",
         "/api/student/me",
     ]
     assert result["renders"] == [
         "waiting:登录时旧教学组",
+        "countdown:当前教学组",
         "open:当前教学组",
         "open:当前教学组",
     ]
     assert result["renderedTimingTags"][0] == "waiting-rtt"
+    assert "countdown-rtt" in result["synchronizedTimingTags"]
     assert "open-rtt" in result["synchronizedTimingTags"]
     assert result["phase"] == "open"
 

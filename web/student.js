@@ -104,6 +104,7 @@ const studentState = {
   countdownTimer: null,
   pollInFlight: false,
   lastSelectedSyncAt: 0,
+  preparedCountdownKey: null,
   heartbeatInFlight: false,
   boundaryRefreshPending: false,
   connectionInterrupted: false,
@@ -1179,11 +1180,26 @@ function startStudentPolling() {
         const publicStatus = await studentApi("/api/public/status");
         synchronizeStudentClock(publicStatus);
         const currentActivityId = studentState.payload?.settings?.activity_id;
+        const publicPhase = studentPhase(publicStatus);
+        const countdownKey = [
+          publicStatus.activity_id,
+          publicStatus.selection_opens_at || "",
+        ].join(":");
         if (String(publicStatus.activity_id) !== String(currentActivityId)) {
           data = await studentApi("/api/student/me");
-        } else if (studentPhase(publicStatus) === "open") {
+          studentState.preparedCountdownKey = publicPhase === "countdown" || publicPhase === "open"
+            ? countdownKey
+            : null;
+        } else if (
+          (publicPhase === "countdown" || publicPhase === "open")
+          && studentState.preparedCountdownKey !== countdownKey
+        ) {
           data = await studentApi("/api/student/me");
+          studentState.preparedCountdownKey = countdownKey;
         } else {
+          if (publicPhase !== "countdown" && publicPhase !== "open") {
+            studentState.preparedCountdownKey = null;
+          }
           data = mergePublicStatusIntoStudentPayload(studentState.payload, publicStatus);
           renderStudentPayload(data);
           markStudentConnectionHealthy();

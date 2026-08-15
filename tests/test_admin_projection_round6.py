@@ -43,7 +43,7 @@ def test_topbar_is_a_board_entry_and_phase_control_stays_inside_board() -> None:
     assert "adminEls.statusButton.textContent" not in phase_render
 
 
-def test_entity_names_autosave_with_ime_guard_and_capacity_only_on_commit() -> None:
+def test_entity_names_and_capacity_autosave_with_one_module_summary() -> None:
     _, javascript, _ = _sources()
     major = javascript.split("function renderMajorEditor", 1)[1].split(
         "function renderGroupEditor", 1
@@ -57,12 +57,15 @@ def test_entity_names_autosave_with_ime_guard_and_capacity_only_on_commit() -> N
 
     assert "save-major" not in major
     assert "save-group" not in group
-    assert "makeEntitySaveState" in major and "makeEntitySaveState" in group
+    assert "makeEntitySaveState" not in major and "makeEntitySaveState" not in group
+    assert 'row.dataset.saveState = "saved"' in major
+    assert 'row.dataset.saveState = "saved"' in group
     assert 'addEventListener("compositionstart"' in wiring
     assert 'addEventListener("compositionend"' in wiring
     assert "event.isComposing" in wiring
     assert "scheduleEntityRowSave(row)" in wiring
-    assert "离开输入框后保存容量" in wiring
+    assert "等待自动保存容量" in wiring
+    assert "scheduleEntityRowSave(row, 650" in wiring
     assert "includeCapacity = event.target === row._capacityInput" in wiring
     assert "delay = 360" in javascript
     assert "saveQueued" in javascript
@@ -147,6 +150,7 @@ const clearAllRevealedActivationCodes = () => {};
 const stopRosterAutoScroll = () => {};
 const stopLiveFeedAutoScroll = () => {};
 const stopWaitingFeedAutoScroll = () => {};
+const stopGroupProgressAutoScroll = () => {};
 const renderBoardClock = () => {};
 const renderReadiness = () => {};
 const renderDashboardPhaseStatus = () => {};
@@ -642,6 +646,7 @@ const clearAllRevealedActivationCodes = () => {};
 const stopRosterAutoScroll = () => {};
 const stopLiveFeedAutoScroll = () => {};
 const stopWaitingFeedAutoScroll = () => {};
+const stopGroupProgressAutoScroll = () => {};
 const renderBoardClock = () => {};
 const renderReadiness = () => {};
 const renderDashboardPhaseStatus = () => {};
@@ -1264,7 +1269,7 @@ def test_phone_roster_defaults_to_all_and_qr_portal_is_larger_and_structured() -
     assert "输入姓名、11 位学号或专业快速查找" in html
     assert 'class="qr-portal"' in html
     assert 'class="qr-portal__instruction"' in html
-    assert "width: min(48vh, 100%, 560px)" in css
+    assert "width: min(54vh, 100%, 620px)" in css
     assert ".completion-progress + .panel-title-row" in css
     assert "margin-top: 25px" in css
 
@@ -1286,7 +1291,7 @@ def test_short_desktop_projection_compacts_qr_before_hiding_countdown_action() -
         "@media (prefers-reduced-motion: reduce)", 1
     )[0]
 
-    assert "width: min(38vh, 100%, 450px)" in compact
+    assert "width: min(41vh, 100%, 470px)" in compact
     assert ".qr-heading h2" in compact and "margin-bottom: 8px" in compact
     assert ".board-stage" in compact and "margin-top: 4px" in compact
-    assert "min-height: 48px" in compact
+    assert "min-height: 44px" in compact

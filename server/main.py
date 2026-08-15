@@ -387,6 +387,16 @@ class QuotaUpdate(StrictModel):
     capacity: int = Field(ge=0, le=1000)
 
 
+class QuotaBatchItem(StrictModel):
+    major_id: int = Field(gt=0)
+    group_id: int = Field(gt=0)
+    capacity: int = Field(ge=0, le=1000)
+
+
+class QuotaBatchUpdate(StrictModel):
+    quotas: list[QuotaBatchItem] = Field(min_length=1, max_length=2000)
+
+
 class StudentSelect(StrictModel):
     group_id: int = Field(gt=0)
 
@@ -1668,6 +1678,11 @@ def create_app(config: Config | None = None) -> FastAPI:
             ).fetchone()["count"]
             if major_selected >= quota["capacity"] or total_selected >= group["total_capacity"]:
                 raise HTTPException(status_code=409, detail="该教学组名额刚刚已满，请选择其他教学组")
+            # Receipt generation is part of the successful selection contract.  Validate
+            # its trusted public origin before inserting anything so a broken setting
+            # still fails atomically, while the expensive per-student projection can be
+            # built after the short write transaction has committed.
+            selection_receipt_public_origin(setting_dict(connection))
             now = utc_now()
             selection = connection.execute(
                 """
@@ -1686,9 +1701,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                 entity_id=selection.lastrowid,
                 details={"student_id": student_id, "group_id": group_id},
             )
-            payload = student_payload_from_connection(connection, student_id)
             connection.commit()
-            return payload
+            return student_payload_from_connection(connection, student_id)
         except Exception:
             connection.rollback()
             raise
@@ -3181,6 +3195,112 @@ def create_app(config: Config | None = None) -> FastAPI:
         finally:
             connection.close()
         return {"ok": True}
+
+    @app.put("/api/admin/quotas/batch")
+    def update_quotas_batch(payload: QuotaBatchUpdate, request: Request):
+        identity = require_session(request, "admin", csrf=True)
+        desired: dict[tuple[int, int], int] = {}
+        for item in payload.quotas:
+            key = (item.major_id, item.group_id)
+            if key in desired:
+                raise HTTPException(status_code=400, detail="批量配额中存在重复单元格")
+            desired[key] = item.capacity
+
+        connection = connect(config.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            require_expected_activity(request, connection, identity=identity)
+            ensure_closed(connection)
+
+            current: dict[tuple[int, int], int] = {}
+            selected: dict[tuple[int, int], int] = {}
+            affected_group_ids = sorted({group_id for _, group_id in desired})
+            for major_id, group_id in desired:
+                row = connection.execute(
+                    "SELECT capacity FROM quotas WHERE major_id = ? AND group_id = ?",
+                    (major_id, group_id),
+                ).fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="批量配额包含不存在的单元格")
+                current[(major_id, group_id)] = int(row["capacity"])
+                selected[(major_id, group_id)] = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) AS count
+                        FROM selections se JOIN students s ON s.id = se.student_id
+                        WHERE s.major_id = ? AND se.group_id = ? AND se.revoked_at IS NULL
+                        """,
+                        (major_id, group_id),
+                    ).fetchone()["count"]
+                )
+                if desired[(major_id, group_id)] < selected[(major_id, group_id)]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "批量配额不能小于当前已选人数："
+                            f"专业 {major_id} / 教学组 {group_id} 已选 "
+                            f"{selected[(major_id, group_id)]} 人"
+                        ),
+                    )
+
+            for group_id in affected_group_ids:
+                group = connection.execute(
+                    "SELECT name, total_capacity FROM teaching_groups WHERE id = ?",
+                    (group_id,),
+                ).fetchone()
+                if not group:
+                    raise HTTPException(status_code=404, detail="批量配额包含不存在的教学组")
+                final_total = 0
+                for quota in connection.execute(
+                    "SELECT major_id, capacity FROM quotas WHERE group_id = ?",
+                    (group_id,),
+                ).fetchall():
+                    key = (int(quota["major_id"]), group_id)
+                    final_total += desired.get(key, int(quota["capacity"]))
+                if final_total > int(group["total_capacity"]):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"{group['name']}各专业配额合计 {final_total}，"
+                            f"不能超过教学组总容量 {group['total_capacity']}"
+                        ),
+                    )
+
+            now = utc_now()
+            for (major_id, group_id), capacity in desired.items():
+                connection.execute(
+                    """
+                    UPDATE quotas SET capacity = ?, updated_at = ?
+                    WHERE major_id = ? AND group_id = ?
+                    """,
+                    (capacity, now, major_id, group_id),
+                )
+            audit(
+                connection,
+                actor_type="admin",
+                actor_id=identity.subject_id,
+                action="quota.batch.update",
+                entity_type="quota_batch",
+                entity_id=str(len(desired)),
+                details={
+                    "updates": [
+                        {
+                            "major_id": major_id,
+                            "group_id": group_id,
+                            "from": current[(major_id, group_id)],
+                            "to": capacity,
+                        }
+                        for (major_id, group_id), capacity in desired.items()
+                    ]
+                },
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return {"ok": True, "updated_count": len(desired)}
 
     @app.put("/api/admin/quotas/{major_id}/{group_id}")
     def update_quota(major_id: int, group_id: int, payload: QuotaUpdate, request: Request):
