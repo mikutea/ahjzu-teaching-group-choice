@@ -16,6 +16,15 @@ def _web_sources() -> tuple[str, str, str]:
     )
 
 
+def test_bootstrap_never_persists_the_plaintext_admin_password() -> None:
+    script = (ROOT / "deploy" / "bootstrap.sh").read_text(encoding="utf-8")
+
+    assert "rm -f -- /root/teaching-choice-initial-password.txt" in script
+    assert "> /root/teaching-choice-initial-password.txt" not in script
+    assert "服务器不会保留该明文密码" in script
+    assert "sed -i 's/^ADMIN_INITIAL_PASSWORD=.*/ADMIN_INITIAL_PASSWORD=/' .env" in script
+
+
 def test_structure_editor_has_one_save_summary_and_large_matrix_tools() -> None:
     html, javascript, css = _web_sources()
 

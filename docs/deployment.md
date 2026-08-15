@@ -20,7 +20,7 @@ sudo APP_DIR=/opt/ahjzu-teaching-group-choice \
   ./deploy/bootstrap.sh
 ```
 
-脚本会安装 Docker、生成独立应用密钥和随机初始管理员密码、构建容器、执行健康检查并启用每日 SQLite 在线备份。首次凭据仅保存在 VM 的 `/root/teaching-choice-initial-password.txt`，权限为 `600`。
+脚本会安装 Docker、生成独立应用密钥和随机初始管理员密码、构建容器、执行健康检查并启用每日 SQLite 在线备份。首次凭据只在首次部署终端显示一次；数据库初始化后 `.env` 中的初始密码会被清空，服务器不会保存管理员明文密码。请立即把终端中显示的密码存入受控密码管理器。
 `ORIGIN_BIND=127.0.0.1` 会让宿主机 80 端口只在回环地址监听，供同机
 `cloudflared` 访问，不向校园网或公网直接暴露。只有明确需要受控的局域网直连、并已经
 配置主机防火墙时，才可显式改为 `0.0.0.0`。

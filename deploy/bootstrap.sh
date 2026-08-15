@@ -11,6 +11,7 @@ PUBLIC_URL="${PUBLIC_URL:-}"
 ORIGIN_BIND_VALUE="${ORIGIN_BIND:-127.0.0.1}"
 APP_CPU_LIMIT_VALUE="${APP_CPU_LIMIT:-1.5}"
 APP_MEMORY_LIMIT_VALUE="${APP_MEMORY_LIMIT:-1g}"
+ADMIN_PASSWORD_VALUE=""
 
 if [[ ! -f "${APP_DIR}/docker-compose.yml" ]]; then
   echo "未找到 ${APP_DIR}/docker-compose.yml" >&2
@@ -36,6 +37,10 @@ if [[ "${PUBLIC_URL}" == https://* ]]; then
   COOKIE_SECURE_VALUE=true
 fi
 
+# Earlier releases persisted the bootstrap password for handoff.  Remove that
+# exact legacy artifact and keep the new plaintext credential terminal-only.
+rm -f -- /root/teaching-choice-initial-password.txt
+
 if [[ ! -f .env ]]; then
   APP_SECRET_VALUE="$(openssl rand -hex 32)"
   ADMIN_PASSWORD_VALUE="$(openssl rand -base64 18 | tr -d '\n')"
@@ -56,8 +61,6 @@ if [[ ! -f .env ]]; then
     echo "SEED_DEMO_STRUCTURE=false"
     echo "APP_VERSION=$(git rev-parse --short HEAD 2>/dev/null || echo local)"
   } > .env
-  install -m 600 /dev/null /root/teaching-choice-initial-password.txt
-  printf '账号：admin\n初始密码：%s\n管理端：%s/admin\n' "${ADMIN_PASSWORD_VALUE}" "${PUBLIC_URL}" > /root/teaching-choice-initial-password.txt
 fi
 
 docker compose up -d --build
@@ -74,7 +77,7 @@ for attempt in $(seq 1 36); do
   sleep 5
 done
 
-# 数据库已初始化后，从运行环境中移除初始密码；root 专用凭据文件保留供首次交接。
+# 数据库已初始化后，从运行环境中移除初始明文密码。
 sed -i 's/^ADMIN_INITIAL_PASSWORD=.*/ADMIN_INITIAL_PASSWORD=/' .env
 docker compose up -d
 
@@ -88,4 +91,9 @@ systemctl enable --now teaching-choice-backup.timer
 
 echo "部署完成：${PUBLIC_URL}"
 echo "源站绑定：${ORIGIN_BIND_VALUE}:80；Cloudflare Tunnel 应指向 http://127.0.0.1:80"
-echo "首次登录凭据保存在 /root/teaching-choice-initial-password.txt（权限 600）"
+if [[ -n "${ADMIN_PASSWORD_VALUE}" ]]; then
+  printf '首次登录账号：admin\n首次登录密码：%s\n管理端：%s/admin\n' "${ADMIN_PASSWORD_VALUE}" "${PUBLIC_URL}"
+  echo "请立即保存到受控密码管理器；服务器不会保留该明文密码。"
+else
+  echo "未生成新的管理员密码；服务器不保存管理员明文密码。"
+fi
