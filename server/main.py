@@ -1627,8 +1627,13 @@ def create_app(config: Config | None = None) -> FastAPI:
                 raise HTTPException(status_code=403, detail="不能代替其他学生提交选择")
             if operator != str(identity.subject_id):
                 raise HTTPException(status_code=403, detail="操作人身份校验失败")
+            phase = activity_phase(activity)
+            if source == "admin" and phase == "countdown":
+                raise HTTPException(
+                    status_code=409,
+                    detail="统一倒计时期间不能管理员补位，请等待倒计时结束",
+                )
             if require_open:
-                phase = activity_phase(activity)
                 if phase == "countdown":
                     raise HTTPException(status_code=409, detail="统一倒计时尚未结束，请等待开抢")
                 if phase != "open":
@@ -1701,8 +1706,9 @@ def create_app(config: Config | None = None) -> FastAPI:
                 entity_id=selection.lastrowid,
                 details={"student_id": student_id, "group_id": group_id},
             )
+            response_payload = student_payload_from_connection(connection, student_id)
             connection.commit()
-            return student_payload_from_connection(connection, student_id)
+            return response_payload
         except Exception:
             connection.rollback()
             raise
@@ -3787,7 +3793,12 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection = connect(config.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            require_expected_activity(request, connection, identity=identity)
+            activity = require_expected_activity(request, connection, identity=identity)
+            if activity_phase(activity) == "countdown":
+                raise HTTPException(
+                    status_code=409,
+                    detail="统一倒计时期间不能撤销选择，请等待倒计时结束",
+                )
             selection = connection.execute(
                 """
                 SELECT id, group_id FROM selections

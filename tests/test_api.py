@@ -627,7 +627,7 @@ def test_one_hundred_fifty_students_competing_for_thirty_seats_never_oversells(a
         assert final["totals"] == {"students": 150, "selected": 30, "unselected": 120}
 
 
-def test_successful_selection_commits_before_building_the_student_projection(
+def test_successful_selection_builds_projection_before_committing(
     app,
     monkeypatch,
 ):
@@ -707,4 +707,4 @@ def test_successful_selection_commits_before_building_the_student_projection(
             for index, sql in enumerate(normalized)
             if index > insert_index and "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY" in sql
         )
-        assert insert_index < commit_index < projection_index
+        assert insert_index < projection_index < commit_index

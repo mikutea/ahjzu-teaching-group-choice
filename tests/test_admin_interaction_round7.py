@@ -256,6 +256,162 @@ eval(saveFunctions);
     }
 
 
+def test_equivalent_quota_clears_pending_without_request() -> None:
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const quotaFunctions = "function quotaInputKey" + source
+  .split("function quotaInputKey", 2)[1]
+  .split("function quotaMatrixInputAt", 1)[0];
+const requests = [];
+const adminState = {quotaSaveTimers: new Map()};
+const adminEls = {
+  structureSaveSummary: null,
+  quotaMatrix: {dataset: {activityId: "7"}},
+};
+const document = {querySelector() { return null; }};
+const input = {
+  dataset: {
+    majorId: "2",
+    groupId: "3",
+    original: "10",
+    pending: "true",
+    saveState: "pending",
+  },
+  value: "010",
+  title: "按回车或离开输入框保存配额",
+  isConnected: true,
+  setCustomValidity() {},
+  reportValidity() {},
+  setAttribute() {},
+  removeAttribute() {},
+};
+function clearTimeout() {}
+function setTimeout() { throw new Error("equivalent value must not be rescheduled"); }
+async function adminApi(path, options) { requests.push({path, options}); return {}; }
+async function loadDashboard() {}
+function renderStructureSaveSummary() {}
+function renderLatestStructureAfterAutosave() {}
+function showAdminToast() {}
+eval(quotaFunctions);
+(async () => {
+  await persistQuotaInput(input);
+  process.stdout.write(JSON.stringify({
+    requests: requests.length,
+    value: input.value,
+    original: input.dataset.original,
+    pending: input.dataset.pending === "true",
+    saveState: input.dataset.saveState,
+    title: input.title,
+    timers: adminState.quotaSaveTimers.size,
+  }));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    execution = subprocess.run(
+        ["node", "-e", script, str(ROOT / "web" / "admin.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert json.loads(execution.stdout) == {
+        "requests": 0,
+        "value": "10",
+        "original": "10",
+        "pending": False,
+        "saveState": "saved",
+        "title": "",
+        "timers": 0,
+    }
+
+
+def test_empty_numeric_autosaves_never_submit_zero() -> None:
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const entityFunctions = "function entityRowSaveKey" + source
+  .split("function entityRowSaveKey", 2)[1]
+  .split("function wireEntityAutosave", 1)[0];
+const quotaFunctions = "function quotaInputKey" + source
+  .split("function quotaInputKey", 2)[1]
+  .split("function quotaMatrixInputAt", 1)[0];
+const requests = [];
+const adminState = {
+  dashboard: {settings: {activity_id: 7}},
+  entitySaveTimers: new Map(),
+  quotaSaveTimers: new Map(),
+};
+const adminEls = {
+  structureSaveSummary: null,
+  majorEditor: {dataset: {activityId: "7"}},
+  groupEditor: {dataset: {activityId: "7"}},
+  quotaMatrix: {dataset: {activityId: "7"}},
+};
+const document = {querySelector() { return null; }};
+let entityValidity = "";
+let quotaValidity = "";
+const row = {
+  dataset: {entityKind: "group", id: "3", originalName: "第一教学组", originalCapacity: "10"},
+  isConnected: true,
+  _nameInput: {value: "第一教学组", setCustomValidity() {}, reportValidity() {}},
+  _capacityInput: {
+    value: "",
+    setCustomValidity(value) { entityValidity = value; },
+    reportValidity() {},
+  },
+  setAttribute() {},
+  removeAttribute() {},
+};
+const quotaInput = {
+  dataset: {majorId: "2", groupId: "3", original: "10", pending: "true"},
+  value: "",
+  title: "",
+  isConnected: true,
+  setCustomValidity(value) { quotaValidity = value; },
+  reportValidity() {},
+  setAttribute() {},
+  removeAttribute() {},
+};
+function clearTimeout() {}
+function setTimeout() { throw new Error("empty value must not be rescheduled"); }
+async function adminApi(path, options) { requests.push({path, options}); return {}; }
+async function loadDashboard() {}
+function renderDashboard() {}
+function renderStructureSaveSummary() {}
+function renderLatestStructureAfterAutosave() {}
+function showAdminToast() {}
+eval(entityFunctions + quotaFunctions);
+(async () => {
+  await persistEntityRow(row, {includeCapacity: true});
+  await persistQuotaInput(quotaInput);
+  process.stdout.write(JSON.stringify({
+    requests: requests.length,
+    entityValidity,
+    quotaValidity,
+    entityValue: row._capacityInput.value,
+    entityOriginal: row.dataset.originalCapacity,
+    quotaValue: quotaInput.value,
+    quotaOriginal: quotaInput.dataset.original,
+  }));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    execution = subprocess.run(
+        ["node", "-e", script, str(ROOT / "web" / "admin.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    result = json.loads(execution.stdout)
+    assert result["requests"] == 0
+    assert "不能为空" in result["entityValidity"]
+    assert "不能为空" in result["quotaValidity"]
+    assert result["entityValue"] == ""
+    assert result["entityOriginal"] == "10"
+    assert result["quotaValue"] == ""
+    assert result["quotaOriginal"] == "10"
+
+
 def test_quota_clipboard_preserves_edge_cells_and_rejects_empty_values() -> None:
     _, javascript, _ = _web_sources()
     script = r"""
