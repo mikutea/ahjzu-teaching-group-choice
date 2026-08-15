@@ -45,6 +45,15 @@ def roster_csv(rows: list[tuple[str, str, str, str]]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+def test_student_entry_page_is_short_lived_edge_cacheable(client: TestClient) -> None:
+    student_page = client.get("/")
+    assert student_page.status_code == 200
+    assert student_page.headers["cache-control"] == "public, max-age=60, must-revalidate"
+
+    assert client.get("/admin").headers["cache-control"] == "no-store"
+    assert client.get("/api/public/status").headers["cache-control"] == "no-store"
+
+
 def import_roster(
     client: TestClient,
     admin_headers: dict[str, str],

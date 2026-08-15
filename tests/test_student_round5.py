@@ -221,6 +221,7 @@ eval(`
     assert result["monotonicAfterStale"] is True
     assert result["paths"] == [
         "/api/public/info",
+        "/api/public/status",
         "/api/student/login",
         "/api/student/me",
     ]
@@ -365,3 +366,226 @@ def test_success_view_keeps_syncing_for_administrator_revocation() -> None:
     assert "pollStartedAt - studentState.lastSelectedSyncAt < 5000" in polling_block
     assert "hadSelection && !data.selection" in polling_block
     assert "原选择已被管理员撤销" in polling_block
+
+
+def test_waiting_poll_uses_lightweight_public_status_until_selection_opens() -> None:
+    _, _, javascript = _student_sources()
+    merge_block = javascript.split(
+        "function mergePublicStatusIntoStudentPayload", 1
+    )[1].split("async function loadPublicInfo", 1)[0]
+    polling_block = javascript.split("function startStudentPolling", 1)[1].split(
+        "function tickStudentCountdown", 1
+    )[0]
+
+    assert 'studentApi("/api/public/status")' in polling_block
+    assert 'studentApi("/api/student/me")' in polling_block
+    assert "mergePublicStatusIntoStudentPayload" in polling_block
+    assert "activity_id" in merge_block
+    assert "selection_opens_at" in merge_block
+
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const mergeBlock = "function mergePublicStatusIntoStudentPayload" + source
+  .split("function mergePublicStatusIntoStudentPayload", 2)[1]
+  .split("async function loadPublicInfo", 1)[0];
+const pollingBlock = "function startStudentPolling" + source
+  .split("function startStudentPolling", 2)[1]
+  .split("function tickStudentCountdown", 1)[0];
+const calls = [];
+const renders = [];
+const renderedTimingTags = [];
+const synchronizedTimingTags = [];
+const studentResponseClockTimings = new WeakMap();
+let intervalCallback = null;
+let now = 1000;
+const studentState = {
+  pollTimer: null,
+  heartbeatTimer: null,
+  pollInFlight: false,
+  heartbeatInFlight: false,
+  lastSelectedSyncAt: 0,
+  selectedGroupId: null,
+  csrf: "csrf",
+  payload: {
+    phase: "waiting",
+    selection_opens_at: null,
+    selection: null,
+    groups: [{id: 1, name: "登录时旧教学组", full: false}],
+    student: {id: 1},
+    settings: {activity_id: 7, activity_title: "压力测试", status: "closed"},
+  },
+};
+global.clearInterval = () => {};
+global.setInterval = (callback, delay) => {
+  if (delay === 1000) intervalCallback = callback;
+  return delay;
+};
+function studentMonotonicNow() { return now; }
+function studentPhase(payload) { return payload.phase; }
+function rememberStudentResponseClockTiming(payload, timing) {
+  if (timing) studentResponseClockTimings.set(payload, timing);
+}
+function synchronizeStudentClock(payload) {
+  synchronizedTimingTags.push(studentResponseClockTimings.get(payload)?.tag || null);
+}
+function markStudentConnectionHealthy() {}
+function handleStudentSessionExpired() { throw new Error("unexpected expiry"); }
+function reportStudentConnectionIssue(error) { throw error; }
+function renderStudentPayload(payload) {
+  studentState.payload = payload;
+  renders.push(`${payload.phase}:${payload.groups?.[0]?.name || "no-groups"}`);
+  renderedTimingTags.push(studentResponseClockTimings.get(payload)?.tag || null);
+}
+const waitingStatus = {activity_id: 7, status: "closed", phase: "waiting", server_now: "2026-08-15T00:00:00Z", selection_opens_at: null, student_login_allowed: true, status_message: "waiting"};
+const openStatus = {activity_id: 7, status: "open", phase: "open", server_now: "2026-08-15T00:00:01Z", selection_opens_at: "2026-08-15T00:00:01Z", student_login_allowed: true, status_message: "open"};
+studentResponseClockTimings.set(waitingStatus, {tag: "waiting-rtt"});
+studentResponseClockTimings.set(openStatus, {tag: "open-rtt"});
+const responses = [
+  waitingStatus,
+  openStatus,
+  {csrf_token: "csrf", phase: "open", selection_opens_at: "2026-08-15T00:00:01Z", selection: null, groups: [{id: 1, name: "当前教学组", full: false}], student: {id: 1}, settings: {activity_id: 7, activity_title: "压力测试", status: "open"}},
+  {csrf_token: "csrf", phase: "open", selection_opens_at: "2026-08-15T00:00:01Z", selection: null, groups: [{id: 1, name: "当前教学组", full: false}], student: {id: 1}, settings: {activity_id: 7, activity_title: "压力测试", status: "open"}},
+];
+async function studentApi(path) { calls.push(path); return responses.shift(); }
+eval(mergeBlock + pollingBlock);
+(async () => {
+  startStudentPolling();
+  await intervalCallback();
+  await intervalCallback();
+  now = 2000;
+  await intervalCallback();
+  process.stdout.write(JSON.stringify({calls, renders, renderedTimingTags, synchronizedTimingTags, phase: studentState.payload.phase}));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    result = _run_node(script)
+
+    assert result["calls"] == [
+        "/api/public/status",
+        "/api/public/status",
+        "/api/student/me",
+        "/api/student/me",
+    ]
+    assert result["renders"] == [
+        "waiting:登录时旧教学组",
+        "open:当前教学组",
+        "open:当前教学组",
+    ]
+    assert result["renderedTimingTags"][0] == "waiting-rtt"
+    assert "open-rtt" in result["synchronizedTimingTags"]
+    assert result["phase"] == "open"
+
+
+def test_waiting_heartbeat_refreshes_private_state_after_admin_backfill() -> None:
+    _, _, javascript = _student_sources()
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const pollingBlock = "function startStudentPolling" + source
+  .split("function startStudentPolling", 2)[1]
+  .split("function tickStudentCountdown", 1)[0];
+const calls = [];
+const renders = [];
+let heartbeatCallback = null;
+const studentState = {
+  csrf: "csrf",
+  payload: {
+    phase: "waiting",
+    selection: null,
+    groups: [{id: 1, name: "第一教学组", full: false}],
+    student: {id: 11},
+    settings: {activity_id: 7, status: "closed"},
+  },
+  selectedGroupId: null,
+  pollTimer: null,
+  heartbeatTimer: null,
+  pollInFlight: false,
+  heartbeatInFlight: false,
+  lastSelectedSyncAt: 0,
+};
+global.clearInterval = () => {};
+global.setInterval = (callback, delay) => {
+  if (delay === 5000) heartbeatCallback = callback;
+  return delay;
+};
+function studentMonotonicNow() { return 1000; }
+function studentPhase(payload) { return payload.phase; }
+function synchronizeStudentClock() {}
+function markStudentConnectionHealthy() {}
+function handleStudentSessionExpired() { throw new Error("unexpected expiry"); }
+function reportStudentConnectionIssue(error) { throw error; }
+function showStudentMessage() {}
+function mergePublicStatusIntoStudentPayload(payload) { return payload; }
+function renderStudentPayload(payload) {
+  studentState.payload = payload;
+  renders.push(payload.selection?.group_name || null);
+}
+const responses = [
+  {ok: true, has_selection: true, phase: "waiting"},
+  {
+    csrf_token: "next-csrf",
+    phase: "waiting",
+    selection: {group_id: 3, group_name: "管理员补录教学组", selected_at: "2026-08-15T15:00:00Z"},
+    groups: [{id: 3, name: "管理员补录教学组", full: false}],
+    student: {id: 11},
+    settings: {activity_id: 7, status: "closed"},
+  },
+];
+async function studentApi(path) {
+  calls.push(path);
+  return responses.shift();
+}
+eval(pollingBlock);
+(async () => {
+  startStudentPolling();
+  await heartbeatCallback();
+  process.stdout.write(JSON.stringify({calls, renders, csrf: studentState.csrf, selection: studentState.payload.selection}));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    result = _run_node(script)
+
+    assert result["calls"] == ["/api/student/heartbeat", "/api/student/me"]
+    assert result["renders"] == ["管理员补录教学组"]
+    assert result["csrf"] == "next-csrf"
+    assert result["selection"]["group_id"] == 3
+
+
+def test_countdown_boundary_keeps_waiting_view_until_private_snapshot_arrives() -> None:
+    _, _, javascript = _student_sources()
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const countdownBlock = "function tickStudentCountdown" + source
+  .split("function tickStudentCountdown", 2)[1]
+  .split('studentEls.loginForm.addEventListener', 1)[0];
+const renders = [];
+const calls = [];
+let resolvePrivateSnapshot;
+const studentState = {
+  payload: {phase: "open", groups: [{name: "登录时旧教学组"}], selection: null},
+  boundaryRefreshPending: false,
+  pollInFlight: false,
+};
+const studentEls = {
+  waitingView: {classList: {contains: () => false}},
+};
+function studentPhase() { return "open"; }
+function renderStudentPayload(payload) { renders.push(payload.groups[0].name); }
+function studentApi(path) {
+  calls.push(path);
+  return new Promise((resolve) => { resolvePrivateSnapshot = resolve; });
+}
+eval(countdownBlock);
+(async () => {
+  tickStudentCountdown();
+  const beforePrivateSnapshot = [...renders];
+  resolvePrivateSnapshot({phase: "open", groups: [{name: "当前教学组"}], selection: null});
+  await new Promise((resolve) => setImmediate(resolve));
+  process.stdout.write(JSON.stringify({calls, beforePrivateSnapshot, renders}));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    result = _run_node(script)
+
+    assert result["calls"] == ["/api/student/me"]
+    assert result["beforePrivateSnapshot"] == []
+    assert result["renders"] == ["当前教学组"]
