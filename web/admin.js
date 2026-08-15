@@ -2239,7 +2239,13 @@ async function persistEntityRow(row, { refreshAfter = false, includeCapacity = f
       activityId,
     });
     if (nameChanged) row.dataset.originalName = submittedName;
-    if (capacityChanged) row.dataset.originalCapacity = String(submittedCapacity);
+    if (capacityChanged) {
+      const canonicalCapacity = String(submittedCapacity);
+      row.dataset.originalCapacity = canonicalCapacity;
+      if (Number(row._capacityInput.value) === submittedCapacity) {
+        row._capacityInput.value = canonicalCapacity;
+      }
+    }
     setEntitySaveState(row, "saved", "已自动保存");
     if (result?.quotas_adjusted || result?.quota_adjustments?.length) {
       showAdminToast("教学组容量已保存，专业配额已按已选下限自动重算", "success");
@@ -2662,7 +2668,7 @@ adminEls.quotaMatrix.addEventListener("keydown", (event) => {
 });
 
 function quotaClipboardRows(clipboard) {
-  const withoutTerminalLineEndings = clipboard.replace(/(?:\r\n|\r|\n)+$/, "");
+  const withoutTerminalLineEndings = clipboard.replace(/(?:\r\n|\r|\n)$/, "");
   return withoutTerminalLineEndings.split(/\r\n|\r|\n/).map((line) => line.split("\t"));
 }
 

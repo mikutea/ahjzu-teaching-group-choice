@@ -41,6 +41,25 @@ scrub_initial_password() {
   fi
 }
 
+write_initial_password_without_argv() {
+  local line=""
+  local password_line_found=false
+  local -a env_lines=()
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" == ADMIN_INITIAL_PASSWORD=* ]]; then
+      env_lines+=("ADMIN_INITIAL_PASSWORD=${ADMIN_PASSWORD_VALUE}")
+      password_line_found=true
+    else
+      env_lines+=("${line}")
+    fi
+  done < .env
+  if [[ "${password_line_found}" != true ]]; then
+    env_lines+=("ADMIN_INITIAL_PASSWORD=${ADMIN_PASSWORD_VALUE}")
+  fi
+  printf '%s\n' "${env_lines[@]}" > .env
+}
+
 database_bootstrap_state() {
   local database_path="data/teaching-choice.db"
   local schema_version=""
@@ -153,11 +172,7 @@ elif [[ "${DATABASE_BOOTSTRAP_STATE}" == "empty" ]]; then
   # Its exit trap scrubbed .env, so generate and hand off a fresh credential.
   ADMIN_PASSWORD_VALUE="$(openssl rand -base64 18 | tr -d '\n')"
   BOOTSTRAP_PASSWORD_ACTIVE=true
-  if grep -q '^ADMIN_INITIAL_PASSWORD=' .env; then
-    sed -i "s|^ADMIN_INITIAL_PASSWORD=.*|ADMIN_INITIAL_PASSWORD=${ADMIN_PASSWORD_VALUE}|" .env
-  else
-    printf 'ADMIN_INITIAL_PASSWORD=%s\n' "${ADMIN_PASSWORD_VALUE}" >> .env
-  fi
+  write_initial_password_without_argv
 else
   # Existing databases authenticate against the stored password hash and never
   # need the bootstrap plaintext again.

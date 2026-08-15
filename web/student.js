@@ -1262,6 +1262,14 @@ function tickStudentCountdown() {
   }
   if (phase === "open" && !studentEls.waitingView.classList.contains("is-hidden")) {
     if (studentState.boundaryRefreshPending || studentState.pollInFlight) return;
+    const countdownKey = [
+      payload.settings?.activity_id ?? payload.activity_id,
+      payload.selection_opens_at || payload.settings?.selection_opens_at || "",
+    ].join(":");
+    if (studentState.preparedCountdownKey && studentState.preparedCountdownKey === countdownKey) {
+      renderStudentPayload(payload);
+      return;
+    }
     studentState.boundaryRefreshPending = true;
     studentApi("/api/student/me")
       .then((latest) => renderStudentPayload(latest))

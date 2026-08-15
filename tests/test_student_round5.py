@@ -558,7 +558,46 @@ eval(pollingBlock);
     assert result["selection"]["group_id"] == 3
 
 
-def test_countdown_boundary_keeps_waiting_view_until_private_snapshot_arrives() -> None:
+def test_countdown_boundary_reuses_prepared_snapshot_without_refetch() -> None:
+    _, _, javascript = _student_sources()
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const countdownBlock = "function tickStudentCountdown" + source
+  .split("function tickStudentCountdown", 2)[1]
+  .split('studentEls.loginForm.addEventListener', 1)[0];
+const renders = [];
+const calls = [];
+const selectionOpensAt = "2026-08-15T00:00:10Z";
+const studentState = {
+  payload: {
+    phase: "open",
+    selection_opens_at: selectionOpensAt,
+    groups: [{name: "倒计时期间准备的教学组"}],
+    selection: null,
+    settings: {activity_id: 7, selection_opens_at: selectionOpensAt},
+  },
+  preparedCountdownKey: `7:${selectionOpensAt}`,
+  boundaryRefreshPending: false,
+  pollInFlight: false,
+};
+const studentEls = {
+  waitingView: {classList: {contains: () => false}},
+};
+function studentPhase() { return "open"; }
+function renderStudentPayload(payload) { renders.push(payload.groups[0].name); }
+function studentApi(path) { calls.push(path); throw new Error("prepared snapshot must avoid refetch"); }
+eval(countdownBlock);
+tickStudentCountdown();
+process.stdout.write(JSON.stringify({calls, renders}));
+"""
+    result = _run_node(script)
+
+    assert result["calls"] == []
+    assert result["renders"] == ["倒计时期间准备的教学组"]
+
+
+def test_countdown_boundary_fetches_when_no_snapshot_was_prepared() -> None:
     _, _, javascript = _student_sources()
     script = r"""
 const fs = require("fs");
@@ -571,6 +610,7 @@ const calls = [];
 let resolvePrivateSnapshot;
 const studentState = {
   payload: {phase: "open", groups: [{name: "登录时旧教学组"}], selection: null},
+  preparedCountdownKey: null,
   boundaryRefreshPending: false,
   pollInFlight: false,
 };
