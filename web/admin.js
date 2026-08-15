@@ -2194,7 +2194,14 @@ async function persistEntityRow(row, { refreshAfter = false, includeCapacity = f
     && row.dataset.entityKind === "group"
     && row._capacityInput.value !== row.dataset.originalCapacity;
   if (capacityChanged) {
-    submittedCapacity = Number(row._capacityInput.value);
+    const rawCapacity = row._capacityInput.value.trim();
+    if (!rawCapacity) {
+      row._capacityInput.setCustomValidity("教学组容量不能为空");
+      row._capacityInput.reportValidity();
+      setEntitySaveState(row, "error", "容量不能为空");
+      return;
+    }
+    submittedCapacity = Number(rawCapacity);
     if (!Number.isInteger(submittedCapacity) || submittedCapacity < 0 || submittedCapacity > 1000) {
       row._capacityInput.setCustomValidity("请输入 0 至 1000 的整数");
       row._capacityInput.reportValidity();
@@ -2344,6 +2351,14 @@ function wireEntityAutosave(editor) {
       setEntitySaveState(row, "pending", input.dataset.composing === "true" || event.isComposing ? "正在输入…" : "等待自动保存");
       if (input.dataset.composing !== "true" && !event.isComposing) scheduleEntityRowSave(row);
     } else {
+      if (!input.value.trim()) {
+        const key = entityRowSaveKey(row);
+        clearTimeout(adminState.entitySaveTimers.get(key));
+        adminState.entitySaveTimers.delete(key);
+        input.setCustomValidity("教学组容量不能为空");
+        setEntitySaveState(row, "error", "容量不能为空");
+        return;
+      }
       setEntitySaveState(row, "pending", "等待自动保存容量");
       scheduleEntityRowSave(row, 650, { refreshAfter: true, includeCapacity: true });
     }
@@ -2454,7 +2469,17 @@ async function persistQuotaInput(input) {
     input.dataset.saveQueued = "true";
     return;
   }
-  const nextValue = Number(input.value);
+  const rawValue = input.value.trim();
+  if (!rawValue) {
+    input.setCustomValidity("配额不能为空");
+    input.reportValidity();
+    input.dataset.saveState = "error";
+    input.dataset.pending = "true";
+    input.title = "配额不能为空";
+    notifyQuotaStructureSaveSummary();
+    return;
+  }
+  const nextValue = Number(rawValue);
   if (!Number.isInteger(nextValue) || nextValue < 0 || nextValue > 1000) {
     input.setCustomValidity("请输入 0 至 1000 的整数");
     input.reportValidity();
@@ -2464,7 +2489,11 @@ async function persistQuotaInput(input) {
   }
   input.setCustomValidity("");
   if (String(nextValue) === input.dataset.original) {
+    input.value = String(nextValue);
+    delete input.dataset.pending;
+    delete input.dataset.saveQueued;
     input.dataset.saveState = "saved";
+    input.title = "";
     notifyQuotaStructureSaveSummary();
     return;
   }
@@ -2478,7 +2507,9 @@ async function persistQuotaInput(input) {
   try {
     await adminApi(`/api/admin/quotas/${input.dataset.majorId}/${input.dataset.groupId}`, { method: "PUT", body: JSON.stringify({ capacity: nextValue }), activityId });
     input.dataset.original = submittedValue;
-    if (input.value === submittedValue) {
+    const currentRawValue = input.value.trim();
+    if (currentRawValue && Number(currentRawValue) === nextValue) {
+      input.value = submittedValue;
       delete input.dataset.pending;
       input.title = "";
     } else {
@@ -2636,6 +2667,17 @@ async function applyQuotaBatch(capacityByInput, label) {
 adminEls.quotaMatrix.addEventListener("input", (event) => {
   const input = event.target.closest("input[data-major-id]");
   if (!input) return;
+  if (!input.value.trim()) {
+    const key = quotaInputKey(input);
+    clearTimeout(adminState.quotaSaveTimers.get(key));
+    adminState.quotaSaveTimers.delete(key);
+    input.setCustomValidity("配额不能为空");
+    input.dataset.pending = "true";
+    input.dataset.saveState = "error";
+    input.title = "配额不能为空";
+    notifyQuotaStructureSaveSummary();
+    return;
+  }
   input.setCustomValidity("");
   input.dataset.pending = String(input.value !== input.dataset.original);
   input.dataset.saveState = input.dataset.pending === "true" ? "pending" : "saved";
