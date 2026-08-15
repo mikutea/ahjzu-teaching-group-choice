@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#7f292f">
   <title>教学组抢选 · 管理端</title>
-  <link rel="stylesheet" href="/assets/app.css">
+  <link rel="stylesheet" href="/assets/app.css?v=20260816-round7">
 </head>
 <body class="admin-body">
   <section id="admin-login-view" class="admin-login-shell">
@@ -115,8 +115,12 @@
                 </article>
               </div>
               <div class="waiting-overview__progress">
-                <div class="progress-label"><span>候场完成率</span><strong id="waiting-rate">0%</strong></div>
+                <div class="waiting-overview__progress-heading">
+                  <div><span>候场完成率</span><small id="waiting-rate-count">0 / 0 人</small></div>
+                  <strong id="waiting-rate">0%</strong>
+                </div>
                 <div class="progress-track"><span id="waiting-rate-bar"></span></div>
+                <div class="waiting-overview__progress-scale" aria-hidden="true"><span>等待核验</span><span>候场就绪</span></div>
               </div>
               <div class="waiting-feed-shell">
                 <div class="waiting-feed-shell__heading"><strong>实时进入候场</strong><span id="waiting-feed-state">实时更新</span></div>
@@ -226,7 +230,9 @@
       <section id="view-structure" class="admin-view is-hidden">
         <div class="page-heading">
           <div><p class="eyebrow">DYNAMIC STRUCTURE</p><h2>专业与教学组</h2><p>名称和数量均可自定义增减；开放抢选后自动锁定结构。</p></div>
-          <span id="structure-lock-hint" class="lock-hint">当前可编辑</span>
+          <div class="structure-heading-status">
+            <span id="structure-save-summary" class="structure-save-summary is-saved" role="status" aria-live="polite">已全部保存 · 当前可编辑</span>
+          </div>
         </div>
         <div class="structure-grid">
           <section class="content-card">
@@ -235,6 +241,11 @@
               <input name="name" maxlength="80" required placeholder="例如：室内设计">
               <button class="button button--primary" type="submit">＋ 新增专业</button>
             </form>
+            <label class="entity-filter">
+              <span aria-hidden="true">⌕</span>
+              <input id="structure-major-search" type="search" placeholder="筛选专业名称">
+              <small id="major-visible-count">显示全部</small>
+            </label>
             <div id="major-editor" class="entity-editor"></div>
           </section>
           <section class="content-card">
@@ -244,6 +255,11 @@
               <input name="capacity" type="number" min="0" max="1000" step="1" inputmode="numeric" value="30" aria-label="总容量">
               <button class="button button--primary" type="submit">＋ 新增教学组</button>
             </form>
+            <label class="entity-filter">
+              <span aria-hidden="true">⌕</span>
+              <input id="structure-group-search" type="search" placeholder="筛选教学组名称">
+              <small id="group-visible-count">显示全部</small>
+            </label>
             <div id="group-editor" class="entity-editor"></div>
           </section>
         </div>
@@ -251,6 +267,18 @@
           <div class="content-card__heading">
             <div><h3>专业 × 教学组配额矩阵</h3><p>矩阵随专业、教学组和总容量实时变化；手动调整单格时仍会校验已选人数和该组总容量。</p></div>
             <span class="legend-chip"><i></i> 已选 / 配额</span>
+          </div>
+          <div class="quota-workbench">
+            <div class="quota-workbench__guide">
+              <strong>快速编辑</strong>
+              <span>上方两个筛选框会同步缩小矩阵；支持粘贴 Excel 多行多列，Tab 横移、Enter 下移。</span>
+            </div>
+            <form id="quota-batch-form" class="quota-batch-form">
+              <span>当前筛选结果</span>
+              <strong id="quota-batch-count">0 个可编辑单元格</strong>
+              <label><span>统一设为</span><input id="quota-batch-value" type="number" min="0" max="1000" step="1" inputmode="numeric" value="0" aria-label="批量配额值"></label>
+              <button class="button button--outline" type="submit">批量应用</button>
+            </form>
           </div>
           <div id="quota-matrix" class="quota-matrix"></div>
         </section>
@@ -386,6 +414,6 @@
     </form>
   </dialog>
 
-  <script src="/assets/admin.js" defer></script>
+  <script src="/assets/admin.js?v=20260816-round7" defer></script>
 </body>
 </html>
