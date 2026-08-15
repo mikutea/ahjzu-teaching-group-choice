@@ -77,6 +77,11 @@ for attempt in $(seq 1 36); do
   sleep 5
 done
 
+if [[ -n "${ADMIN_PASSWORD_VALUE}" ]]; then
+  printf '首次登录账号：admin\n首次登录密码：%s\n管理端：%s/admin\n' "${ADMIN_PASSWORD_VALUE}" "${PUBLIC_URL}"
+  echo "请立即保存到受控密码管理器；服务器不会保留该明文密码。"
+fi
+
 # 数据库已初始化后，从运行环境中移除初始明文密码。
 sed -i 's/^ADMIN_INITIAL_PASSWORD=.*/ADMIN_INITIAL_PASSWORD=/' .env
 docker compose up -d
@@ -91,9 +96,4 @@ systemctl enable --now teaching-choice-backup.timer
 
 echo "部署完成：${PUBLIC_URL}"
 echo "源站绑定：${ORIGIN_BIND_VALUE}:80；Cloudflare Tunnel 应指向 http://127.0.0.1:80"
-if [[ -n "${ADMIN_PASSWORD_VALUE}" ]]; then
-  printf '首次登录账号：admin\n首次登录密码：%s\n管理端：%s/admin\n' "${ADMIN_PASSWORD_VALUE}" "${PUBLIC_URL}"
-  echo "请立即保存到受控密码管理器；服务器不会保留该明文密码。"
-else
-  echo "未生成新的管理员密码；服务器不保存管理员明文密码。"
-fi
+echo "服务器不保存管理员明文密码。"
