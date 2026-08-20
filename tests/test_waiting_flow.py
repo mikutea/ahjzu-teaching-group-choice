@@ -813,6 +813,7 @@ def test_same_student_same_group_retry_is_idempotent_after_commit(
     app,
     client: TestClient,
     admin_headers: dict[str, str],
+    monkeypatch,
 ):
     dashboard = client.get("/api/admin/dashboard").json()
     activity_id = int(dashboard["settings"]["activity_id"])
@@ -840,15 +841,48 @@ def test_same_student_same_group_retry_is_idempotent_after_commit(
             headers=headers,
             json={"group_id": group["id"]},
         )
+        assert first.status_code == 200, first.text
+        closed = client.post(
+            "/api/admin/status",
+            headers=admin_headers,
+            json={"status": "closed"},
+        )
+        assert closed.status_code == 200, closed.text
+        traces: list[tuple[str, list[str]]] = []
+        original_connect = main_module.connect
+
+        def traced_connect(database_path):
+            connection = original_connect(database_path)
+            statements: list[str] = []
+            traces.append((threading.current_thread().name, statements))
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        monkeypatch.setattr(main_module, "connect", traced_connect)
         replay = student.post(
             "/api/student/select",
             headers=headers,
             json={"group_id": group["id"]},
         )
-        assert first.status_code == 200, first.text
         assert replay.status_code == 200, replay.text
+        assert replay.json()["phase"] == "closed"
         assert replay.json()["selection"] == first.json()["selection"]
         assert replay.json()["receipt"]["token"] == first.json()["receipt"]["token"]
+        writer_statements = next(
+            statements for thread_name, statements in traces if thread_name == "sqlite-batch-writer"
+        )
+        assert not any(
+            "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY"
+            in " ".join(statement.upper().split())
+            for statement in writer_statements
+        )
+        assert any(
+            "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY"
+            in " ".join(statement.upper().split())
+            for thread_name, statements in traces
+            if thread_name != "sqlite-batch-writer"
+            for statement in statements
+        )
         connection = connect(client.app.state.config.database_path)
         try:
             assert connection.execute(

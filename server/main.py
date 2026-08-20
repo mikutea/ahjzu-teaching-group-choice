@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
+from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
@@ -950,7 +951,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         return claims, receipt_verification_code(expected_signature)
 
     @lru_cache(maxsize=2_048)
-    def receipt_qr_png_bytes(verify_url: str) -> bytes:
+    def cached_receipt_qr_png_bytes(verify_url: str) -> bytes:
         """Cache a student's deterministic QR for refreshes within this worker."""
 
         qr = qrcode.QRCode(
@@ -966,7 +967,35 @@ def create_app(config: Config | None = None) -> FastAPI:
         image.save(output, format="PNG")
         return output.getvalue()
 
-    app.state.receipt_qr_cache = receipt_qr_png_bytes
+    receipt_qr_inflight_lock = threading.Lock()
+    receipt_qr_inflight: dict[str, Future[bytes]] = {}
+
+    def receipt_qr_png_bytes(verify_url: str) -> bytes:
+        """Share one render across concurrent misses for the same receipt URL."""
+
+        with receipt_qr_inflight_lock:
+            future = receipt_qr_inflight.get(verify_url)
+            owner = future is None
+            if future is None:
+                future = Future()
+                receipt_qr_inflight[verify_url] = future
+        if not owner:
+            return future.result()
+        try:
+            rendered = cached_receipt_qr_png_bytes(verify_url)
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        else:
+            future.set_result(rendered)
+            return rendered
+        finally:
+            with receipt_qr_inflight_lock:
+                if receipt_qr_inflight.get(verify_url) is future:
+                    receipt_qr_inflight.pop(verify_url, None)
+
+    app.state.receipt_qr_cache = cached_receipt_qr_png_bytes
+    app.state.receipt_qr_renderer = receipt_qr_png_bytes
 
     def validated_activity_archive(
         activity: sqlite3.Row,
@@ -1669,7 +1698,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             "settings": settings,
         }
 
-    def choose_group(
+    async def choose_group(
         *,
         request: Request,
         identity: Identity,
@@ -1679,7 +1708,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         operator: str,
         require_open: bool,
     ) -> dict[str, Any]:
-        def persist_selection(connection: sqlite3.Connection) -> dict[str, Any]:
+        def persist_selection(
+            connection: sqlite3.Connection,
+        ) -> dict[str, Any] | None:
             activity = require_expected_activity(
                 request, connection, identity=identity
             )
@@ -1689,17 +1720,6 @@ def create_app(config: Config | None = None) -> FastAPI:
                 raise HTTPException(status_code=403, detail="不能代替其他学生提交选择")
             if operator != str(identity.subject_id):
                 raise HTTPException(status_code=403, detail="操作人身份校验失败")
-            phase = activity_phase(activity)
-            if source == "admin" and phase == "countdown":
-                raise HTTPException(
-                    status_code=409,
-                    detail="统一倒计时期间不能管理员补位，请等待倒计时结束",
-                )
-            if require_open:
-                if phase == "countdown":
-                    raise HTTPException(status_code=409, detail="统一倒计时尚未结束，请等待开抢")
-                if phase != "open":
-                    raise HTTPException(status_code=409, detail="抢选尚未开放或已经结束")
             student = connection.execute(
                 """
                 SELECT s.id, s.student_no, s.name, s.major_id, s.active,
@@ -1722,9 +1742,21 @@ def create_app(config: Config | None = None) -> FastAPI:
                 if source == "student" and int(existing["group_id"]) == group_id:
                     # A client may retry after losing the successful response. The
                     # unique active-selection invariant makes the same choice safe
-                    # to replay without a second insert or audit record.
-                    return student_payload_from_connection(connection, student_id)
+                    # to replay without a second insert or audit record. The full
+                    # projection is deliberately built after this transaction.
+                    return None
                 raise HTTPException(status_code=409, detail="你已经完成选择，不能重复提交")
+            phase = activity_phase(activity)
+            if source == "admin" and phase == "countdown":
+                raise HTTPException(
+                    status_code=409,
+                    detail="统一倒计时期间不能管理员补位，请等待倒计时结束",
+                )
+            if require_open:
+                if phase == "countdown":
+                    raise HTTPException(status_code=409, detail="统一倒计时尚未结束，请等待开抢")
+                if phase != "open":
+                    raise HTTPException(status_code=409, detail="抢选尚未开放或已经结束")
             group = connection.execute(
                 "SELECT id, name, active, total_capacity FROM teaching_groups WHERE id = ?",
                 (group_id,),
@@ -1777,7 +1809,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                         and replay is not None
                         and int(replay["group_id"]) == group_id
                     ):
-                        return student_payload_from_connection(connection, student_id)
+                        return None
                     raise HTTPException(
                         status_code=409, detail="你已经完成选择，不能重复提交"
                     ) from exc
@@ -1827,7 +1859,16 @@ def create_app(config: Config | None = None) -> FastAPI:
             )
             return committed_payload
 
-        return sqlite_writer.submit(persist_selection, priority=0)
+        committed_payload = await sqlite_writer.submit_async(
+            persist_selection, priority=0
+        )
+        if committed_payload is not None:
+            return committed_payload
+        projection_connection = connect(config.database_path)
+        try:
+            return student_payload_from_connection(projection_connection, student_id)
+        finally:
+            projection_connection.close()
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
@@ -2062,7 +2103,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.close()
 
     @app.post("/api/student/login")
-    def student_login(
+    async def student_login(
         payload: StudentLogin, request: Request, response: Response
     ):
         ip_key = client_key(request, "student-login-ip")
@@ -2162,7 +2203,9 @@ def create_app(config: Config | None = None) -> FastAPI:
             )
             return student_id
 
-        student_id = sqlite_writer.submit(persist_student_login, priority=5)
+        student_id = await sqlite_writer.submit_async(
+            persist_student_login, priority=5
+        )
         if id_key is not None:
             student_id_limiter.clear(id_key)
 
@@ -2188,7 +2231,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.close()
 
     @app.post("/api/student/heartbeat")
-    def student_heartbeat(request: Request):
+    async def student_heartbeat(request: Request):
         """Refresh waiting-room presence without turning every poll into a write.
 
         The browser may call this every five seconds.  SQLite is updated at most once
@@ -2221,7 +2264,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                         (now_text, identity.token_hash, write_cutoff),
                     )
 
-                sqlite_writer.submit(persist_heartbeat, priority=10)
+                await sqlite_writer.submit_async(persist_heartbeat, priority=10)
             has_selection = bool(
                 connection.execute(
                     """
@@ -2247,9 +2290,9 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.close()
 
     @app.post("/api/student/select")
-    def student_select(payload: StudentSelect, request: Request):
+    async def student_select(payload: StudentSelect, request: Request):
         identity = require_session(request, "student", csrf=True)
-        result = choose_group(
+        result = await choose_group(
             request=request,
             identity=identity,
             student_id=identity.subject_id,
@@ -3898,9 +3941,9 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.close()
 
     @app.post("/api/admin/selections")
-    def admin_assign(payload: AdminAssign, request: Request):
+    async def admin_assign(payload: AdminAssign, request: Request):
         identity = require_session(request, "admin", csrf=True)
-        choose_group(
+        await choose_group(
             request=request,
             identity=identity,
             student_id=payload.student_id,
