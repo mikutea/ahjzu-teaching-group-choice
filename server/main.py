@@ -10,12 +10,15 @@ import secrets
 import sqlite3
 import threading
 import time
+from contextlib import asynccontextmanager
+from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from http.cookies import CookieError, SimpleCookie
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Callable, Literal
 from urllib.parse import quote
 
 import qrcode
@@ -58,6 +61,11 @@ from .student_identity import (
     normalize_student_name,
     normalize_student_number,
 )
+from .write_batch import (
+    SQLiteBatchWriter,
+    SQLiteWriteQueueClosed,
+    SQLiteWriteQueueFull,
+)
 
 
 WEB_ROOT = PROJECT_ROOT / "web"
@@ -80,6 +88,49 @@ RECEIPT_RATE_WINDOW_SECONDS = 300
 RECEIPT_TOKEN_VERIFY_LIMIT = 30
 RECEIPT_SHARED_IP_DISTINCT_LIMIT = 500
 RECEIPT_INVALID_IP_LIMIT = 5_000
+RESPONSE_FINALIZER_SCOPE_KEY = "teaching_choice.response_finalizer"
+
+
+class PrincipalResponseGate:
+    """Keep one response-producing request active for each logical principal."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active: set[int] = set()
+
+    def try_acquire(self, principal_id: int) -> Callable[[], None] | None:
+        with self._lock:
+            if principal_id in self._active:
+                return None
+            self._active.add(principal_id)
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            with self._lock:
+                if released:
+                    return
+                released = True
+                self._active.discard(principal_id)
+
+        return release
+
+
+class ResponseFinalizerMiddleware:
+    """Run request finalizers after the outer server-facing ASGI send."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            finalizer = scope.pop(RESPONSE_FINALIZER_SCOPE_KEY, None)
+            if callable(finalizer):
+                finalizer()
 RECEIPT_TOKEN_VERSION = "v2"
 RECEIPT_SNAPSHOT_VERSION = 1
 
@@ -594,13 +645,43 @@ def create_app(config: Config | None = None) -> FastAPI:
     receipt_verify_ip_limiter = DistinctRateLimiter()
     receipt_invalid_limiter = RateLimiter()
     receipt_qr_limiter = RateLimiter()
+    student_login_response_gate = PrincipalResponseGate()
+    # Resolve ``connect`` at execution time so tests and operational probes can
+    # instrument the exact writer connection without bypassing the coordinator.
+    sqlite_writer = SQLiteBatchWriter(
+        config.database_path,
+        batch_size=config.sqlite_write_batch_size,
+        queue_limit=config.sqlite_write_queue_limit,
+        batch_window_seconds=config.sqlite_write_batch_window_ms / 1_000,
+        connect_factory=lambda path: connect(path),
+    )
+    lifespan_lock = threading.Lock()
+    lifespan_users = 0
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        nonlocal lifespan_users
+        with lifespan_lock:
+            if lifespan_users == 0:
+                sqlite_writer.open()
+            lifespan_users += 1
+        try:
+            yield
+        finally:
+            with lifespan_lock:
+                lifespan_users -= 1
+                if lifespan_users == 0:
+                    sqlite_writer.close()
+
     app = FastAPI(
         title="教学组抢选系统",
         docs_url=None if config.environment == "production" else "/api/docs",
         redoc_url=None,
         openapi_url=None if config.environment == "production" else "/api/openapi.json",
+        lifespan=lifespan,
     )
     app.state.config = config
+    app.state.sqlite_writer = sqlite_writer
     app.add_middleware(
         ImportBodyLimitMiddleware,
         database_path=config.database_path,
@@ -634,6 +715,10 @@ def create_app(config: Config | None = None) -> FastAPI:
                 response.headers["Cache-Control"] = "no-store"
         return response
 
+    # This pure ASGI layer is intentionally registered after BaseHTTPMiddleware
+    # so it is outermost and observes the actual server-facing send completion.
+    app.add_middleware(ResponseFinalizerMiddleware)
+
     @app.exception_handler(sqlite3.IntegrityError)
     async def sqlite_integrity_error(_: Request, exc: sqlite3.IntegrityError):
         message = str(exc).lower()
@@ -653,6 +738,15 @@ def create_app(config: Config | None = None) -> FastAPI:
                 headers={"Retry-After": "1"},
             )
         raise exc
+
+    @app.exception_handler(SQLiteWriteQueueFull)
+    @app.exception_handler(SQLiteWriteQueueClosed)
+    async def sqlite_write_queue_unavailable(_: Request, __: RuntimeError):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "当前提交人数较多，服务器正在按顺序处理，请稍候重试"},
+            headers={"Retry-After": "1"},
+        )
 
     def client_key(request: Request, namespace: str) -> str:
         host = resolve_client_host(request, config.trusted_proxy_ips)
@@ -903,6 +997,53 @@ def create_app(config: Config | None = None) -> FastAPI:
         except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail="凭证无效或已损坏") from exc
         return claims, receipt_verification_code(expected_signature)
+
+    @lru_cache(maxsize=2_048)
+    def cached_receipt_qr_png_bytes(verify_url: str) -> bytes:
+        """Cache a student's deterministic QR for refreshes within this worker."""
+
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_Q,
+            box_size=8,
+            border=4,
+        )
+        qr.add_data(verify_url)
+        qr.make(fit=True)
+        image = qr.make_image(fill_color="#241a1c", back_color="#ffffff")
+        output = io.BytesIO()
+        image.save(output, format="PNG")
+        return output.getvalue()
+
+    receipt_qr_inflight_lock = threading.Lock()
+    receipt_qr_inflight: dict[str, Future[bytes]] = {}
+
+    def receipt_qr_png_bytes(verify_url: str) -> bytes:
+        """Share one render across concurrent misses for the same receipt URL."""
+
+        with receipt_qr_inflight_lock:
+            future = receipt_qr_inflight.get(verify_url)
+            owner = future is None
+            if future is None:
+                future = Future()
+                receipt_qr_inflight[verify_url] = future
+        if not owner:
+            return future.result()
+        try:
+            rendered = cached_receipt_qr_png_bytes(verify_url)
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        else:
+            future.set_result(rendered)
+            return rendered
+        finally:
+            with receipt_qr_inflight_lock:
+                if receipt_qr_inflight.get(verify_url) is future:
+                    receipt_qr_inflight.pop(verify_url, None)
+
+    app.state.receipt_qr_cache = cached_receipt_qr_png_bytes
+    app.state.receipt_qr_renderer = receipt_qr_png_bytes
 
     def validated_activity_archive(
         activity: sqlite3.Row,
@@ -1605,7 +1746,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             "settings": settings,
         }
 
-    def choose_group(
+    async def choose_group(
         *,
         request: Request,
         identity: Identity,
@@ -1615,9 +1756,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         operator: str,
         require_open: bool,
     ) -> dict[str, Any]:
-        connection = connect(config.database_path)
-        try:
-            connection.execute("BEGIN IMMEDIATE")
+        def persist_selection(
+            connection: sqlite3.Connection,
+        ) -> dict[str, Any]:
             activity = require_expected_activity(
                 request, connection, identity=identity
             )
@@ -1627,17 +1768,6 @@ def create_app(config: Config | None = None) -> FastAPI:
                 raise HTTPException(status_code=403, detail="不能代替其他学生提交选择")
             if operator != str(identity.subject_id):
                 raise HTTPException(status_code=403, detail="操作人身份校验失败")
-            phase = activity_phase(activity)
-            if source == "admin" and phase == "countdown":
-                raise HTTPException(
-                    status_code=409,
-                    detail="统一倒计时期间不能管理员补位，请等待倒计时结束",
-                )
-            if require_open:
-                if phase == "countdown":
-                    raise HTTPException(status_code=409, detail="统一倒计时尚未结束，请等待开抢")
-                if phase != "open":
-                    raise HTTPException(status_code=409, detail="抢选尚未开放或已经结束")
             student = connection.execute(
                 """
                 SELECT s.id, s.student_no, s.name, s.major_id, s.active,
@@ -1649,12 +1779,84 @@ def create_app(config: Config | None = None) -> FastAPI:
             ).fetchone()
             if not student or not student["active"] or not student["major_active"]:
                 raise HTTPException(status_code=403, detail="学生或所属专业已停用")
+
+            def committed_selection_payload(
+                *,
+                settings: dict[str, Any],
+                selection_id: int,
+                selection_group_id: int,
+                selected_at: str,
+                group_name: str,
+            ) -> dict[str, Any]:
+                receipt = build_selection_receipt(
+                    settings=settings,
+                    selection_id=selection_id,
+                    student_id=student_id,
+                    group_id=selection_group_id,
+                    selected_at=selected_at,
+                    student_no=str(student["student_no"]),
+                    student_name=str(student["name"]),
+                    major_name=str(student["major_name"]),
+                    group_name=group_name,
+                )
+                return {
+                    "server_now": settings["server_now"],
+                    "selection_opens_at": settings["selection_opens_at"],
+                    "phase": settings["phase"],
+                    "student_login_allowed": settings["student_login_allowed"],
+                    "status_message": settings["status_message"],
+                    "student": {
+                        "id": student_id,
+                        "student_no": student["student_no"],
+                        "name": student["name"],
+                        "major_id": student["major_id"],
+                        "major_name": student["major_name"],
+                    },
+                    "selection": {
+                        "group_id": selection_group_id,
+                        "selected_at": selected_at,
+                        "group_name": group_name,
+                    },
+                    "receipt": receipt,
+                    "groups": [],
+                    "settings": settings,
+                }
+
             existing = connection.execute(
-                "SELECT 1 FROM selections WHERE student_id = ? AND revoked_at IS NULL",
+                """
+                SELECT se.id, se.group_id, se.selected_at, g.name AS group_name
+                FROM selections se
+                JOIN teaching_groups g ON g.id = se.group_id
+                WHERE se.student_id = ? AND se.revoked_at IS NULL
+                """,
                 (student_id,),
             ).fetchone()
             if existing:
+                if source == "student" and int(existing["group_id"]) == group_id:
+                    # A client may retry after losing the successful response. The
+                    # unique active-selection invariant makes the same choice safe
+                    # to replay without a second insert or audit record. Freeze the
+                    # exact committed selection while holding the writer lock so a
+                    # later administrative revocation cannot change this response.
+                    return committed_selection_payload(
+                        settings=setting_dict(connection),
+                        selection_id=int(existing["id"]),
+                        selection_group_id=int(existing["group_id"]),
+                        selected_at=str(existing["selected_at"]),
+                        group_name=str(existing["group_name"]),
+                    )
                 raise HTTPException(status_code=409, detail="你已经完成选择，不能重复提交")
+            phase = activity_phase(activity)
+            if source == "admin" and phase == "countdown":
+                raise HTTPException(
+                    status_code=409,
+                    detail="统一倒计时期间不能管理员补位，请等待倒计时结束",
+                )
+            if require_open:
+                if phase == "countdown":
+                    raise HTTPException(status_code=409, detail="统一倒计时尚未结束，请等待开抢")
+                if phase != "open":
+                    raise HTTPException(status_code=409, detail="抢选尚未开放或已经结束")
             group = connection.execute(
                 "SELECT id, name, active, total_capacity FROM teaching_groups WHERE id = ?",
                 (group_id,),
@@ -1667,72 +1869,68 @@ def create_app(config: Config | None = None) -> FastAPI:
             ).fetchone()
             if not quota:
                 raise HTTPException(status_code=409, detail="该专业尚未配置此教学组配额")
-            major_selected = connection.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM selections se JOIN students s ON s.id = se.student_id
-                WHERE se.group_id = ? AND s.major_id = ? AND se.revoked_at IS NULL
-                """,
-                (group_id, student["major_id"]),
-            ).fetchone()["count"]
-            total_selected = connection.execute(
-                """
-                SELECT COUNT(*) AS count FROM selections
-                WHERE group_id = ? AND revoked_at IS NULL
-                """,
-                (group_id,),
-            ).fetchone()["count"]
-            if major_selected >= quota["capacity"] or total_selected >= group["total_capacity"]:
-                raise HTTPException(status_code=409, detail="该教学组名额刚刚已满，请选择其他教学组")
-            # Receipt generation is part of the successful selection contract.  Validate
+            # Receipt generation is part of the successful selection contract. Validate
             # its trusted public origin before inserting anything so a broken setting
-            # still fails atomically, while the expensive per-student projection can be
-            # built after the short write transaction has committed.
+            # still fails atomically. The lightweight committed response is frozen below
+            # without running the full group-capacity projection.
             settings = setting_dict(connection)
             selection_receipt_public_origin(settings)
             now = utc_now()
-            selection = connection.execute(
-                """
-                INSERT INTO selections
-                    (student_id, group_id, selected_at, source, operator)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (student_id, group_id, now, source, operator),
-            )
+            try:
+                selection = connection.execute(
+                    """
+                    INSERT INTO selections
+                        (student_id, group_id, selected_at, source, operator)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (student_id, group_id, now, source, operator),
+                )
+            except sqlite3.IntegrityError as exc:
+                message = str(exc).lower()
+                if "capacity exceeded" in message or "major quota exceeded" in message:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="该教学组名额刚刚已满，请选择其他教学组",
+                    ) from exc
+                if "selection quota missing" in message:
+                    raise HTTPException(
+                        status_code=409, detail="该专业尚未配置此教学组配额"
+                    ) from exc
+                if "unique" in message:
+                    replay = connection.execute(
+                        """
+                        SELECT se.id, se.group_id, se.selected_at,
+                               g.name AS group_name
+                        FROM selections se
+                        JOIN teaching_groups g ON g.id = se.group_id
+                        WHERE se.student_id = ? AND se.revoked_at IS NULL
+                        """,
+                        (student_id,),
+                    ).fetchone()
+                    if (
+                        source == "student"
+                        and replay is not None
+                        and int(replay["group_id"]) == group_id
+                    ):
+                        return committed_selection_payload(
+                            settings=settings,
+                            selection_id=int(replay["id"]),
+                            selection_group_id=int(replay["group_id"]),
+                            selected_at=str(replay["selected_at"]),
+                            group_name=str(replay["group_name"]),
+                        )
+                    raise HTTPException(
+                        status_code=409, detail="你已经完成选择，不能重复提交"
+                    ) from exc
+                raise
             selection_id = int(selection.lastrowid)
-            receipt = build_selection_receipt(
+            committed_payload = committed_selection_payload(
                 settings=settings,
                 selection_id=selection_id,
-                student_id=student_id,
-                group_id=group_id,
+                selection_group_id=group_id,
                 selected_at=now,
-                student_no=str(student["student_no"]),
-                student_name=str(student["name"]),
-                major_name=str(student["major_name"]),
                 group_name=str(group["name"]),
             )
-            committed_payload = {
-                "server_now": settings["server_now"],
-                "selection_opens_at": settings["selection_opens_at"],
-                "phase": settings["phase"],
-                "student_login_allowed": settings["student_login_allowed"],
-                "status_message": settings["status_message"],
-                "student": {
-                    "id": student_id,
-                    "student_no": student["student_no"],
-                    "name": student["name"],
-                    "major_id": student["major_id"],
-                    "major_name": student["major_name"],
-                },
-                "selection": {
-                    "group_id": group_id,
-                    "selected_at": now,
-                    "group_name": group["name"],
-                },
-                "receipt": receipt,
-                "groups": [],
-                "settings": settings,
-            }
             audit(
                 connection,
                 actor_type=source,
@@ -1742,23 +1940,9 @@ def create_app(config: Config | None = None) -> FastAPI:
                 entity_id=selection_id,
                 details={"student_id": student_id, "group_id": group_id},
             )
-            connection.commit()
-            # The correlated availability projection is intentionally outside the
-            # serialized writer section.  The committed payload above is complete
-            # enough to acknowledge success if that best-effort read projection fails.
-            try:
-                connection.execute("BEGIN")
-                response_payload = student_payload_from_connection(connection, student_id)
-                connection.commit()
-                return response_payload
-            except Exception:
-                connection.rollback()
-                return committed_payload
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+            return committed_payload
+
+        return await sqlite_writer.submit_async(persist_selection, priority=0)
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
@@ -1837,18 +2021,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             verify_url = selection_receipt_verify_url(payload.token, settings)
         finally:
             connection.close()
-        qr = qrcode.QRCode(
-            version=None,
-            error_correction=qrcode.constants.ERROR_CORRECT_Q,
-            box_size=8,
-            border=4,
-        )
-        qr.add_data(verify_url)
-        qr.make(fit=True)
-        image = qr.make_image(fill_color="#241a1c", back_color="#ffffff")
-        output = io.BytesIO()
-        image.save(output, format="PNG")
-        output.seek(0)
+        output = io.BytesIO(receipt_qr_png_bytes(verify_url))
         return StreamingResponse(
             output,
             media_type="image/png",
@@ -2004,50 +2177,18 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.close()
 
     @app.post("/api/student/login")
-    def student_login(
-        payload: StudentLogin, request: Request, response: Response
-    ):
+    async def student_login(payload: StudentLogin, request: Request):
         ip_key = client_key(request, "student-login-ip")
         student_ip_limiter.check(ip_key, limit=500, window_seconds=300)
-        connection = connect(config.database_path)
         token = new_session_token()
         csrf_token = new_csrf_token()
-        now_dt = datetime.now(UTC)
         family_key = student_login_principal_key(
             "student-login-account-family", payload.student_no
         )
         id_key = None
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                """
-            SELECT id, student_no, name, activation_hash,
-                   activation_ciphertext, active
-            FROM students WHERE student_no = ?
-                """,
-                (payload.student_no,),
-            ).fetchone()
 
-            if row is not None:
-                id_key = student_login_principal_key(
-                    "student-login-account-id", str(row["id"])
-                )
-                if student_id_limiter.is_limited(
-                    id_key, limit=10, window_seconds=300
-                ):
-                    family_was_limited = student_family_limiter.record_failure(
-                        family_key, limit=10, window_seconds=300
-                    )
-                    raise HTTPException(
-                        status_code=429 if family_was_limited else 401,
-                        detail=(
-                            "尝试次数过多，请稍后再试"
-                            if family_was_limited
-                            else "学号、姓名或激活码不正确"
-                        ),
-                    )
-
-            authenticated = bool(
+        def credentials_match(row: sqlite3.Row | None) -> bool:
+            return bool(
                 row is not None
                 and row["active"]
                 and bool(row["activation_ciphertext"])
@@ -2060,42 +2201,126 @@ def create_app(config: Config | None = None) -> FastAPI:
                     payload.activation_code,
                 )
             )
-            if not authenticated:
+
+        def read_login_candidate() -> sqlite3.Row | None:
+            connection = connect(config.database_path)
+            try:
+                return connection.execute(
+                    """
+                    SELECT id, student_no, name, activation_hash,
+                           activation_ciphertext, active
+                    FROM students WHERE student_no = ?
+                    """,
+                    (payload.student_no,),
+                ).fetchone()
+            finally:
+                connection.close()
+
+        row = await asyncio.to_thread(read_login_candidate)
+        if row is not None:
+            id_key = student_login_principal_key(
+                "student-login-account-id", str(row["id"])
+            )
+            if student_id_limiter.is_limited(
+                id_key, limit=10, window_seconds=300
+            ):
                 family_was_limited = student_family_limiter.record_failure(
                     family_key, limit=10, window_seconds=300
                 )
-                if id_key is not None:
-                    student_id_limiter.record_failure(
-                        id_key, limit=10, window_seconds=300
-                    )
-                if family_was_limited:
-                    raise HTTPException(
-                        status_code=429, detail="尝试次数过多，请稍后再试"
-                    )
                 raise HTTPException(
-                    status_code=401, detail="学号、姓名或激活码不正确"
+                    status_code=429 if family_was_limited else 401,
+                    detail=(
+                        "尝试次数过多，请稍后再试"
+                        if family_was_limited
+                        else "学号、姓名或激活码不正确"
+                    ),
                 )
 
-            student_id = int(row["id"])
-            student_data = student_payload_from_connection(connection, student_id)
+        candidate_matches = await asyncio.to_thread(credentials_match, row)
+        if not candidate_matches:
+            family_was_limited = student_family_limiter.record_failure(
+                family_key, limit=10, window_seconds=300
+            )
+            if id_key is not None:
+                student_id_limiter.record_failure(
+                    id_key, limit=10, window_seconds=300
+                )
+            if family_was_limited:
+                raise HTTPException(
+                    status_code=429, detail="尝试次数过多，请稍后再试"
+                )
+            raise HTTPException(
+                status_code=401, detail="学号、姓名或激活码不正确"
+            )
+
+        candidate_id = int(row["id"])
+        release_response_gate = student_login_response_gate.try_acquire(candidate_id)
+        if release_response_gate is None:
+            raise HTTPException(
+                status_code=409,
+                detail="同一学号正在登录，请等待当前请求完成后重试",
+            )
+        response_owns_gate = False
+
+        def persist_student_login(write_connection: sqlite3.Connection) -> int:
+            current = write_connection.execute(
+                """
+                SELECT id, student_no, name, activation_hash,
+                       activation_ciphertext, active
+                FROM students WHERE student_no = ?
+                """,
+                (payload.student_no,),
+            ).fetchone()
+            if not credentials_match(current) or int(current["id"]) != candidate_id:
+                raise HTTPException(status_code=401, detail="学号、姓名或激活码不正确")
+            student_id = int(current["id"])
             persist_session(
-                connection,
+                write_connection,
                 role="student",
                 subject_id=student_id,
                 token=token,
                 csrf_token=csrf_token,
-                now_dt=now_dt,
+                now_dt=datetime.now(UTC),
             )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+            return student_id
+
+        try:
+            student_id = await sqlite_writer.submit_async(
+                persist_student_login, priority=5
+            )
+
+            def project_committed_login() -> dict[str, Any]:
+                projection_connection = connect(config.database_path)
+                try:
+                    projection_connection.execute("BEGIN")
+                    session_survives = projection_connection.execute(
+                        "SELECT 1 FROM sessions WHERE token_hash = ?",
+                        (session_token_hash(token),),
+                    ).fetchone()
+                    if session_survives is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="本次登录已被同一账号的另一个请求替代，请重新登录",
+                        )
+                    return student_payload_from_connection(
+                        projection_connection, student_id
+                    )
+                finally:
+                    projection_connection.close()
+
+            student_data = await asyncio.to_thread(project_committed_login)
+            if id_key is not None:
+                student_id_limiter.clear(id_key)
+            login_response = JSONResponse(
+                {"csrf_token": csrf_token, **student_data}
+            )
+            set_session_cookie(login_response, "student", token)
+            request.scope[RESPONSE_FINALIZER_SCOPE_KEY] = release_response_gate
+            response_owns_gate = True
+            return login_response
         finally:
-            connection.close()
-        if id_key is not None:
-            student_id_limiter.clear(id_key)
-        set_session_cookie(response, "student", token)
-        return {"csrf_token": csrf_token, **student_data}
+            if not response_owns_gate:
+                release_response_gate()
 
     @app.get("/api/student/me")
     def student_me(request: Request):
@@ -2109,68 +2334,98 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.close()
 
     @app.post("/api/student/heartbeat")
-    def student_heartbeat(request: Request):
+    async def student_heartbeat(request: Request):
         """Refresh waiting-room presence without turning every poll into a write.
 
         The browser may call this every five seconds.  SQLite is updated at most once
         per student per write interval, preserving the write lock for actual selections.
         """
 
-        identity = require_session(request, "student", csrf=True)
-        connection = connect(config.database_path)
-        try:
-            require_expected_activity(request, connection, identity=identity)
-            row = connection.execute(
-                "SELECT last_seen_at FROM sessions WHERE token_hash = ?",
-                (identity.token_hash,),
-            ).fetchone()
-            now_text = utc_now()
-            write_cutoff = (
-                parse_utc(now_text) - timedelta(seconds=HEARTBEAT_WRITE_INTERVAL_SECONDS)
-            ).isoformat(timespec="seconds")
-            if not row or not row["last_seen_at"] or row["last_seen_at"] <= write_cutoff:
-                connection.execute("BEGIN IMMEDIATE")
+        def read_heartbeat_state() -> tuple[Identity, bool]:
+            connection = connect(config.database_path)
+            try:
+                identity = require_session_from_connection(
+                    request, "student", connection, csrf=True
+                )
                 require_expected_activity(request, connection, identity=identity)
-                connection.execute(
+                row = connection.execute(
+                    "SELECT last_seen_at FROM sessions WHERE token_hash = ?",
+                    (identity.token_hash,),
+                ).fetchone()
+                read_now_text = utc_now()
+                read_cutoff = (
+                    parse_utc(read_now_text)
+                    - timedelta(seconds=HEARTBEAT_WRITE_INTERVAL_SECONDS)
+                ).isoformat(timespec="seconds")
+                needs_write = (
+                    not row
+                    or not row["last_seen_at"]
+                    or row["last_seen_at"] <= read_cutoff
+                )
+                return identity, needs_write
+            finally:
+                connection.close()
+
+        identity, needs_write = await asyncio.to_thread(read_heartbeat_state)
+
+        if needs_write:
+
+            def persist_heartbeat(write_connection: sqlite3.Connection) -> None:
+                require_expected_activity(
+                    request, write_connection, identity=identity
+                )
+                write_now_text = utc_now()
+                write_cutoff = (
+                    parse_utc(write_now_text)
+                    - timedelta(seconds=HEARTBEAT_WRITE_INTERVAL_SECONDS)
+                ).isoformat(timespec="seconds")
+                write_connection.execute(
                     """
                     UPDATE sessions SET last_seen_at = ?
                     WHERE token_hash = ?
                       AND (last_seen_at IS NULL OR last_seen_at <= ?)
                     """,
-                    (now_text, identity.token_hash, write_cutoff),
+                    (write_now_text, identity.token_hash, write_cutoff),
                 )
-                connection.commit()
-            has_selection = bool(
-                connection.execute(
-                    """
-                    SELECT EXISTS(
-                        SELECT 1 FROM selections
-                        WHERE student_id = ? AND revoked_at IS NULL
-                    )
-                    """,
-                    (identity.subject_id,),
-                ).fetchone()[0]
-            )
-            settings = setting_dict(connection)
-            return {
-                "ok": True,
-                "has_selection": has_selection,
-                "server_now": settings["server_now"],
-                "selection_opens_at": settings["selection_opens_at"],
-                "phase": settings["phase"],
-                "student_login_allowed": settings["student_login_allowed"],
-                "status_message": settings["status_message"],
-            }
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+
+            await sqlite_writer.submit_async(persist_heartbeat, priority=10)
+
+        def project_heartbeat_response() -> dict[str, Any]:
+            response_connection = connect(config.database_path)
+            try:
+                require_expected_activity(
+                    request, response_connection, identity=identity
+                )
+                has_selection = bool(
+                    response_connection.execute(
+                        """
+                        SELECT EXISTS(
+                            SELECT 1 FROM selections
+                            WHERE student_id = ? AND revoked_at IS NULL
+                        )
+                        """,
+                        (identity.subject_id,),
+                    ).fetchone()[0]
+                )
+                settings = setting_dict(response_connection)
+                return {
+                    "ok": True,
+                    "has_selection": has_selection,
+                    "server_now": settings["server_now"],
+                    "selection_opens_at": settings["selection_opens_at"],
+                    "phase": settings["phase"],
+                    "student_login_allowed": settings["student_login_allowed"],
+                    "status_message": settings["status_message"],
+                }
+            finally:
+                response_connection.close()
+
+        return await asyncio.to_thread(project_heartbeat_response)
 
     @app.post("/api/student/select")
-    def student_select(payload: StudentSelect, request: Request):
+    async def student_select(payload: StudentSelect, request: Request):
         identity = require_session(request, "student", csrf=True)
-        result = choose_group(
+        result = await choose_group(
             request=request,
             identity=identity,
             student_id=identity.subject_id,
@@ -3819,9 +4074,9 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.close()
 
     @app.post("/api/admin/selections")
-    def admin_assign(payload: AdminAssign, request: Request):
+    async def admin_assign(payload: AdminAssign, request: Request):
         identity = require_session(request, "admin", csrf=True)
-        choose_group(
+        await choose_group(
             request=request,
             identity=identity,
             student_id=payload.student_id,
@@ -4095,6 +4350,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         return FileResponse(
             BRAND_ROOT / "college-wordmark-official.png",
             media_type="image/png",
+            # This stable URL is not content-hashed, so it must remain revalidatable
+            # when the official wordmark asset changes in a later deployment.
             headers={"Cache-Control": "public, max-age=86400"},
         )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -23,12 +24,32 @@ from server.maintenance import (
 )
 
 
+def test_batched_write_routes_do_not_wait_in_fastapi_sync_worker_pool(app) -> None:
+    endpoints = {
+        route.path: route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None)
+    }
+    for path in (
+        "/api/student/login",
+        "/api/student/heartbeat",
+        "/api/student/select",
+        "/api/admin/selections",
+    ):
+        assert inspect.iscoroutinefunction(endpoints[path]), path
+
+
 def test_health_and_public_branding(client: TestClient):
     assert client.get("/api/health").json() == {"status": "ok"}
     info = client.get("/api/public/info")
     assert info.status_code == 200
     assert info.json()["settings"]["organization_name"] == "安徽建筑大学 · 建筑与空间规划学院"
     assert info.json()["group_count"] == 6
+
+    wordmark = client.get("/brand/college-wordmark-official.png")
+    assert wordmark.status_code == 200
+    assert wordmark.headers["cache-control"] == "public, max-age=86400"
+    assert "immutable" not in wordmark.headers["cache-control"]
 
 
 def test_professional_and_group_counts_are_dynamic(client: TestClient, admin_headers: dict[str, str]):
@@ -627,7 +648,7 @@ def test_one_hundred_fifty_students_competing_for_thirty_seats_never_oversells(a
         assert final["totals"] == {"students": 150, "selected": 30, "unselected": 120}
 
 
-def test_successful_selection_releases_write_lock_before_full_projection(
+def test_successful_selection_returns_without_running_full_projection_in_writer(
     app,
     monkeypatch,
 ):
@@ -702,10 +723,9 @@ def test_successful_selection_releases_write_lock_before_full_projection(
             index for index, sql in enumerate(normalized) if "INSERT INTO SELECTIONS" in sql
         )
         commit_index = normalized.index("COMMIT", insert_index)
-        read_begin_index = normalized.index("BEGIN", commit_index + 1)
-        projection_index = next(
-            index
-            for index, sql in enumerate(normalized)
-            if index > insert_index and "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY" in sql
+        assert any(sql.startswith("SAVEPOINT BATCH_JOB_") for sql in normalized[:insert_index])
+        assert insert_index < commit_index
+        assert not any(
+            "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY" in sql
+            for sql in normalized[insert_index + 1 :]
         )
-        assert insert_index < commit_index < read_begin_index < projection_index
