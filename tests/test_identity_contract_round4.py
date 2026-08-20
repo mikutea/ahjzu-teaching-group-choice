@@ -367,6 +367,55 @@ def test_rate_limit_namespaces_do_not_evict_or_block_each_other():
         assert limiter.is_limited(key, limit=1, window_seconds=300)
 
 
+def test_student_login_shared_nat_allows_one_thousand_students_with_headroom(
+    app,
+    app_config,
+    client: TestClient,
+    admin_headers: dict[str, str],
+):
+    student_no = "20261237003"
+    name = "共享网络登录学生"
+    correct_code = "A1B2C3"
+    insert_login_identity(
+        app_config=app_config,
+        client=client,
+        student_no=student_no,
+        name=name,
+        code=correct_code,
+    )
+    limiter = endpoint_closure_value(app, "/api/student/login", "student_ip_limiter")
+    ip_key = "student-login-ip:testclient"
+
+    assert main_module.STUDENT_LOGIN_SHARED_IP_LIMIT == 1_500
+    for _ in range(main_module.STUDENT_LOGIN_SHARED_IP_LIMIT - 1):
+        assert limiter.record_failure(
+            ip_key,
+            limit=main_module.STUDENT_LOGIN_SHARED_IP_LIMIT,
+            window_seconds=main_module.STUDENT_LOGIN_RATE_WINDOW_SECONDS,
+        ) is False
+
+    admitted = client.post(
+        "/api/student/login",
+        json={
+            "student_no": student_no,
+            "name": name,
+            "activation_code": correct_code,
+        },
+    )
+    assert admitted.status_code == 200, admitted.text
+
+    blocked = client.post(
+        "/api/student/login",
+        json={
+            "student_no": student_no,
+            "name": name,
+            "activation_code": correct_code,
+        },
+    )
+    assert blocked.status_code == 429, blocked.text
+    assert blocked.json()["detail"] == "尝试次数过多，请稍后再试"
+
+
 def test_identity_capacity_skips_verification_without_evicting_locks(
     app,
     app_config,

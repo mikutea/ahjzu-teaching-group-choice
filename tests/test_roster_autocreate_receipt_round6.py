@@ -1333,7 +1333,7 @@ def test_receipt_verification_rate_limits_exact_tokens_without_exhausting_classr
     assert limited.headers["retry-after"] == "300"
 
     # A whole class can independently verify signed receipts behind one public IP.
-    for index in range(1_000, 1_150):
+    for index in range(1_000, 2_000):
         response = client.post(
             "/api/public/receipts/verify",
             json={"token": token_for(index)},

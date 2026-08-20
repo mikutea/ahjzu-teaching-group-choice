@@ -89,8 +89,10 @@ HEARTBEAT_WRITE_INTERVAL_SECONDS = 15
 MAX_ADMIN_SESSIONS_PER_USER = 8
 RECEIPT_RATE_WINDOW_SECONDS = 300
 RECEIPT_TOKEN_VERIFY_LIMIT = 30
-RECEIPT_SHARED_IP_DISTINCT_LIMIT = 500
+RECEIPT_SHARED_IP_DISTINCT_LIMIT = 1_500
 RECEIPT_INVALID_IP_LIMIT = 5_000
+STUDENT_LOGIN_RATE_WINDOW_SECONDS = 300
+STUDENT_LOGIN_SHARED_IP_LIMIT = 1_500
 STUDENT_SELECT_RATE_WINDOW_SECONDS = 30
 STUDENT_SELECT_STUDENT_LIMIT = 6
 STUDENT_SELECT_SHARED_IP_LIMIT = 1_500
@@ -2353,7 +2355,11 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/api/student/login")
     async def student_login(payload: StudentLogin, request: Request):
         ip_key = client_key(request, "student-login-ip")
-        student_ip_limiter.check(ip_key, limit=500, window_seconds=300)
+        student_ip_limiter.check(
+            ip_key,
+            limit=STUDENT_LOGIN_SHARED_IP_LIMIT,
+            window_seconds=STUDENT_LOGIN_RATE_WINDOW_SECONDS,
+        )
         csrf_token = new_csrf_token()
         family_key = student_login_principal_key(
             "student-login-account-family", payload.student_no
