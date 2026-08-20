@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import csv
 from dataclasses import replace
@@ -56,6 +57,41 @@ def test_concurrent_receipt_qr_cache_misses_share_one_render(
 
     assert render_count == 1
     assert len(set(outputs)) == 1
+
+
+def test_distinct_receipt_qr_renders_are_bounded_outside_the_sync_pool() -> None:
+    active = 0
+    max_active = 0
+    render_lock = threading.Lock()
+
+    def render(verify_url: str) -> bytes:
+        nonlocal active, max_active
+        with render_lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.03)
+            return verify_url.encode("ascii")
+        finally:
+            with render_lock:
+                active -= 1
+
+    async def exercise() -> list[bytes]:
+        slots = asyncio.Semaphore(server_main.RECEIPT_QR_RENDER_PARALLELISM)
+        return await asyncio.gather(
+            *(
+                server_main.render_receipt_qr_limited(
+                    slots,
+                    render,
+                    f"https://class.miyuo.net/receipt#token={index}",
+                )
+                for index in range(20)
+            )
+        )
+
+    outputs = asyncio.run(exercise())
+    assert len(outputs) == 20
+    assert max_active == server_main.RECEIPT_QR_RENDER_PARALLELISM
 
 
 def signed_receipt_token(secret: str, claims: dict[str, object]) -> str:

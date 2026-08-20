@@ -386,6 +386,8 @@ def test_same_student_overlapping_logins_acknowledge_only_one_session(
     assert imported.status_code == 200, imported.text
 
     projection_threads: list[str] = []
+    first_projection_waiting = threading.Event()
+    allow_first_projection = threading.Event()
     original_connect = main_module.connect
 
     class ConnectionProxy:
@@ -397,6 +399,9 @@ def test_same_student_overlapping_logins_acknowledge_only_one_session(
                 sql.upper().split()
             ):
                 projection_threads.append(threading.current_thread().name)
+                if not first_projection_waiting.is_set():
+                    first_projection_waiting.set()
+                    assert allow_first_projection.wait(timeout=10)
             return self._connection.execute(sql, parameters)
 
         def __getattr__(self, name):
@@ -427,7 +432,6 @@ def test_same_student_overlapping_logins_acknowledge_only_one_session(
     writer._batch_size = 2
     writer._batch_window_seconds = 0.01
     students = [TestClient(app), TestClient(app)]
-    barrier = threading.Barrier(2)
     payload = {
         "student_no": student_no,
         "name": student_name,
@@ -435,12 +439,16 @@ def test_same_student_overlapping_logins_acknowledge_only_one_session(
     }
 
     def login(student: TestClient):
-        barrier.wait(timeout=10)
         return student.post("/api/student/login", json=payload)
 
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            responses = list(pool.map(login, students))
+            first = pool.submit(login, students[0])
+            assert first_projection_waiting.wait(timeout=10)
+            second = pool.submit(login, students[1])
+            second_response = second.result(timeout=10)
+            allow_first_projection.set()
+            responses = [first.result(timeout=10), second_response]
         assert sorted(response.status_code for response in responses) == [200, 409]
         winner_index = next(
             index for index, response in enumerate(responses) if response.status_code == 200
@@ -466,10 +474,106 @@ def test_same_student_overlapping_logins_acknowledge_only_one_session(
         finally:
             connection.close()
     finally:
+        allow_first_projection.set()
         writer._batch_size = original_batch_size
         writer._batch_window_seconds = original_batch_window
         for student in students:
             student.close()
+
+
+def test_public_status_burst_shares_one_database_projection(
+    client: TestClient, monkeypatch
+) -> None:
+    monkeypatch.setattr(main_module, "PUBLIC_STATUS_CACHE_SECONDS", 60.0)
+    original_connect = main_module.connect
+    connection_count = 0
+    counter_lock = threading.Lock()
+
+    def counted_connect(database_path):
+        nonlocal connection_count
+        with counter_lock:
+            connection_count += 1
+        return original_connect(database_path)
+
+    monkeypatch.setattr(main_module, "connect", counted_connect)
+    start = threading.Barrier(25)
+
+    def fetch_status() -> dict:
+        start.wait(timeout=10)
+        response = client.get("/api/public/status")
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    with ThreadPoolExecutor(max_workers=24) as pool:
+        futures = [pool.submit(fetch_status) for _ in range(24)]
+        start.wait(timeout=10)
+        payloads = [future.result(timeout=10) for future in futures]
+
+    assert connection_count == 1
+    assert {payload["activity_id"] for payload in payloads} == {1}
+    assert all(payload["server_now"] for payload in payloads)
+
+
+def test_selected_student_refresh_skips_capacity_matrix_projection(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    major = dashboard["majors"][0]
+    group = dashboard["groups"][0]
+    student_no = "20550000888"
+    document_number = fictional_document_number("SELECTED-LIGHTWEIGHT-ME")
+    imported = import_roster(
+        client,
+        admin_headers,
+        major["name"],
+        [(student_no, "Selected Refresh Student", document_number)],
+    )
+    assert imported.status_code == 200, imported.text
+    quota = client.put(
+        f"/api/admin/quotas/{major['id']}/{group['id']}",
+        headers=admin_headers,
+        json={"capacity": 1},
+    )
+    assert quota.status_code == 200, quota.text
+    open_selection_now(client, admin_headers)
+    student, login = login_student(
+        app,
+        student_no=student_no,
+        name="Selected Refresh Student",
+        activation_code=document_number[-6:],
+    )
+    try:
+        headers = student_headers(login, int(admin_headers["X-Activity-ID"]))
+        selected = student.post(
+            "/api/student/select",
+            headers=headers,
+            json={"group_id": group["id"]},
+        )
+        assert selected.status_code == 200, selected.text
+
+        statements: list[str] = []
+        original_connect = main_module.connect
+
+        def traced_connect(database_path):
+            connection = original_connect(database_path)
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        monkeypatch.setattr(main_module, "connect", traced_connect)
+        refreshed = student.get("/api/student/me")
+        assert refreshed.status_code == 200, refreshed.text
+        assert refreshed.json()["groups"] == []
+        assert refreshed.json()["receipt"]["token"] == selected.json()["receipt"]["token"]
+        normalized = [" ".join(statement.upper().split()) for statement in statements]
+        assert not any(
+            "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY" in statement
+            for statement in normalized
+        )
+    finally:
+        student.close()
 
 
 def test_overlapping_student_login_cannot_publish_a_superseded_cookie(

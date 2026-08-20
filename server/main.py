@@ -89,6 +89,8 @@ RECEIPT_TOKEN_VERIFY_LIMIT = 30
 RECEIPT_SHARED_IP_DISTINCT_LIMIT = 500
 RECEIPT_INVALID_IP_LIMIT = 5_000
 RESPONSE_FINALIZER_SCOPE_KEY = "teaching_choice.response_finalizer"
+PUBLIC_STATUS_CACHE_SECONDS = 0.05
+RECEIPT_QR_RENDER_PARALLELISM = 4
 
 
 class PrincipalResponseGate:
@@ -131,8 +133,21 @@ class ResponseFinalizerMiddleware:
             finalizer = scope.pop(RESPONSE_FINALIZER_SCOPE_KEY, None)
             if callable(finalizer):
                 finalizer()
+
+
 RECEIPT_TOKEN_VERSION = "v2"
 RECEIPT_SNAPSHOT_VERSION = 1
+
+
+async def render_receipt_qr_limited(
+    slots: asyncio.Semaphore,
+    renderer: Callable[[str], bytes],
+    verify_url: str,
+) -> bytes:
+    """Keep CPU-bound QR work bounded and outside Starlette's sync pool."""
+
+    async with slots:
+        return await asyncio.to_thread(renderer, verify_url)
 
 
 def session_utc_now() -> str:
@@ -646,6 +661,9 @@ def create_app(config: Config | None = None) -> FastAPI:
     receipt_invalid_limiter = RateLimiter()
     receipt_qr_limiter = RateLimiter()
     student_login_response_gate = PrincipalResponseGate()
+    public_status_cache_lock = threading.Lock()
+    public_status_cache: tuple[float, dict[str, Any]] | None = None
+    receipt_qr_render_slots = asyncio.Semaphore(RECEIPT_QR_RENDER_PARALLELISM)
     # Resolve ``connect`` at execution time so tests and operational probes can
     # instrument the exact writer connection without bypassing the coordinator.
     sqlite_writer = SQLiteBatchWriter(
@@ -1668,24 +1686,32 @@ def create_app(config: Config | None = None) -> FastAPI:
             """,
             (student_id,),
         ).fetchone()
-        groups = connection.execute(
-            """
-            SELECT g.id, g.name, g.total_capacity,
-                   q.capacity,
-                   (SELECT COUNT(*) FROM selections sx
-                    JOIN students stx ON stx.id = sx.student_id
-                    WHERE sx.group_id = g.id AND stx.major_id = ?
-                      AND sx.revoked_at IS NULL) AS major_selected,
-                   (SELECT COUNT(*) FROM selections sx
-                    WHERE sx.group_id = g.id AND sx.revoked_at IS NULL) AS total_selected
-            FROM teaching_groups g
-            JOIN quotas q ON q.group_id = g.id AND q.major_id = ?
-            WHERE g.active = 1
-            ORDER BY g.sort_order, g.id
-            """,
-            (student["major_id"], student["major_id"]),
-        ).fetchall()
         settings = setting_dict(connection)
+        # The selected-state UI only needs the immutable committed result and
+        # receipt. Re-running the capacity matrix projection for every five-second
+        # refresh is quadratic in the live selection count and can starve the
+        # classroom-wide submit burst.
+        groups = (
+            []
+            if selection
+            else connection.execute(
+                """
+                SELECT g.id, g.name, g.total_capacity,
+                       q.capacity,
+                       (SELECT COUNT(*) FROM selections sx
+                        JOIN students stx ON stx.id = sx.student_id
+                        WHERE sx.group_id = g.id AND stx.major_id = ?
+                          AND sx.revoked_at IS NULL) AS major_selected,
+                       (SELECT COUNT(*) FROM selections sx
+                        WHERE sx.group_id = g.id AND sx.revoked_at IS NULL) AS total_selected
+                FROM teaching_groups g
+                JOIN quotas q ON q.group_id = g.id AND q.major_id = ?
+                WHERE g.active = 1
+                ORDER BY g.sort_order, g.id
+                """,
+                (student["major_id"], student["major_id"]),
+            ).fetchall()
+        )
         selection_payload = (
             {
                 "group_id": selection["group_id"],
@@ -1945,7 +1971,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         return await sqlite_writer.submit_async(persist_selection, priority=0)
 
     @app.get("/api/health")
-    def health() -> dict[str, str]:
+    async def health() -> dict[str, str]:
         connection = connect(config.database_path)
         try:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -1984,46 +2010,67 @@ def create_app(config: Config | None = None) -> FastAPI:
             connection.close()
 
     @app.get("/api/public/status")
-    def public_status() -> dict[str, Any]:
-        connection = connect(config.database_path)
-        try:
-            connection.execute("BEGIN")
-            settings = setting_dict(connection)
-            return {
-                "activity_id": settings["activity_id"],
-                "status": settings["status"],
-                "phase": settings["phase"],
-                "server_now": settings["server_now"],
-                "selection_opens_at": settings["selection_opens_at"],
-                "student_login_allowed": settings["student_login_allowed"],
-                "status_message": settings["status_message"],
-            }
-        finally:
-            connection.close()
+    async def public_status() -> dict[str, Any]:
+        nonlocal public_status_cache
+        now = time.monotonic()
+        with public_status_cache_lock:
+            cached = public_status_cache
+            if cached is None or cached[0] <= now:
+                connection = connect(config.database_path)
+                try:
+                    connection.execute("BEGIN")
+                    settings = setting_dict(connection)
+                    cached_payload = {
+                        "activity_id": settings["activity_id"],
+                        "status": settings["status"],
+                        "phase": settings["phase"],
+                        "server_now": settings["server_now"],
+                        "selection_opens_at": settings["selection_opens_at"],
+                        "student_login_allowed": settings["student_login_allowed"],
+                        "status_message": settings["status_message"],
+                    }
+                finally:
+                    connection.close()
+                public_status_cache = (
+                    now + PUBLIC_STATUS_CACHE_SECONDS,
+                    cached_payload,
+                )
+            else:
+                cached_payload = cached[1]
+        # Keep phase and server_now from the same database projection. The shared
+        # snapshot lives for only 50 ms, well below the one-second UI resolution.
+        return dict(cached_payload)
 
     @app.post("/api/student/receipt/qr.png")
-    def selection_receipt_qr(payload: ReceiptVerify, request: Request):
-        connection = connect(config.database_path)
-        try:
-            connection.execute("BEGIN")
-            identity = require_session_from_connection(
-                request, "student", connection, csrf=True
-            )
-            enforce_receipt_rate_limit(
-                receipt_qr_limiter,
-                f"receipt-qr-student:{identity.subject_id}",
-                limit=120,
-            )
-            claims, _ = parse_selection_receipt(payload.token)
-            if claims["student_id"] != identity.subject_id:
-                raise HTTPException(status_code=403, detail="凭证与当前学生不匹配")
-            settings = setting_dict(connection)
-            verify_url = selection_receipt_verify_url(payload.token, settings)
-        finally:
-            connection.close()
-        output = io.BytesIO(receipt_qr_png_bytes(verify_url))
-        return StreamingResponse(
-            output,
+    async def selection_receipt_qr(payload: ReceiptVerify, request: Request):
+        def prepare_receipt_qr() -> str:
+            connection = connect(config.database_path)
+            try:
+                connection.execute("BEGIN")
+                identity = require_session_from_connection(
+                    request, "student", connection, csrf=True
+                )
+                enforce_receipt_rate_limit(
+                    receipt_qr_limiter,
+                    f"receipt-qr-student:{identity.subject_id}",
+                    limit=120,
+                )
+                claims, _ = parse_selection_receipt(payload.token)
+                if claims["student_id"] != identity.subject_id:
+                    raise HTTPException(status_code=403, detail="凭证与当前学生不匹配")
+                settings = setting_dict(connection)
+                return selection_receipt_verify_url(payload.token, settings)
+            finally:
+                connection.close()
+
+        verify_url = await asyncio.to_thread(prepare_receipt_qr)
+        rendered = await render_receipt_qr_limited(
+            receipt_qr_render_slots,
+            receipt_qr_png_bytes,
+            verify_url,
+        )
+        return Response(
+            content=rendered,
             media_type="image/png",
             headers={"Cache-Control": "no-store"},
         )
