@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
-from server.write_batch import SQLiteBatchWriter
+from server.write_batch import SQLiteBatchWriter, SQLiteWriteQueueFull
 
 
 def test_batch_writer_commits_a_classroom_burst_in_few_transactions(
@@ -122,3 +124,80 @@ def test_fully_stopped_writer_can_serve_a_new_application_lifespan(
             (1,),
             (2,),
         ]
+
+
+def test_low_priority_burst_cannot_consume_reserved_selection_capacity(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "priority-reserve.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE events (value TEXT)")
+    writer = SQLiteBatchWriter(
+        database_path,
+        batch_size=2,
+        queue_limit=4,
+        batch_window_seconds=0,
+    )
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+
+    def insert(value: str, *, slow: bool = False):
+        def callback(connection: sqlite3.Connection) -> str:
+            if slow:
+                slow_started.set()
+                assert release_slow.wait(timeout=10)
+            connection.execute("INSERT INTO events VALUES (?)", (value,))
+            return value
+
+        return callback
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            slow = pool.submit(writer.submit, insert("slow", slow=True), priority=10)
+            assert slow_started.wait(timeout=10)
+            low_one = pool.submit(writer.submit, insert("low-1"), priority=10)
+            low_two = pool.submit(writer.submit, insert("low-2"), priority=10)
+            deadline = time.monotonic() + 10
+            while writer.stats()["pending_jobs"] < 3 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert writer.stats()["pending_jobs"] == 3
+            with pytest.raises(SQLiteWriteQueueFull):
+                writer.submit(insert("rejected-low"), priority=10)
+            critical = pool.submit(writer.submit, insert("selection"), priority=0)
+            deadline = time.monotonic() + 10
+            while writer.stats()["pending_jobs"] < 4 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert writer.stats()["pending_jobs"] == 4
+            release_slow.set()
+            assert slow.result(timeout=10) == "slow"
+            assert low_one.result(timeout=10) == "low-1"
+            assert low_two.result(timeout=10) == "low-2"
+            assert critical.result(timeout=10) == "selection"
+        with sqlite3.connect(database_path) as connection:
+            values = {row[0] for row in connection.execute("SELECT value FROM events")}
+        assert values == {"slow", "low-1", "low-2", "selection"}
+    finally:
+        release_slow.set()
+        writer.close()
+
+
+def test_async_submission_is_admitted_before_awaiting_commit(tmp_path: Path) -> None:
+    database_path = tmp_path / "async-submit.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE events (value INTEGER)")
+    writer = SQLiteBatchWriter(database_path, batch_window_seconds=0)
+
+    async def submit() -> int:
+        return await writer.submit_async(
+            lambda connection: connection.execute(
+                "INSERT INTO events VALUES (7)"
+            ).rowcount,
+            priority=0,
+        )
+
+    try:
+        assert asyncio.run(submit()) == 1
+        with sqlite3.connect(database_path) as connection:
+            assert connection.execute("SELECT value FROM events").fetchall() == [(7,)]
+    finally:
+        writer.close()

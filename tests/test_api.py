@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +22,21 @@ from server.maintenance import (
     check_database,
     create_backup,
 )
+
+
+def test_batched_write_routes_do_not_wait_in_fastapi_sync_worker_pool(app) -> None:
+    endpoints = {
+        route.path: route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None)
+    }
+    for path in (
+        "/api/student/login",
+        "/api/student/heartbeat",
+        "/api/student/select",
+        "/api/admin/selections",
+    ):
+        assert inspect.iscoroutinefunction(endpoints[path]), path
 
 
 def test_health_and_public_branding(client: TestClient):

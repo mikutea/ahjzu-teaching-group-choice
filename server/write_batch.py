@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import heapq
 import sqlite3
 import threading
@@ -28,6 +29,8 @@ class _QueuedWrite(Generic[ResultT]):
     sequence: int
     callback: Callable[[sqlite3.Connection], ResultT] = field(compare=False)
     completed: threading.Event = field(default_factory=threading.Event, compare=False)
+    async_loop: asyncio.AbstractEventLoop | None = field(default=None, compare=False)
+    async_future: asyncio.Future[ResultT] | None = field(default=None, compare=False)
     result: ResultT | None = field(default=None, compare=False)
     error: BaseException | None = field(default=None, compare=False)
 
@@ -61,6 +64,10 @@ class SQLiteBatchWriter:
         self._database_path = database_path
         self._batch_size = batch_size
         self._queue_limit = queue_limit
+        # Keep enough admission headroom for the seat-claim path (priority 0).
+        # Lower-priority session and heartbeat traffic may use the rest of the
+        # queue, but can never consume these reserved slots.
+        self._priority_reserve = min(batch_size, max(1, queue_limit // 4))
         self._batch_window_seconds = batch_window_seconds
         self._connect_factory = connect_factory
         self._condition = threading.Condition()
@@ -84,16 +91,68 @@ class SQLiteBatchWriter:
         *,
         priority: int = 0,
     ) -> ResultT:
+        job = self._enqueue(callback, priority=priority)
+        job.completed.wait()
+        if job.error is not None:
+            raise job.error
+        return cast(ResultT, job.result)
+
+    async def submit_async(
+        self,
+        callback: Callable[[sqlite3.Connection], ResultT],
+        *,
+        priority: int = 0,
+    ) -> ResultT:
+        """Admit synchronously, then await completion without an AnyIO worker.
+
+        FastAPI runs ordinary ``def`` handlers in a small shared worker pool.
+        Blocking those workers before a request reaches the bounded writer
+        queue would merely move overload into an unbounded framework backlog.
+        Async routes use this method so admission happens immediately on the
+        event-loop thread and only accepted work waits for the database writer.
+        """
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[ResultT] = loop.create_future()
+        # Retrieve a late exception even if the HTTP request is cancelled after
+        # admission; the committed job is deliberately not cancelled.
+        future.add_done_callback(
+            lambda completed: completed.exception() if not completed.cancelled() else None
+        )
+        self._enqueue(
+            callback,
+            priority=priority,
+            async_loop=loop,
+            async_future=future,
+        )
+        return await asyncio.shield(future)
+
+    def _enqueue(
+        self,
+        callback: Callable[[sqlite3.Connection], ResultT],
+        *,
+        priority: int,
+        async_loop: asyncio.AbstractEventLoop | None = None,
+        async_future: asyncio.Future[ResultT] | None = None,
+    ) -> _QueuedWrite[ResultT]:
         with self._condition:
             if not self._accepting:
                 raise SQLiteWriteQueueClosed("SQLite write queue is closed")
-            if len(self._queue) >= self._queue_limit:
+            pending_jobs = len(self._queue) + self._active_jobs
+            admission_limit = (
+                self._queue_limit
+                if priority <= 0
+                else self._queue_limit - self._priority_reserve
+            )
+            if pending_jobs >= admission_limit:
                 raise SQLiteWriteQueueFull("SQLite write queue is full")
             self._sequence += 1
             job = _QueuedWrite(
                 priority=priority,
                 sequence=self._sequence,
                 callback=callback,
+                async_loop=async_loop,
+                async_future=async_future,
             )
             heapq.heappush(self._queue, job)
             self._stats["max_queue_depth"] = max(
@@ -107,11 +166,7 @@ class SQLiteBatchWriter:
                 )
                 self._thread.start()
             self._condition.notify()
-
-        job.completed.wait()
-        if job.error is not None:
-            raise job.error
-        return cast(ResultT, job.result)
+        return job
 
     def stats(self) -> dict[str, int]:
         with self._condition:
@@ -119,6 +174,8 @@ class SQLiteBatchWriter:
                 **self._stats,
                 "queued_jobs": len(self._queue),
                 "active_jobs": self._active_jobs,
+                "pending_jobs": len(self._queue) + self._active_jobs,
+                "priority_reserve": self._priority_reserve,
             }
 
     def open(self) -> None:
@@ -218,3 +275,20 @@ class SQLiteBatchWriter:
                 counter = "jobs_failed" if job.error is not None else "jobs_succeeded"
                 self._stats[counter] += 1
             job.completed.set()
+            if job.async_loop is not None and job.async_future is not None:
+                try:
+                    job.async_loop.call_soon_threadsafe(self._resolve_async_job, job)
+                except RuntimeError:
+                    # The accepted write has already committed. A request loop
+                    # that vanished during shutdown no longer has a recipient.
+                    pass
+
+    @staticmethod
+    def _resolve_async_job(job: _QueuedWrite[Any]) -> None:
+        future = job.async_future
+        if future is None or future.done():
+            return
+        if job.error is not None:
+            future.set_exception(job.error)
+        else:
+            future.set_result(job.result)
