@@ -359,7 +359,7 @@ def test_waiting_room_presence_heartbeat_and_absent_roster(
         student.close()
 
 
-def test_same_student_batched_logins_acknowledge_only_the_surviving_session(
+def test_same_student_overlapping_logins_acknowledge_only_one_session(
     app,
     client: TestClient,
     admin_headers: dict[str, str],
@@ -425,7 +425,7 @@ def test_same_student_batched_logins_acknowledge_only_the_surviving_session(
     original_batch_size = writer._batch_size
     original_batch_window = writer._batch_window_seconds
     writer._batch_size = 2
-    writer._batch_window_seconds = 10
+    writer._batch_window_seconds = 0.01
     students = [TestClient(app), TestClient(app)]
     barrier = threading.Barrier(2)
     payload = {
@@ -446,7 +446,7 @@ def test_same_student_batched_logins_acknowledge_only_the_surviving_session(
             index for index, response in enumerate(responses) if response.status_code == 200
         )
         loser_index = 1 - winner_index
-        assert "另一个请求替代" in responses[loser_index].json()["detail"]
+        assert "正在登录" in responses[loser_index].json()["detail"]
         assert students[winner_index].get("/api/student/me").status_code == 200
         assert students[loser_index].cookies.get(main_module.STUDENT_COOKIE) is None
         assert projection_threads
@@ -470,6 +470,199 @@ def test_same_student_batched_logins_acknowledge_only_the_surviving_session(
         writer._batch_window_seconds = original_batch_window
         for student in students:
             student.close()
+
+
+def test_overlapping_student_login_cannot_publish_a_superseded_cookie(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    student_no = "20520000006"
+    student_name = "Response Ordered Login"
+    activation_seed = "RESPORDER"
+    imported = import_roster(
+        client,
+        admin_headers,
+        dashboard["majors"][0]["name"],
+        [
+            (
+                student_no,
+                student_name,
+                fictional_document_number(activation_seed),
+            )
+        ],
+    )
+    assert imported.status_code == 200, imported.text
+
+    first_reached_cookie_boundary = threading.Event()
+    allow_first_response = threading.Event()
+    clear_lock = threading.Lock()
+    clear_calls = 0
+    original_clear = main_module.RateLimiter.clear
+
+    def controlled_clear(limiter, key):
+        nonlocal clear_calls
+        original_clear(limiter, key)
+        with clear_lock:
+            clear_calls += 1
+            call_number = clear_calls
+        if call_number == 1:
+            first_reached_cookie_boundary.set()
+            assert allow_first_response.wait(timeout=10)
+
+    monkeypatch.setattr(main_module.RateLimiter, "clear", controlled_clear)
+    writer = app.state.sqlite_writer
+    original_batch_size = writer._batch_size
+    original_batch_window = writer._batch_window_seconds
+    writer._batch_size = 1
+    writer._batch_window_seconds = 0
+    first_student = TestClient(app)
+    second_student = TestClient(app)
+    payload = {
+        "student_no": student_no,
+        "name": student_name,
+        "activation_code": fictional_activation_code(activation_seed),
+    }
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(
+                first_student.post, "/api/student/login", json=payload
+            )
+            assert first_reached_cookie_boundary.wait(timeout=10)
+            second_future = pool.submit(
+                second_student.post, "/api/student/login", json=payload
+            )
+            second_response = second_future.result(timeout=10)
+            assert second_response.status_code == 409, second_response.text
+            assert second_student.cookies.get(main_module.STUDENT_COOKIE) is None
+            allow_first_response.set()
+            first_response = first_future.result(timeout=10)
+
+        assert first_response.status_code == 200, first_response.text
+        assert first_student.get("/api/student/me").status_code == 200
+        assert clear_calls == 1
+    finally:
+        allow_first_response.set()
+        writer._batch_size = original_batch_size
+        writer._batch_window_seconds = original_batch_window
+        first_student.close()
+        second_student.close()
+
+
+@pytest.mark.parametrize("fail_send", [False, True])
+def test_login_response_gate_releases_only_after_asgi_send(fail_send: bool):
+    async def exercise() -> None:
+        gate = main_module.PrincipalResponseGate()
+        release = gate.try_acquire(42)
+        assert release is not None
+        response = main_module.FinalizingJSONResponse(
+            {"ok": True}, finalizer=release
+        )
+        body_send_started = asyncio.Event()
+        allow_body_send = asyncio.Event()
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] != "http.response.body":
+                return
+            body_send_started.set()
+            await allow_body_send.wait()
+            if fail_send:
+                raise RuntimeError("simulated client disconnect")
+
+        response_task = asyncio.create_task(
+            response({"type": "http"}, receive, send)
+        )
+        await asyncio.wait_for(body_send_started.wait(), timeout=2)
+        assert gate.try_acquire(42) is None
+        allow_body_send.set()
+        if fail_send:
+            with pytest.raises(RuntimeError, match="simulated client disconnect"):
+                await response_task
+        else:
+            await response_task
+        next_release = gate.try_acquire(42)
+        assert next_release is not None
+        next_release()
+
+    asyncio.run(exercise())
+
+
+def test_heartbeat_sqlite_reads_run_off_the_event_loop(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    activity_id = int(dashboard["settings"]["activity_id"])
+    student_no = "20520000007"
+    student_name = "Async Heartbeat Reads"
+    activation_seed = "ASYNCREAD"
+    imported = import_roster(
+        client,
+        admin_headers,
+        dashboard["majors"][0]["name"],
+        [
+            (
+                student_no,
+                student_name,
+                fictional_document_number(activation_seed),
+            )
+        ],
+    )
+    assert imported.status_code == 200, imported.text
+    student, login_payload = login_student(
+        app,
+        student_no=student_no,
+        name=student_name,
+        activation_code=fictional_activation_code(activation_seed),
+    )
+
+    read_threads: list[str] = []
+    original_connect = main_module.connect
+
+    class ConnectionProxy:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, parameters=()):
+            normalized = " ".join(sql.upper().split())
+            if any(
+                marker in normalized
+                for marker in (
+                    "SELECT ROLE, SUBJECT_ID, CSRF_TOKEN",
+                    "SELECT LAST_SEEN_AT FROM SESSIONS",
+                    "SELECT EXISTS( SELECT 1 FROM SELECTIONS",
+                    "SELECT S.*, A.ID AS ACTIVITY_ID",
+                )
+            ):
+                read_threads.append(threading.current_thread().name)
+            return self._connection.execute(sql, parameters)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    monkeypatch.setattr(
+        main_module,
+        "connect",
+        lambda path: ConnectionProxy(original_connect(path)),
+    )
+    try:
+        heartbeat = student.post(
+            "/api/student/heartbeat",
+            headers=student_headers(login_payload, activity_id),
+        )
+        assert heartbeat.status_code == 200, heartbeat.text
+        assert read_threads
+        assert all("asyncio-portal" not in name for name in read_threads)
+    finally:
+        student.close()
 
 
 def test_queued_heartbeat_uses_writer_execution_time(
