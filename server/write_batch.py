@@ -70,7 +70,7 @@ class SQLiteBatchWriter:
         # Keep enough admission headroom for the seat-claim path (priority 0).
         # Lower-priority session and heartbeat traffic may use the rest of the
         # queue, but can never consume these reserved slots.
-        self._priority_reserve = min(priority_reserve, max(1, queue_limit - 1))
+        self._priority_reserve = min(priority_reserve, max(1, queue_limit // 4))
         self._batch_window_seconds = batch_window_seconds
         self._connect_factory = connect_factory
         self._condition = threading.Condition()

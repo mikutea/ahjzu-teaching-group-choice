@@ -190,6 +190,20 @@ def test_default_writer_reserves_one_thousand_selection_slots(tmp_path: Path) ->
         writer.close()
 
 
+def test_small_writer_preserves_low_priority_capacity(tmp_path: Path) -> None:
+    writer = SQLiteBatchWriter(
+        tmp_path / "small-reserve.db",
+        batch_size=32,
+        queue_limit=256,
+    )
+    try:
+        stats = writer.stats()
+        assert stats["priority_reserve"] == 64
+        assert 256 - stats["priority_reserve"] == 192
+    finally:
+        writer.close()
+
+
 def test_critical_burst_displaces_queued_low_priority_jobs(tmp_path: Path) -> None:
     database_path = tmp_path / "priority-displacement.db"
     with sqlite3.connect(database_path) as connection:
