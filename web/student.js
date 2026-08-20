@@ -6,6 +6,9 @@ const CONTROL_CHARACTER_PATTERN = /\p{C}/u;
 const STUDENT_NO_PATTERN = /^\d{11}$/;
 const STUDENT_NAME_PATTERN = /^[A-Za-z\p{Script=Han}]+(?:[ ·•・][A-Za-z\p{Script=Han}]+)*$/u;
 const ACTIVATION_CODE_PATTERN = /^[A-Z0-9]{6}$/;
+const STUDENT_WAITING_POLL_INTERVAL_MS = 2500;
+const STUDENT_SELECTED_SYNC_INTERVAL_MS = 10000;
+const STUDENT_HEARTBEAT_INTERVAL_MS = 15000;
 
 function normalizeCompatibilityText(value) {
   return String(value ?? "").normalize("NFKC");
@@ -457,6 +460,25 @@ function studentPhase(payload = studentState.payload) {
   if (raw === "countdown" && (remaining === null || remaining <= 0)) return "open";
   if (["open", "selecting", "active"].includes(raw) || status === "open") return "open";
   return "waiting";
+}
+
+function rememberPreparedCountdownSnapshot(payload) {
+  const phase = String(studentField(payload, "phase") || "").toLowerCase();
+  const activityId = payload?.settings?.activity_id ?? payload?.activity_id;
+  const selectionOpensAt = studentField(payload, "selection_opens_at") || "";
+  if (
+    ["countdown", "open"].includes(phase)
+    && activityId !== null
+    && activityId !== undefined
+    && selectionOpensAt
+    && Array.isArray(payload?.groups)
+  ) {
+    studentState.preparedCountdownKey = `${activityId}:${selectionOpensAt}`;
+    return;
+  }
+  if (!["countdown", "open"].includes(phase)) {
+    studentState.preparedCountdownKey = null;
+  }
 }
 
 function renderStudentSettings(settings, payload = { settings }) {
@@ -1216,6 +1238,7 @@ async function loadStudentSession() {
   try {
     const data = await studentApi("/api/student/me");
     studentState.csrf = data.csrf_token;
+    rememberPreparedCountdownSnapshot(data);
     markStudentConnectionHealthy();
     renderStudentPayload(data);
     startStudentPolling();
@@ -1232,7 +1255,7 @@ function startStudentPolling() {
     const pollStartedAt = studentMonotonicNow();
     if (
       studentState.payload?.selection
-      && pollStartedAt - studentState.lastSelectedSyncAt < 5000
+      && pollStartedAt - studentState.lastSelectedSyncAt < STUDENT_SELECTED_SYNC_INTERVAL_MS
     ) return;
     if (studentState.payload?.selection) studentState.lastSelectedSyncAt = pollStartedAt;
     studentState.pollInFlight = true;
@@ -1287,7 +1310,7 @@ function startStudentPolling() {
     } finally {
       studentState.pollInFlight = false;
     }
-  }, 1000);
+  }, STUDENT_WAITING_POLL_INTERVAL_MS);
   studentState.heartbeatTimer = setInterval(async () => {
     if (studentState.heartbeatInFlight || !studentState.payload || studentState.payload.selection) return;
     studentState.heartbeatInFlight = true;
@@ -1311,7 +1334,7 @@ function startStudentPolling() {
     } finally {
       studentState.heartbeatInFlight = false;
     }
-  }, 5000);
+  }, STUDENT_HEARTBEAT_INTERVAL_MS);
 }
 
 function tickStudentCountdown() {
@@ -1337,7 +1360,7 @@ function tickStudentCountdown() {
     studentState.boundaryRefreshPending = true;
     studentApi("/api/student/me")
       .then((latest) => renderStudentPayload(latest))
-      .catch(() => { /* the one-second poll will retry */ })
+      .catch(() => { /* the next lightweight status poll will retry */ })
       .finally(() => { studentState.boundaryRefreshPending = false; });
   }
 }
@@ -1369,6 +1392,7 @@ studentEls.loginForm.addEventListener("submit", async (event) => {
     });
     studentState.csrf = data.csrf_token;
     studentState.selectedGroupId = null;
+    rememberPreparedCountdownSnapshot(data);
     markStudentConnectionHealthy();
     renderStudentPayload(data);
     startStudentPolling();
