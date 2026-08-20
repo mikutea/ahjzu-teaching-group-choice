@@ -40,6 +40,12 @@ def test_container_has_explicit_open_file_headroom_for_peak_login_bursts() -> No
     assert "SQLITE_WRITE_BATCH_WINDOW_MS=4" in env_example
 
 
+def test_origin_keep_alive_outlives_cloudflare_tunnel_idle_pool() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert '"--timeout-keep-alive", "95"' in dockerfile
+
+
 def test_bootstrap_never_persists_the_plaintext_admin_password() -> None:
     script = (ROOT / "deploy" / "bootstrap.sh").read_text(encoding="utf-8")
 
