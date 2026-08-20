@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -358,6 +359,406 @@ def test_waiting_room_presence_heartbeat_and_absent_roster(
         student.close()
 
 
+def test_same_student_overlapping_logins_acknowledge_only_one_session(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    app_config,
+    monkeypatch,
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    major_name = dashboard["majors"][0]["name"]
+    student_no = "20520000004"
+    student_name = "Concurrent Login Student"
+    activation_seed = "SAMELOGIN"
+    imported = import_roster(
+        client,
+        admin_headers,
+        major_name,
+        [
+            (
+                student_no,
+                student_name,
+                fictional_document_number(activation_seed),
+            )
+        ],
+    )
+    assert imported.status_code == 200, imported.text
+
+    projection_threads: list[str] = []
+    original_connect = main_module.connect
+
+    class ConnectionProxy:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, parameters=()):
+            if "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY" in " ".join(
+                sql.upper().split()
+            ):
+                projection_threads.append(threading.current_thread().name)
+            return self._connection.execute(sql, parameters)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    monkeypatch.setattr(
+        main_module,
+        "connect",
+        lambda path: ConnectionProxy(original_connect(path)),
+    )
+    read_time = datetime.now(UTC).replace(microsecond=0)
+    write_time = read_time + timedelta(seconds=40)
+
+    class ControlledDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = (
+                write_time
+                if threading.current_thread().name == "sqlite-batch-writer"
+                else read_time
+            )
+            return current if tz is not None else current.replace(tzinfo=None)
+
+    monkeypatch.setattr(main_module, "datetime", ControlledDateTime)
+    writer = app.state.sqlite_writer
+    original_batch_size = writer._batch_size
+    original_batch_window = writer._batch_window_seconds
+    writer._batch_size = 2
+    writer._batch_window_seconds = 0.01
+    students = [TestClient(app), TestClient(app)]
+    barrier = threading.Barrier(2)
+    payload = {
+        "student_no": student_no,
+        "name": student_name,
+        "activation_code": fictional_activation_code(activation_seed),
+    }
+
+    def login(student: TestClient):
+        barrier.wait(timeout=10)
+        return student.post("/api/student/login", json=payload)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(pool.map(login, students))
+        assert sorted(response.status_code for response in responses) == [200, 409]
+        winner_index = next(
+            index for index, response in enumerate(responses) if response.status_code == 200
+        )
+        loser_index = 1 - winner_index
+        assert "正在登录" in responses[loser_index].json()["detail"]
+        assert students[winner_index].get("/api/student/me").status_code == 200
+        assert students[loser_index].cookies.get(main_module.STUDENT_COOKIE) is None
+        assert projection_threads
+        assert all("asyncio-portal" not in name for name in projection_threads)
+        connection = connect(app_config.database_path)
+        try:
+            sessions = connection.execute(
+                """
+                SELECT created_at FROM sessions
+                WHERE role = 'student'
+                """
+            ).fetchall()
+            assert len(sessions) == 1
+            assert sessions[0]["created_at"] == write_time.isoformat(
+                timespec="seconds"
+            )
+        finally:
+            connection.close()
+    finally:
+        writer._batch_size = original_batch_size
+        writer._batch_window_seconds = original_batch_window
+        for student in students:
+            student.close()
+
+
+def test_overlapping_student_login_cannot_publish_a_superseded_cookie(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    student_no = "20520000006"
+    student_name = "Response Ordered Login"
+    activation_seed = "RESPORDER"
+    imported = import_roster(
+        client,
+        admin_headers,
+        dashboard["majors"][0]["name"],
+        [
+            (
+                student_no,
+                student_name,
+                fictional_document_number(activation_seed),
+            )
+        ],
+    )
+    assert imported.status_code == 200, imported.text
+
+    first_reached_cookie_boundary = threading.Event()
+    allow_first_response = threading.Event()
+    clear_lock = threading.Lock()
+    clear_calls = 0
+    original_clear = main_module.RateLimiter.clear
+
+    def controlled_clear(limiter, key):
+        nonlocal clear_calls
+        original_clear(limiter, key)
+        with clear_lock:
+            clear_calls += 1
+            call_number = clear_calls
+        if call_number == 1:
+            first_reached_cookie_boundary.set()
+            assert allow_first_response.wait(timeout=10)
+
+    monkeypatch.setattr(main_module.RateLimiter, "clear", controlled_clear)
+    writer = app.state.sqlite_writer
+    original_batch_size = writer._batch_size
+    original_batch_window = writer._batch_window_seconds
+    writer._batch_size = 1
+    writer._batch_window_seconds = 0
+    first_student = TestClient(app)
+    second_student = TestClient(app)
+    payload = {
+        "student_no": student_no,
+        "name": student_name,
+        "activation_code": fictional_activation_code(activation_seed),
+    }
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(
+                first_student.post, "/api/student/login", json=payload
+            )
+            assert first_reached_cookie_boundary.wait(timeout=10)
+            second_future = pool.submit(
+                second_student.post, "/api/student/login", json=payload
+            )
+            second_response = second_future.result(timeout=10)
+            assert second_response.status_code == 409, second_response.text
+            assert second_student.cookies.get(main_module.STUDENT_COOKIE) is None
+            allow_first_response.set()
+            first_response = first_future.result(timeout=10)
+
+        assert first_response.status_code == 200, first_response.text
+        assert first_student.get("/api/student/me").status_code == 200
+        assert clear_calls == 1
+    finally:
+        allow_first_response.set()
+        writer._batch_size = original_batch_size
+        writer._batch_window_seconds = original_batch_window
+        first_student.close()
+        second_student.close()
+
+
+@pytest.mark.parametrize("fail_send", [False, True])
+def test_login_response_gate_releases_only_after_outer_asgi_send(app, fail_send: bool):
+    async def exercise() -> None:
+        gate = main_module.PrincipalResponseGate()
+        release = gate.try_acquire(42)
+        assert release is not None
+        body_send_started = asyncio.Event()
+        allow_body_send = asyncio.Event()
+
+        async def inner(scope, receive, send):
+            scope[main_module.RESPONSE_FINALIZER_SCOPE_KEY] = release
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b'{"ok":true}',
+                }
+            )
+
+        middleware = main_module.ResponseFinalizerMiddleware(inner)
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] != "http.response.body":
+                return
+            body_send_started.set()
+            await allow_body_send.wait()
+            if fail_send:
+                raise RuntimeError("simulated client disconnect")
+
+        response_task = asyncio.create_task(
+            middleware({"type": "http"}, receive, send)
+        )
+        await asyncio.wait_for(body_send_started.wait(), timeout=2)
+        assert gate.try_acquire(42) is None
+        allow_body_send.set()
+        if fail_send:
+            with pytest.raises(RuntimeError, match="simulated client disconnect"):
+                await response_task
+        else:
+            await response_task
+        next_release = gate.try_acquire(42)
+        assert next_release is not None
+        next_release()
+
+    assert app.user_middleware[0].cls is main_module.ResponseFinalizerMiddleware
+    asyncio.run(exercise())
+
+
+def test_heartbeat_sqlite_reads_run_off_the_event_loop(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    activity_id = int(dashboard["settings"]["activity_id"])
+    student_no = "20520000007"
+    student_name = "Async Heartbeat Reads"
+    activation_seed = "ASYNCREAD"
+    imported = import_roster(
+        client,
+        admin_headers,
+        dashboard["majors"][0]["name"],
+        [
+            (
+                student_no,
+                student_name,
+                fictional_document_number(activation_seed),
+            )
+        ],
+    )
+    assert imported.status_code == 200, imported.text
+    student, login_payload = login_student(
+        app,
+        student_no=student_no,
+        name=student_name,
+        activation_code=fictional_activation_code(activation_seed),
+    )
+
+    read_threads: list[str] = []
+    original_connect = main_module.connect
+
+    class ConnectionProxy:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, parameters=()):
+            normalized = " ".join(sql.upper().split())
+            if any(
+                marker in normalized
+                for marker in (
+                    "SELECT ROLE, SUBJECT_ID, CSRF_TOKEN",
+                    "SELECT LAST_SEEN_AT FROM SESSIONS",
+                    "SELECT EXISTS( SELECT 1 FROM SELECTIONS",
+                    "SELECT S.*, A.ID AS ACTIVITY_ID",
+                )
+            ):
+                read_threads.append(threading.current_thread().name)
+            return self._connection.execute(sql, parameters)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    monkeypatch.setattr(
+        main_module,
+        "connect",
+        lambda path: ConnectionProxy(original_connect(path)),
+    )
+    try:
+        heartbeat = student.post(
+            "/api/student/heartbeat",
+            headers=student_headers(login_payload, activity_id),
+        )
+        assert heartbeat.status_code == 200, heartbeat.text
+        assert read_threads
+        assert all("asyncio-portal" not in name for name in read_threads)
+    finally:
+        student.close()
+
+
+def test_queued_heartbeat_uses_writer_execution_time(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    app_config,
+    monkeypatch,
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    activity_id = int(dashboard["settings"]["activity_id"])
+    major_name = dashboard["majors"][0]["name"]
+    imported = import_roster(
+        client,
+        admin_headers,
+        major_name,
+        [
+            (
+                "20520000005",
+                "Delayed Heartbeat Student",
+                fictional_document_number("LATEHEART"),
+            )
+        ],
+    )
+    assert imported.status_code == 200, imported.text
+    student, login_payload = login_student(
+        app,
+        student_no="20520000005",
+        name="Delayed Heartbeat Student",
+        activation_code=fictional_activation_code("LATEHEART"),
+    )
+    student_id = int(login_payload["student"]["id"])
+    connection = connect(app_config.database_path)
+    try:
+        connection.execute(
+            """
+            UPDATE sessions SET last_seen_at = '2000-01-01T00:00:00+00:00'
+            WHERE role = 'student' AND subject_id = ?
+            """,
+            (student_id,),
+        )
+    finally:
+        connection.close()
+
+    write_time = datetime.now(UTC).replace(microsecond=0)
+    read_time = write_time - timedelta(
+        seconds=main_module.PRESENCE_FRESH_SECONDS + 5
+    )
+
+    def controlled_utc_now() -> str:
+        current = (
+            write_time
+            if threading.current_thread().name == "sqlite-batch-writer"
+            else read_time
+        )
+        return current.isoformat(timespec="seconds")
+
+    monkeypatch.setattr(main_module, "utc_now", controlled_utc_now)
+    try:
+        heartbeat = student.post(
+            "/api/student/heartbeat",
+            headers=student_headers(login_payload, activity_id),
+        )
+        assert heartbeat.status_code == 200, heartbeat.text
+        connection = connect(app_config.database_path)
+        try:
+            last_seen_at = connection.execute(
+                """
+                SELECT last_seen_at FROM sessions
+                WHERE role = 'student' AND subject_id = ?
+                """,
+                (student_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        assert last_seen_at == write_time.isoformat(timespec="seconds")
+    finally:
+        student.close()
+
+
 def test_countdown_uses_server_clock_and_opens_atomically_without_sleeping(
     app,
     client: TestClient,
@@ -437,7 +838,7 @@ def test_countdown_uses_server_clock_and_opens_atomically_without_sleeping(
         student.close()
 
 
-def test_selection_projection_failure_returns_committed_fallback(
+def test_selection_returns_committed_payload_without_post_commit_projection(
     app,
     client: TestClient,
     admin_headers: dict[str, str],
@@ -509,7 +910,7 @@ def test_selection_projection_failure_returns_committed_fallback(
         )
         assert selected.status_code == 200, selected.text
         payload = selected.json()
-        assert projection_failure_triggered is True
+        assert projection_failure_triggered is False
         assert payload["selection"]["group_id"] == group_id
         assert payload["receipt"]["token"]
         assert payload["groups"] == []
@@ -757,6 +1158,7 @@ def test_one_hundred_fifty_students_after_countdown_never_oversell(
 
         clock["now"] = base + timedelta(seconds=10)
         barrier = threading.Barrier(150)
+        writer_before = app.state.sqlite_writer.stats()
 
         def submit(index: int):
             barrier.wait(timeout=20)
@@ -768,6 +1170,10 @@ def test_one_hundred_fifty_students_after_countdown_never_oversell(
 
         with ThreadPoolExecutor(max_workers=150) as pool:
             responses = list(pool.map(submit, range(150)))
+
+        writer_after = app.state.sqlite_writer.stats()
+        assert writer_after["commits"] - writer_before["commits"] < 150
+        assert writer_after["max_batch_size"] > 1
 
         statuses = [response.status_code for response in responses]
         assert statuses.count(200) == 30
@@ -799,6 +1205,206 @@ def test_one_hundred_fifty_students_after_countdown_never_oversell(
             "selected": 30,
             "unselected": 120,
         }
+    finally:
+        for student in clients:
+            student.close()
+
+
+def test_same_student_same_group_retry_is_idempotent_after_commit(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    activity_id = int(dashboard["settings"]["activity_id"])
+    major_name = dashboard["majors"][0]["name"]
+    group = dashboard["groups"][0]
+    document_number = fictional_document_number("IDEMPOTENT-SELECTION")
+    imported = import_roster(
+        client,
+        admin_headers,
+        major_name,
+        [("20550000999", "Idempotent Student", document_number)],
+    )
+    assert imported.status_code == 200, imported.text
+    open_selection_now(client, admin_headers)
+    student, login = login_student(
+        app,
+        student_no="20550000999",
+        name="Idempotent Student",
+        activation_code=document_number[-6:],
+    )
+    try:
+        headers = student_headers(login, activity_id)
+        first = student.post(
+            "/api/student/select",
+            headers=headers,
+            json={"group_id": group["id"]},
+        )
+        assert first.status_code == 200, first.text
+        closed = client.post(
+            "/api/admin/status",
+            headers=admin_headers,
+            json={"status": "closed"},
+        )
+        assert closed.status_code == 200, closed.text
+        traces: list[tuple[str, list[str]]] = []
+        original_connect = main_module.connect
+
+        def traced_connect(database_path):
+            connection = original_connect(database_path)
+            statements: list[str] = []
+            traces.append((threading.current_thread().name, statements))
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        monkeypatch.setattr(main_module, "connect", traced_connect)
+        replay_committed = threading.Event()
+        allow_replay_response = threading.Event()
+        original_submit_async = app.state.sqlite_writer.submit_async
+
+        async def gated_submit_async(callback, *, priority=0):
+            result = await original_submit_async(callback, priority=priority)
+            replay_committed.set()
+            allowed = await asyncio.to_thread(
+                allow_replay_response.wait, 10
+            )
+            assert allowed
+            return result
+
+        monkeypatch.setattr(
+            app.state.sqlite_writer, "submit_async", gated_submit_async
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                replay_future = pool.submit(
+                    student.post,
+                    "/api/student/select",
+                    headers=headers,
+                    json={"group_id": group["id"]},
+                )
+                assert replay_committed.wait(timeout=10)
+                revoked = client.post(
+                    "/api/admin/selections/revoke",
+                    headers=admin_headers,
+                    json={
+                        "student_id": first.json()["student"]["id"],
+                        "reason": "synthetic replay response race",
+                    },
+                )
+                assert revoked.status_code == 200, revoked.text
+                allow_replay_response.set()
+                replay = replay_future.result(timeout=10)
+        finally:
+            allow_replay_response.set()
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["phase"] == "closed"
+        assert replay.json()["selection"] == first.json()["selection"]
+        assert replay.json()["receipt"]["token"] == first.json()["receipt"]["token"]
+        writer_statements = next(
+            statements for thread_name, statements in traces if thread_name == "sqlite-batch-writer"
+        )
+        assert not any(
+            "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY"
+            in " ".join(statement.upper().split())
+            for statement in writer_statements
+        )
+        assert not any(
+            "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY"
+            in " ".join(statement.upper().split())
+            for _, statements in traces
+            for statement in statements
+        )
+        connection = connect(client.app.state.config.database_path)
+        try:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM selections"
+            ).fetchone()[0] == 1
+            assert connection.execute(
+                "SELECT COUNT(*) FROM audit_logs WHERE action = 'selection.create'"
+            ).fetchone()[0] == 1
+        finally:
+            connection.close()
+    finally:
+        student.close()
+
+
+def test_three_hundred_simultaneous_valid_choices_commit_without_busy_errors(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    activity_id = int(dashboard["settings"]["activity_id"])
+    major = dashboard["majors"][0]
+    group = dashboard["groups"][0]
+    connection = connect(client.app.state.config.database_path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("UPDATE quotas SET capacity = 0")
+        connection.execute(
+            "UPDATE teaching_groups SET total_capacity = 300 WHERE id = ?",
+            (group["id"],),
+        )
+        connection.execute(
+            "UPDATE quotas SET capacity = 300 WHERE major_id = ? AND group_id = ?",
+            (major["id"], group["id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    rows = [
+        (
+            f"2060000{index:04d}",
+            f"BatchStudent{chr(65 + (index // 26) // 26)}{chr(65 + (index // 26) % 26)}{chr(65 + index % 26)}",
+            fictional_document_number(f"BATCH-300-{index:04d}"),
+        )
+        for index in range(300)
+    ]
+    imported = import_roster(client, admin_headers, major["name"], rows)
+    assert imported.status_code == 200, imported.text
+    open_selection_now(client, admin_headers)
+
+    clients: list[TestClient] = []
+    payloads: list[dict] = []
+    try:
+        for student_no, name, document_number in rows:
+            student, payload = login_student(
+                app,
+                student_no=student_no,
+                name=name,
+                activation_code=document_number[-6:],
+            )
+            clients.append(student)
+            payloads.append(payload)
+
+        barrier = threading.Barrier(300)
+        before = app.state.sqlite_writer.stats()
+
+        def submit(index: int):
+            barrier.wait(timeout=30)
+            return clients[index].post(
+                "/api/student/select",
+                headers=student_headers(payloads[index], activity_id),
+                json={"group_id": group["id"]},
+            )
+
+        with ThreadPoolExecutor(max_workers=300) as pool:
+            responses = list(pool.map(submit, range(300)))
+
+        assert [response.status_code for response in responses] == [200] * 300
+        after = app.state.sqlite_writer.stats()
+        assert after["commits"] - before["commits"] <= 20
+        assert after["max_batch_size"] >= 16
+        connection = connect(client.app.state.config.database_path)
+        try:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM selections WHERE revoked_at IS NULL"
+            ).fetchone()[0] == 300
+        finally:
+            connection.close()
     finally:
         for student in clients:
             student.close()
@@ -840,25 +1446,35 @@ def test_activity_rollover_cannot_race_heartbeat_into_old_activity(
         connection.close()
     heartbeat_waiting = threading.Event()
     allow_heartbeat = threading.Event()
+    initial_read_closed = threading.Event()
+    read_closed_before_writer_wait: list[bool] = []
     pause_lock = threading.Lock()
     paused_once = False
 
     class ConnectionProxy:
         def __init__(self, connection):
             self._connection = connection
+            self._saw_begin = False
 
         def execute(self, sql, parameters=()):
             nonlocal paused_once
             should_pause = False
             if sql.strip().upper() == "BEGIN IMMEDIATE":
+                self._saw_begin = True
                 with pause_lock:
                     if not paused_once:
                         paused_once = True
                         should_pause = True
             if should_pause:
+                read_closed_before_writer_wait.append(initial_read_closed.is_set())
                 heartbeat_waiting.set()
                 assert allow_heartbeat.wait(timeout=10)
             return self._connection.execute(sql, parameters)
+
+        def close(self):
+            if not self._saw_begin:
+                initial_read_closed.set()
+            return self._connection.close()
 
         def __getattr__(self, name):
             return getattr(self._connection, name)
@@ -876,6 +1492,7 @@ def test_activity_rollover_cannot_race_heartbeat_into_old_activity(
                 headers=student_headers(login, activity_id),
             )
             assert heartbeat_waiting.wait(timeout=10)
+            assert read_closed_before_writer_wait == [True]
             rollover = client.post(
                 "/api/admin/activities",
                 headers=admin_headers,

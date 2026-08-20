@@ -62,17 +62,106 @@ def test_result_preview_is_cached_and_uses_csp_compatible_data_url() -> None:
     )[0]
 
     assert "resultCardPreviewPendingKey" in preview_source
+    assert "resultCardPreviewPromise" in preview_source
+    assert "resultCardPreviewBlob" in preview_source
     assert "key === studentState.resultCardPreviewKey" in preview_source
     assert "key === studentState.resultCardPreviewPendingKey" in preview_source
     assert "resultCardDataUrl(blob)" in preview_source
     assert "URL.createObjectURL" not in preview_source
-    assert "void ensureStudentResultCardPreview(payload)" in javascript
+    assert "scheduleStudentResultCardPreview(payload)" in javascript
+    assert "RESULT_CARD_PREVIEW_SPREAD_MS = 15000" in preview_source
+    assert "clearStudentResultCardPreviewSchedule()" in javascript
     assert ".result-card-preview__frame" in css
     assert "aspect-ratio: 9 / 16" in css
     assert "object-fit: contain" in css
     assert '.student-body[data-student-view="success"] .student-hero { display: none; }' in css
     assert '.student-body[data-student-view="success"] .result-card-preview { width: min(34vw, 120px);' in css
     assert '.student-body[data-student-view="success"] .success-card__actions { grid-template-columns: 1fr 1fr;' in css
+
+
+def test_manual_download_reuses_an_inflight_preview_generation() -> None:
+    javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
+    result_flow_source = "function resultCardPreviewKey" + javascript.split(
+        "function resultCardPreviewKey", 1
+    )[1].split("function createGroupOption", 1)[0]
+    harness = rf"""
+const assert = require("node:assert/strict");
+const payload = {{
+  student: {{ id: 17, student_no: "20260000017", name: "测试学生", major_name: "建筑学" }},
+  selection: {{ group_id: 1, group_name: "第一教学组", selected_at: "2026-08-20T10:00:00+00:00" }},
+  receipt: {{ verification_code: "ABCD-EFGH-IJKL", qr_image_url: "/api/student/receipt/qr.png" }},
+  settings: {{ activity_id: 1, activity_title: "并发测试" }},
+}};
+const studentState = {{
+  payload,
+  resultCardInFlight: false,
+  resultCardPreviewKey: null,
+  resultCardPreviewBlob: null,
+  resultCardPreviewError: null,
+  resultCardPreviewPendingKey: null,
+  resultCardPreviewPromise: null,
+  resultCardPreviewScheduledKey: null,
+  resultCardPreviewTimer: null,
+  resultCardPreviewUrl: null,
+}};
+const studentEls = {{
+  downloadResultCard: {{ disabled: false, textContent: "下载抢选结果凭证" }},
+  resultCardPreviewImage: {{ hidden: false, src: "" }},
+  resultCardPreviewStatus: {{ hidden: true, textContent: "" }},
+}};
+let generationCalls = 0;
+let releaseGeneration;
+const generatedBlob = {{ kind: "receipt-png" }};
+function createResultCardBlob() {{
+  generationCalls += 1;
+  return new Promise((resolve) => {{ releaseGeneration = () => resolve(generatedBlob); }});
+}}
+async function resultCardDataUrl(blob) {{
+  assert.equal(blob, generatedBlob);
+  return "data:image/png;base64,preview";
+}}
+let objectUrlCreates = 0;
+const URL = {{
+  createObjectURL(blob) {{ assert.equal(blob, generatedBlob); objectUrlCreates += 1; return "blob:download"; }},
+  revokeObjectURL() {{}},
+}};
+let downloadClicks = 0;
+const document = {{
+  createElement(tag) {{
+    assert.equal(tag, "a");
+    return {{ href: "", download: "", click() {{ downloadClicks += 1; }}, remove() {{}} }};
+  }},
+  body: {{ append() {{}} }},
+}};
+function showStudentMessage() {{}}
+
+{result_flow_source}
+
+(async () => {{
+  const automaticPreview = ensureStudentResultCardPreview(payload);
+  await Promise.resolve();
+  const manualDownload = downloadStudentResultCard();
+  await Promise.resolve();
+  assert.equal(generationCalls, 1, "download must join the in-flight preview render");
+  releaseGeneration();
+  const [previewBlob] = await Promise.all([automaticPreview, manualDownload]);
+  assert.equal(previewBlob, generatedBlob);
+  assert.equal(studentState.resultCardPreviewBlob, generatedBlob);
+  assert.equal(objectUrlCreates, 1);
+  assert.equal(downloadClicks, 1);
+  assert.equal(studentState.resultCardPreviewPendingKey, null);
+  assert.equal(studentState.resultCardPreviewPromise, null);
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+    completed = subprocess.run(
+        ["node", "-e", harness],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 def test_signed_receipt_qr_uses_csp_compatible_decode_and_fails_closed() -> None:

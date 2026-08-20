@@ -7,6 +7,9 @@ import hashlib
 import hmac
 import io
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi.testclient import TestClient
 
@@ -19,6 +22,40 @@ from .conftest import (
     fictional_document_number,
     open_selection_now,
 )
+
+
+def test_concurrent_receipt_qr_cache_misses_share_one_render(
+    client: TestClient, monkeypatch
+) -> None:
+    cache = client.app.state.receipt_qr_cache
+    renderer = client.app.state.receipt_qr_renderer
+    cache.cache_clear()
+    original_make_image = server_main.qrcode.QRCode.make_image
+    render_count = 0
+    render_lock = threading.Lock()
+    start = threading.Barrier(9)
+
+    def slow_make_image(qr, *args, **kwargs):
+        nonlocal render_count
+        with render_lock:
+            render_count += 1
+        time.sleep(0.05)
+        return original_make_image(qr, *args, **kwargs)
+
+    monkeypatch.setattr(server_main.qrcode.QRCode, "make_image", slow_make_image)
+    verify_url = "https://choice.example.com/receipt#token=single-flight-test"
+
+    def render() -> bytes:
+        start.wait(timeout=10)
+        return renderer(verify_url)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(render) for _ in range(8)]
+        start.wait(timeout=10)
+        outputs = [future.result(timeout=10) for future in futures]
+
+    assert render_count == 1
+    assert len(set(outputs)) == 1
 
 
 def signed_receipt_token(secret: str, claims: dict[str, object]) -> str:
@@ -506,6 +543,16 @@ def test_signed_receipt_verifies_and_tampering_or_revocation_invalidates_it(
     assert receipt["token"] not in str(qr_image.request.url)
     assert qr_image.request.url.path == "/api/student/receipt/qr.png"
     assert not qr_image.request.url.query
+    cache_before = client.app.state.receipt_qr_cache.cache_info()
+    repeated_qr = client.post(
+        "/api/student/receipt/qr.png",
+        headers=qr_headers,
+        json={"token": receipt["token"]},
+    )
+    cache_after = client.app.state.receipt_qr_cache.cache_info()
+    assert repeated_qr.status_code == 200
+    assert repeated_qr.content == qr_image.content
+    assert cache_after.hits == cache_before.hits + 1
     encoded_claims = receipt["token"].split(".")[1]
     claims = json.loads(
         base64.urlsafe_b64decode(encoded_claims + "=" * (-len(encoded_claims) % 4))
