@@ -21,6 +21,10 @@ services:
     security_opt:
       - no-new-privileges:true
     pids_limit: 256
+    ulimits:
+      nofile:
+        soft: ${APP_NOFILE_LIMIT:-8192}
+        hard: ${APP_NOFILE_LIMIT:-8192}
     mem_limit: ${APP_MEMORY_LIMIT:-1g}
     cpus: ${APP_CPU_LIMIT:-1.5}
     logging:
