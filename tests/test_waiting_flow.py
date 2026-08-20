@@ -524,6 +524,40 @@ def test_public_status_burst_shares_one_database_projection(
     assert all(payload["server_now"] for payload in payloads)
 
 
+def test_health_check_is_not_queued_behind_a_slow_status_projection(
+    client: TestClient, monkeypatch
+) -> None:
+    original_connect = main_module.connect
+    projection_started = threading.Event()
+    release_projection = threading.Event()
+    counter_lock = threading.Lock()
+    connection_count = 0
+
+    def controlled_connect(database_path):
+        nonlocal connection_count
+        with counter_lock:
+            connection_count += 1
+            call_number = connection_count
+        if call_number == 1:
+            projection_started.set()
+            assert release_projection.wait(timeout=10)
+        return original_connect(database_path)
+
+    monkeypatch.setattr(main_module, "connect", controlled_connect)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        status_future = pool.submit(client.get, "/api/public/status")
+        assert projection_started.wait(timeout=10)
+        health_future = pool.submit(client.get, "/api/health")
+        try:
+            health = health_future.result(timeout=2)
+        finally:
+            release_projection.set()
+        status = status_future.result(timeout=10)
+
+    assert health.status_code == 200, health.text
+    assert status.status_code == 200, status.text
+
+
 def test_selected_student_refresh_skips_capacity_matrix_projection(
     app,
     client: TestClient,
@@ -582,6 +616,390 @@ def test_selected_student_refresh_skips_capacity_matrix_projection(
             "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY" in statement
             for statement in normalized
         )
+    finally:
+        student.close()
+
+
+def test_selection_session_validation_enters_bounded_writer_before_database_read(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    major = dashboard["majors"][0]
+    group = dashboard["groups"][0]
+    student_no = "20550000999"
+    document_number = fictional_document_number("SELECT-AUTH-WORKER")
+    imported = import_roster(
+        client,
+        admin_headers,
+        major["name"],
+        [(student_no, "Selection Worker Student", document_number)],
+    )
+    assert imported.status_code == 200, imported.text
+    quota = client.put(
+        f"/api/admin/quotas/{major['id']}/{group['id']}",
+        headers=admin_headers,
+        json={"capacity": 1},
+    )
+    assert quota.status_code == 200, quota.text
+    open_selection_now(client, admin_headers)
+    student, login = login_student(
+        app,
+        student_no=student_no,
+        name="Selection Worker Student",
+        activation_code=document_number[-6:],
+    )
+    try:
+        connection_threads: list[str] = []
+        original_connect = main_module.connect
+
+        def traced_connect(database_path):
+            connection_threads.append(threading.current_thread().name)
+            return original_connect(database_path)
+
+        monkeypatch.setattr(main_module, "connect", traced_connect)
+        selected = student.post(
+            "/api/student/select",
+            headers=student_headers(login, int(admin_headers["X-Activity-ID"])),
+            json={"group_id": group["id"]},
+        )
+        assert selected.status_code == 200, selected.text
+        # Authentication and the seat claim share the bounded writer callback;
+        # no separate connection may be opened by asyncio's default executor
+        # before the request is admitted to the FIFO.
+        assert connection_threads
+        assert set(connection_threads) == {"sqlite-batch-writer"}
+    finally:
+        student.close()
+
+
+def test_selection_fifo_admission_precedes_slow_session_validation(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    major = dashboard["majors"][0]
+    group = dashboard["groups"][0]
+    first_document = fictional_document_number("FIFO-FIRST")
+    second_document = fictional_document_number("FIFO-SECOND")
+    imported = import_roster(
+        client,
+        admin_headers,
+        major["name"],
+        [
+            ("20550000997", "First Student", first_document),
+            ("20550000998", "Second Student", second_document),
+        ],
+    )
+    assert imported.status_code == 200, imported.text
+    quota = client.put(
+        f"/api/admin/quotas/{major['id']}/{group['id']}",
+        headers=admin_headers,
+        json={"capacity": 1},
+    )
+    assert quota.status_code == 200, quota.text
+    open_selection_now(client, admin_headers)
+    first, first_login = login_student(
+        app,
+        student_no="20550000997",
+        name="First Student",
+        activation_code=first_document[-6:],
+    )
+    second, second_login = login_student(
+        app,
+        student_no="20550000998",
+        name="Second Student",
+        activation_code=second_document[-6:],
+    )
+    release_first_validation = threading.Event()
+    first_validation_started = threading.Event()
+    first_token = first.cookies.get(main_module.STUDENT_COOKIE)
+    original_session_token_hash = main_module.session_token_hash
+    blocked_once = False
+    blocked_lock = threading.Lock()
+
+    def delayed_first_session_token_hash(token: str) -> str:
+        nonlocal blocked_once
+        should_block = False
+        with blocked_lock:
+            if token == first_token and not blocked_once:
+                blocked_once = True
+                should_block = True
+        if should_block:
+            first_validation_started.set()
+            assert release_first_validation.wait(timeout=10)
+        return original_session_token_hash(token)
+
+    monkeypatch.setattr(
+        main_module,
+        "session_token_hash",
+        delayed_first_session_token_hash,
+    )
+    activity_id = int(admin_headers["X-Activity-ID"])
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(
+                first.post,
+                "/api/student/select",
+                headers=student_headers(first_login, activity_id),
+                json={"group_id": group["id"]},
+            )
+            assert first_validation_started.wait(timeout=10)
+            second_future = pool.submit(
+                second.post,
+                "/api/student/select",
+                headers=student_headers(second_login, activity_id),
+                json={"group_id": group["id"]},
+            )
+            time.sleep(0.2)
+            assert not second_future.done()
+            release_first_validation.set()
+            first_response = first_future.result(timeout=10)
+            second_response = second_future.result(timeout=10)
+        assert first_response.status_code == 200, first_response.text
+        assert second_response.status_code == 409, second_response.text
+    finally:
+        release_first_validation.set()
+        first.close()
+        second.close()
+
+
+def test_selection_replayed_signed_cookie_is_throttled_before_writer_admission(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    app_config,
+    monkeypatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    group_id = int(dashboard["groups"][0]["id"])
+    writer = app.state.sqlite_writer
+    original_submit_async = writer.submit_async
+    submitted = 0
+
+    async def counted_submit_async(callback, *, priority=0):
+        nonlocal submitted
+        submitted += 1
+        return await original_submit_async(callback, priority=priority)
+
+    monkeypatch.setattr(writer, "submit_async", counted_submit_async)
+    client.cookies.set(
+        main_module.STUDENT_COOKIE,
+        main_module.new_student_session_token(
+            app_config.app_secret, 1_001, 4_000_000_000
+        ),
+    )
+    headers = {
+        "X-CSRF-Token": "fabricated-csrf-token",
+        "X-Activity-ID": admin_headers["X-Activity-ID"],
+    }
+    responses = [
+        client.post(
+            "/api/student/select",
+            headers=headers,
+            json={"group_id": group_id},
+        )
+        for _ in range(main_module.STUDENT_SELECT_STUDENT_LIMIT + 1)
+    ]
+
+    assert [response.status_code for response in responses] == [
+        *([401] * main_module.STUDENT_SELECT_STUDENT_LIMIT),
+        429,
+    ]
+    assert submitted == main_module.STUDENT_SELECT_STUDENT_LIMIT
+    assert main_module.STUDENT_SELECT_SHARED_IP_LIMIT >= 1_000
+    assert (
+        main_module.STUDENT_SELECT_SHARED_IP_LIMIT
+        <= main_module.STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT
+    )
+    assert 1_000 <= main_module.STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT < 4_096
+
+
+def test_superseded_signed_cookies_share_the_stable_student_limit(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    app_config,
+    monkeypatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    group_id = int(dashboard["groups"][0]["id"])
+    writer = app.state.sqlite_writer
+    original_submit_async = writer.submit_async
+    original_ip_record = app.state.student_select_ip_request_limiter.record_failure
+    submitted = 0
+    shared_ip_records = 0
+
+    async def counted_submit_async(callback, *, priority=0):
+        nonlocal submitted
+        submitted += 1
+        return await original_submit_async(callback, priority=priority)
+
+    def counted_ip_record(key, *, limit, window_seconds):
+        nonlocal shared_ip_records
+        shared_ip_records += 1
+        return original_ip_record(
+            key,
+            limit=limit,
+            window_seconds=window_seconds,
+        )
+
+    monkeypatch.setattr(writer, "submit_async", counted_submit_async)
+    monkeypatch.setattr(
+        app.state.student_select_ip_request_limiter,
+        "record_failure",
+        counted_ip_record,
+    )
+    headers = {
+        "X-CSRF-Token": "fabricated-csrf-token",
+        "X-Activity-ID": admin_headers["X-Activity-ID"],
+    }
+    responses = []
+    for _ in range(main_module.STUDENT_SELECT_STUDENT_LIMIT + 1):
+        client.cookies.set(
+            main_module.STUDENT_COOKIE,
+            main_module.new_student_session_token(
+                app_config.app_secret, 1_002, 4_000_000_000
+            ),
+        )
+        responses.append(
+            client.post(
+                "/api/student/select",
+                headers=headers,
+                json={"group_id": group_id},
+            )
+        )
+
+    assert [response.status_code for response in responses] == [
+        *([401] * main_module.STUDENT_SELECT_STUDENT_LIMIT),
+        429,
+    ]
+    assert submitted == main_module.STUDENT_SELECT_STUDENT_LIMIT
+    assert shared_ip_records == main_module.STUDENT_SELECT_STUDENT_LIMIT
+
+
+def test_selection_signed_cookies_share_an_aggregate_ip_admission_limit(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    app_config,
+    monkeypatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    group_id = int(dashboard["groups"][0]["id"])
+    writer = app.state.sqlite_writer
+    original_submit_async = writer.submit_async
+    submitted = 0
+
+    async def counted_submit_async(callback, *, priority=0):
+        nonlocal submitted
+        submitted += 1
+        return await original_submit_async(callback, priority=priority)
+
+    monkeypatch.setattr(writer, "submit_async", counted_submit_async)
+    monkeypatch.setattr(main_module, "STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT", 3)
+    headers = {
+        "X-CSRF-Token": "fabricated-csrf-token",
+        "X-Activity-ID": admin_headers["X-Activity-ID"],
+    }
+    responses = []
+    for index in range(4):
+        client.cookies.set(
+            main_module.STUDENT_COOKIE,
+            main_module.new_student_session_token(
+                app_config.app_secret, 2_000 + index, 4_000_000_000
+            ),
+        )
+        responses.append(
+            client.post(
+                "/api/student/select",
+                headers=headers,
+                json={"group_id": group_id},
+            )
+        )
+
+    assert [response.status_code for response in responses] == [401, 401, 401, 429]
+    assert responses[-1].headers["Retry-After"] == str(
+        main_module.STUDENT_SELECT_RATE_WINDOW_SECONDS
+    )
+    assert submitted == 3
+
+
+def test_invalid_cookie_flood_does_not_charge_shared_selection_admission(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    major = dashboard["majors"][0]
+    group = dashboard["groups"][0]
+    student_no = "20550000996"
+    document_number = fictional_document_number("SIGNED-SELECT-SESSION")
+    imported = import_roster(
+        client,
+        admin_headers,
+        major["name"],
+        [(student_no, "Signed Session Student", document_number)],
+    )
+    assert imported.status_code == 200, imported.text
+    quota = client.put(
+        f"/api/admin/quotas/{major['id']}/{group['id']}",
+        headers=admin_headers,
+        json={"capacity": 1},
+    )
+    assert quota.status_code == 200, quota.text
+    open_selection_now(client, admin_headers)
+    student, login = login_student(
+        app,
+        student_no=student_no,
+        name="Signed Session Student",
+        activation_code=document_number[-6:],
+    )
+    writer = app.state.sqlite_writer
+    original_submit_async = writer.submit_async
+    submitted = 0
+
+    async def counted_submit_async(callback, *, priority=0):
+        nonlocal submitted
+        submitted += 1
+        return await original_submit_async(callback, priority=priority)
+
+    monkeypatch.setattr(writer, "submit_async", counted_submit_async)
+    monkeypatch.setattr(main_module, "STUDENT_SELECT_SHARED_IP_LIMIT", 1)
+    monkeypatch.setattr(main_module, "STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT", 1)
+    invalid_headers = {
+        "X-CSRF-Token": "fabricated-csrf-token",
+        "X-Activity-ID": admin_headers["X-Activity-ID"],
+    }
+    try:
+        invalid_statuses = []
+        for index in range(10):
+            client.cookies.set(
+                main_module.STUDENT_COOKIE,
+                f"fabricated-session-token-{index}",
+            )
+            invalid_statuses.append(
+                client.post(
+                    "/api/student/select",
+                    headers=invalid_headers,
+                    json={"group_id": group["id"]},
+                ).status_code
+            )
+        assert invalid_statuses == [401] * 10
+        assert submitted == 0
+
+        selected = student.post(
+            "/api/student/select",
+            headers=student_headers(login, int(admin_headers["X-Activity-ID"])),
+            json={"group_id": group["id"]},
+        )
+        assert selected.status_code == 200, selected.text
+        assert submitted == 1
     finally:
         student.close()
 

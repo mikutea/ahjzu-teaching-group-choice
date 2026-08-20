@@ -46,10 +46,13 @@ from .security import (
     hash_password,
     new_csrf_token,
     new_session_token,
+    new_student_session_token,
     session_token_hash,
+    student_session_token_subject,
     verify_activation_ciphertext,
     verify_activation_code,
     verify_password,
+    verify_student_session_token,
 )
 from .student_identity import (
     ACTIVATION_CODE_LENGTH,
@@ -88,9 +91,14 @@ RECEIPT_RATE_WINDOW_SECONDS = 300
 RECEIPT_TOKEN_VERIFY_LIMIT = 30
 RECEIPT_SHARED_IP_DISTINCT_LIMIT = 500
 RECEIPT_INVALID_IP_LIMIT = 5_000
+STUDENT_SELECT_RATE_WINDOW_SECONDS = 30
+STUDENT_SELECT_STUDENT_LIMIT = 6
+STUDENT_SELECT_SHARED_IP_LIMIT = 1_500
+STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT = 2_000
 RESPONSE_FINALIZER_SCOPE_KEY = "teaching_choice.response_finalizer"
 PUBLIC_STATUS_CACHE_SECONDS = 0.05
-RECEIPT_QR_RENDER_PARALLELISM = 4
+PUBLIC_STATUS_EXECUTOR_WORKERS = 2
+RECEIPT_QR_RENDER_PARALLELISM = 8
 
 
 class PrincipalResponseGate:
@@ -663,6 +671,9 @@ def create_app(config: Config | None = None) -> FastAPI:
     receipt_verify_ip_limiter = DistinctRateLimiter()
     receipt_invalid_limiter = RateLimiter()
     receipt_qr_limiter = RateLimiter()
+    student_select_ip_limiter = DistinctRateLimiter()
+    student_select_ip_request_limiter = RateLimiter()
+    student_select_student_limiter = RateLimiter(max_keys=4_096, evict_oldest=False)
     student_login_response_gate = PrincipalResponseGate()
     public_status_cache_lock = threading.Lock()
     public_status_cache: tuple[float, dict[str, Any]] | None = None
@@ -676,7 +687,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         with executor_lock:
             if public_status_executor is None:
                 public_status_executor = ThreadPoolExecutor(
-                    max_workers=1,
+                    # Status projections remain single-flight, while the spare
+                    # worker keeps liveness checks independent of a slow read.
+                    max_workers=PUBLIC_STATUS_EXECUTOR_WORKERS,
                     thread_name_prefix="public-status",
                 )
             return public_status_executor
@@ -740,6 +753,9 @@ def create_app(config: Config | None = None) -> FastAPI:
     )
     app.state.config = config
     app.state.sqlite_writer = sqlite_writer
+    app.state.student_select_ip_limiter = student_select_ip_limiter
+    app.state.student_select_ip_request_limiter = student_select_ip_request_limiter
+    app.state.student_select_student_limiter = student_select_student_limiter
     app.add_middleware(
         ImportBodyLimitMiddleware,
         database_path=config.database_path,
@@ -1230,6 +1246,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         token = request.cookies.get(cookie_name, "")
         if not token:
             raise HTTPException(status_code=401, detail="请先登录")
+        if role == "student" and not verify_student_session_token(
+            config.app_secret, token
+        ):
+            raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
         token_hash = session_token_hash(token)
         row = connection.execute(
             """
@@ -1287,8 +1307,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         token: str,
         csrf_token: str,
         now_dt: datetime,
+        expires_at: datetime | None = None,
     ) -> None:
-        expires = now_dt + timedelta(hours=config.session_hours)
+        expires = expires_at or now_dt + timedelta(hours=config.session_hours)
         connection.execute(
             "DELETE FROM sessions WHERE expires_at <= ?", (session_utc_now(),)
         )
@@ -1524,8 +1545,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection: sqlite3.Connection,
         *,
         identity: Identity,
+        revalidate: bool = True,
     ) -> sqlite3.Row:
-        revalidate_identity(request, connection, identity)
+        if revalidate:
+            revalidate_identity(request, connection, identity)
         supplied = request.headers.get("X-Activity-ID", "").strip()
         if not supplied:
             raise HTTPException(status_code=428, detail="缺少活动版本，请刷新页面后重试")
@@ -1815,24 +1838,47 @@ def create_app(config: Config | None = None) -> FastAPI:
     async def choose_group(
         *,
         request: Request,
-        identity: Identity,
-        student_id: int,
+        identity: Identity | None,
+        student_id: int | None,
         group_id: int,
         source: Literal["student", "admin"],
-        operator: str,
+        operator: str | None,
         require_open: bool,
     ) -> dict[str, Any]:
         def persist_selection(
             connection: sqlite3.Connection,
         ) -> dict[str, Any]:
-            activity = require_expected_activity(
-                request, connection, identity=identity
+            current_identity = identity
+            identity_loaded_in_writer = current_identity is None
+            if current_identity is None:
+                if source != "student":
+                    raise HTTPException(status_code=403, detail="登录身份与操作来源不一致")
+                current_identity = require_session_from_connection(
+                    request,
+                    "student",
+                    connection,
+                    csrf=True,
+                )
+            current_student_id = (
+                current_identity.subject_id if student_id is None else student_id
             )
-            if identity.role != source:
+            current_operator = (
+                str(current_identity.subject_id) if operator is None else operator
+            )
+            activity = require_expected_activity(
+                request,
+                connection,
+                identity=current_identity,
+                revalidate=not identity_loaded_in_writer,
+            )
+            if current_identity.role != source:
                 raise HTTPException(status_code=403, detail="登录身份与操作来源不一致")
-            if source == "student" and identity.subject_id != student_id:
+            if (
+                source == "student"
+                and current_identity.subject_id != current_student_id
+            ):
                 raise HTTPException(status_code=403, detail="不能代替其他学生提交选择")
-            if operator != str(identity.subject_id):
+            if current_operator != str(current_identity.subject_id):
                 raise HTTPException(status_code=403, detail="操作人身份校验失败")
             student = connection.execute(
                 """
@@ -1841,7 +1887,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 FROM students s JOIN majors m ON m.id = s.major_id
                 WHERE s.id = ?
                 """,
-                (student_id,),
+                (current_student_id,),
             ).fetchone()
             if not student or not student["active"] or not student["major_active"]:
                 raise HTTPException(status_code=403, detail="学生或所属专业已停用")
@@ -1857,7 +1903,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 receipt = build_selection_receipt(
                     settings=settings,
                     selection_id=selection_id,
-                    student_id=student_id,
+                    student_id=current_student_id,
                     group_id=selection_group_id,
                     selected_at=selected_at,
                     student_no=str(student["student_no"]),
@@ -1872,7 +1918,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                     "student_login_allowed": settings["student_login_allowed"],
                     "status_message": settings["status_message"],
                     "student": {
-                        "id": student_id,
+                        "id": current_student_id,
                         "student_no": student["student_no"],
                         "name": student["name"],
                         "major_id": student["major_id"],
@@ -1895,7 +1941,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 JOIN teaching_groups g ON g.id = se.group_id
                 WHERE se.student_id = ? AND se.revoked_at IS NULL
                 """,
-                (student_id,),
+                (current_student_id,),
             ).fetchone()
             if existing:
                 if source == "student" and int(existing["group_id"]) == group_id:
@@ -1949,7 +1995,13 @@ def create_app(config: Config | None = None) -> FastAPI:
                         (student_id, group_id, selected_at, source, operator)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (student_id, group_id, now, source, operator),
+                    (
+                        current_student_id,
+                        group_id,
+                        now,
+                        source,
+                        current_operator,
+                    ),
                 )
             except sqlite3.IntegrityError as exc:
                 message = str(exc).lower()
@@ -1971,7 +2023,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                         JOIN teaching_groups g ON g.id = se.group_id
                         WHERE se.student_id = ? AND se.revoked_at IS NULL
                         """,
-                        (student_id,),
+                        (current_student_id,),
                     ).fetchone()
                     if (
                         source == "student"
@@ -2000,11 +2052,11 @@ def create_app(config: Config | None = None) -> FastAPI:
             audit(
                 connection,
                 actor_type=source,
-                actor_id=operator,
+                actor_id=current_operator,
                 action="selection.create",
                 entity_type="selection",
                 entity_id=selection_id,
-                details={"student_id": student_id, "group_id": group_id},
+                details={"student_id": current_student_id, "group_id": group_id},
             )
             return committed_payload
 
@@ -2302,7 +2354,6 @@ def create_app(config: Config | None = None) -> FastAPI:
     async def student_login(payload: StudentLogin, request: Request):
         ip_key = client_key(request, "student-login-ip")
         student_ip_limiter.check(ip_key, limit=500, window_seconds=300)
-        token = new_session_token()
         csrf_token = new_csrf_token()
         family_key = student_login_principal_key(
             "student-login-account-family", payload.student_no
@@ -2376,6 +2427,12 @@ def create_app(config: Config | None = None) -> FastAPI:
             )
 
         candidate_id = int(row["id"])
+        session_expires_at = datetime.now(UTC) + timedelta(hours=config.session_hours)
+        token = new_student_session_token(
+            config.app_secret,
+            candidate_id,
+            int(session_expires_at.timestamp()),
+        )
         release_response_gate = student_login_response_gate.try_acquire(candidate_id)
         if release_response_gate is None:
             raise HTTPException(
@@ -2403,6 +2460,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 token=token,
                 csrf_token=csrf_token,
                 now_dt=datetime.now(UTC),
+                expires_at=session_expires_at,
             )
             return student_id
 
@@ -2546,14 +2604,68 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/api/student/select")
     async def student_select(payload: StudentSelect, request: Request):
-        identity = require_session(request, "student", csrf=True)
+        # Reject empty envelopes without consuming the bounded seat-claim queue.
+        # The session and CSRF values are authoritatively verified inside the
+        # writer callback so requests enter its FIFO in event-loop arrival order;
+        # a shared authentication executor must not reorder scarce-seat claims.
+        session_token = request.cookies.get(STUDENT_COOKIE, "")
+        if not session_token:
+            raise HTTPException(status_code=401, detail="请先登录")
+        if not request.headers.get("X-CSRF-Token", ""):
+            raise HTTPException(status_code=403, detail="请求校验失败，请刷新页面后重试")
+        signed_student_id = student_session_token_subject(
+            config.app_secret, session_token
+        )
+        if signed_student_id is None:
+            raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
+        # These isolated, in-memory gates run before database admission.  The
+        # shared-IP allowances cover a full 1000-student campus NAT burst plus
+        # bounded retries, while fabricated cookies cannot occupy the FIFO.
+        select_token_key = student_login_principal_key(
+            "student-select-token", session_token
+        )
+        select_ip_key = client_key(request, "student-select-ip")
+        select_student_key = student_login_principal_key(
+            "student-select-student-id", str(signed_student_id)
+        )
+        if student_select_student_limiter.record_failure(
+            select_student_key,
+            limit=STUDENT_SELECT_STUDENT_LIMIT,
+            window_seconds=STUDENT_SELECT_RATE_WINDOW_SECONDS,
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail="重复提交次数过多，请稍后重试",
+                headers={"Retry-After": str(STUDENT_SELECT_RATE_WINDOW_SECONDS)},
+            )
+        if student_select_ip_request_limiter.record_failure(
+            select_ip_key,
+            limit=STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT,
+            window_seconds=STUDENT_SELECT_RATE_WINDOW_SECONDS,
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail="当前来源的选座请求过多，请稍后重试",
+                headers={"Retry-After": str(STUDENT_SELECT_RATE_WINDOW_SECONDS)},
+            )
+        if student_select_ip_limiter.record_distinct(
+            select_ip_key,
+            select_token_key,
+            limit=STUDENT_SELECT_SHARED_IP_LIMIT,
+            window_seconds=STUDENT_SELECT_RATE_WINDOW_SECONDS,
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail="当前来源的选座请求过多，请稍后重试",
+                headers={"Retry-After": str(STUDENT_SELECT_RATE_WINDOW_SECONDS)},
+            )
         result = await choose_group(
             request=request,
-            identity=identity,
-            student_id=identity.subject_id,
+            identity=None,
+            student_id=signed_student_id,
             group_id=payload.group_id,
             source="student",
-            operator=str(identity.subject_id),
+            operator=None,
             require_open=True,
         )
         return {"ok": True, **result}

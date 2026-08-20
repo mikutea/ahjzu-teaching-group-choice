@@ -20,8 +20,12 @@ from server.security import (
     activation_code_hash,
     encrypt_activation_code,
     hash_password,
+    new_session_token,
+    new_student_session_token,
+    student_session_token_subject,
     validate_password_hash,
     verify_password,
+    verify_student_session_token,
 )
 from server.student_identity import (
     StudentIdentityError,
@@ -214,6 +218,35 @@ def test_password_hash_validator_accepts_only_current_canonical_structure():
     for invalid_password in ("x" * 10, "x" * 11, "x" * 257):
         with pytest.raises(ValueError, match="12 至 256"):
             hash_password(invalid_password)
+
+
+def test_student_session_token_has_a_strict_tamper_evident_envelope(app_config):
+    token = new_student_session_token(app_config.app_secret, 37, 4_000_000_000)
+    assert verify_student_session_token(app_config.app_secret, token) is True
+    assert (
+        student_session_token_subject(
+            app_config.app_secret, token, now_epoch=3_999_999_999
+        )
+        == 37
+    )
+    assert (
+        student_session_token_subject(
+            app_config.app_secret, token, now_epoch=4_000_000_000
+        )
+        is None
+    )
+    replacement = "0" if token[-1] != "0" else "1"
+    assert (
+        verify_student_session_token(
+            app_config.app_secret,
+            token[:-1] + replacement,
+        )
+        is False
+    )
+    assert (
+        verify_student_session_token(app_config.app_secret, new_session_token())
+        is False
+    )
 
 
 def test_initialization_rejects_overlong_admin_password(app_config, tmp_path):
@@ -572,10 +605,13 @@ def test_untrusted_slow_imports_do_not_consume_authenticated_import_slots(
             )
             for _ in range(4)
         ]
-        for _ in range(100):
-            if middleware._active_untrusted_imports == 4:
-                break
-            await asyncio.sleep(0)
+        loop = asyncio.get_running_loop()
+        startup_deadline = loop.time() + 2
+        while (
+            middleware._active_untrusted_imports != 4
+            and loop.time() < startup_deadline
+        ):
+            await asyncio.sleep(0.01)
         assert middleware._active_untrusted_imports == 4
 
         trusted_scope = {

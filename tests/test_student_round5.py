@@ -363,7 +363,15 @@ def test_success_view_keeps_syncing_for_administrator_revocation() -> None:
     assert "clearInterval(studentState.pollTimer)" not in render_block
     assert "if (studentState.payload?.selection) return" not in polling_block
     assert "const hadSelection = Boolean(studentState.payload?.selection)" in polling_block
-    assert "pollStartedAt - studentState.lastSelectedSyncAt < 5000" in polling_block
+    assert (
+        "pollStartedAt - studentState.lastSelectedSyncAt < "
+        "STUDENT_SELECTED_SYNC_INTERVAL_MS"
+    ) in polling_block
+    assert "const STUDENT_WAITING_POLL_INTERVAL_MS = 2500" in javascript
+    assert "const STUDENT_SELECTED_SYNC_INTERVAL_MS = 10000" in javascript
+    assert "const STUDENT_HEARTBEAT_INTERVAL_MS = 15000" in javascript
+    assert "}, STUDENT_WAITING_POLL_INTERVAL_MS);" in polling_block
+    assert "}, STUDENT_HEARTBEAT_INTERVAL_MS);" in polling_block
     assert "hadSelection && !data.selection" in polling_block
     assert "原选择已被管理员撤销" in polling_block
 
@@ -397,6 +405,9 @@ const renders = [];
 const renderedTimingTags = [];
 const synchronizedTimingTags = [];
 const studentResponseClockTimings = new WeakMap();
+const STUDENT_WAITING_POLL_INTERVAL_MS = 2500;
+const STUDENT_SELECTED_SYNC_INTERVAL_MS = 10000;
+const STUDENT_HEARTBEAT_INTERVAL_MS = 15000;
 let intervalCallback = null;
 let now = 1000;
 const studentState = {
@@ -419,7 +430,7 @@ const studentState = {
 };
 global.clearInterval = () => {};
 global.setInterval = (callback, delay) => {
-  if (delay === 1000) intervalCallback = callback;
+  if (delay === STUDENT_WAITING_POLL_INTERVAL_MS) intervalCallback = callback;
   return delay;
 };
 function studentMonotonicNow() { return now; }
@@ -494,6 +505,9 @@ const pollingBlock = "function startStudentPolling" + source
   .split("function tickStudentCountdown", 1)[0];
 const calls = [];
 const renders = [];
+const STUDENT_WAITING_POLL_INTERVAL_MS = 2500;
+const STUDENT_SELECTED_SYNC_INTERVAL_MS = 10000;
+const STUDENT_HEARTBEAT_INTERVAL_MS = 15000;
 let heartbeatCallback = null;
 const studentState = {
   csrf: "csrf",
@@ -513,7 +527,7 @@ const studentState = {
 };
 global.clearInterval = () => {};
 global.setInterval = (callback, delay) => {
-  if (delay === 5000) heartbeatCallback = callback;
+  if (delay === STUDENT_HEARTBEAT_INTERVAL_MS) heartbeatCallback = callback;
   return delay;
 };
 function studentMonotonicNow() { return 1000; }
@@ -556,6 +570,60 @@ eval(pollingBlock);
     assert result["renders"] == ["管理员补录教学组"]
     assert result["csrf"] == "next-csrf"
     assert result["selection"]["group_id"] == 3
+
+
+def test_late_login_prepares_countdown_snapshot_before_rendering() -> None:
+    _, _, javascript = _student_sources()
+    helper_block = "function rememberPreparedCountdownSnapshot" + javascript.split(
+        "function rememberPreparedCountdownSnapshot", 1
+    )[1].split("function renderStudentSettings", 1)[0]
+    session_block = "async function loadStudentSession" + javascript.split(
+        "async function loadStudentSession", 1
+    )[1].split("function startStudentPolling", 1)[0]
+
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const helperBlock = "function rememberPreparedCountdownSnapshot" + source
+  .split("function rememberPreparedCountdownSnapshot", 2)[1]
+  .split("function renderStudentSettings", 1)[0];
+const sessionBlock = "async function loadStudentSession" + source
+  .split("async function loadStudentSession", 2)[1]
+  .split("function startStudentPolling", 1)[0];
+const selectionOpensAt = "2026-08-15T00:00:10Z";
+const studentState = {csrf: "", preparedCountdownKey: null};
+const renderedKeys = [];
+function studentField(payload, key) { return payload?.[key] ?? payload?.settings?.[key] ?? null; }
+async function studentApi(path) {
+  if (path !== "/api/student/me") throw new Error(`unexpected ${path}`);
+  return {
+    csrf_token: "csrf",
+    phase: "countdown",
+    selection_opens_at: selectionOpensAt,
+    selection: null,
+    groups: [{id: 1, name: "已准备教学组"}],
+    student: {id: 1},
+    settings: {activity_id: 7, phase: "countdown", selection_opens_at: selectionOpensAt},
+  };
+}
+function markStudentConnectionHealthy() {}
+function startStudentPolling() {}
+function showStudentMessage(message) { throw new Error(message); }
+function renderStudentPayload() { renderedKeys.push(studentState.preparedCountdownKey); }
+eval(helperBlock + sessionBlock);
+(async () => {
+  await loadStudentSession();
+  process.stdout.write(JSON.stringify({prepared: studentState.preparedCountdownKey, renderedKeys}));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    result = _run_node(script)
+
+    assert helper_block
+    assert "rememberPreparedCountdownSnapshot(data)" in session_block
+    assert result == {
+        "prepared": "7:2026-08-15T00:00:10Z",
+        "renderedKeys": ["7:2026-08-15T00:00:10Z"],
+    }
 
 
 def test_countdown_boundary_reuses_prepared_snapshot_without_refetch() -> None:
