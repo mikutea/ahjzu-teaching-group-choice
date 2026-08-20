@@ -19,6 +19,22 @@ def _web_sources() -> tuple[str, str, str]:
     )
 
 
+def test_container_has_explicit_open_file_headroom_for_peak_login_bursts() -> None:
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    bootstrap = (ROOT / "deploy" / "bootstrap.sh").read_text(encoding="utf-8")
+    deployment = (ROOT / "docs" / "deployment.md").read_text(encoding="utf-8")
+
+    assert "ulimits:" in compose
+    assert "nofile:" in compose
+    assert "soft: ${APP_NOFILE_LIMIT:-8192}" in compose
+    assert "hard: ${APP_NOFILE_LIMIT:-8192}" in compose
+    assert "APP_NOFILE_LIMIT=8192" in env_example
+    assert 'APP_NOFILE_LIMIT_VALUE="${APP_NOFILE_LIMIT:-8192}"' in bootstrap
+    assert 'echo "APP_NOFILE_LIMIT=${APP_NOFILE_LIMIT_VALUE}"' in bootstrap
+    assert "APP_NOFILE_LIMIT=8192" in deployment
+
+
 def test_bootstrap_never_persists_the_plaintext_admin_password() -> None:
     script = (ROOT / "deploy" / "bootstrap.sh").read_text(encoding="utf-8")
 

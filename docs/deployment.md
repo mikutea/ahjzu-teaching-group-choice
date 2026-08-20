@@ -27,9 +27,11 @@ sudo APP_DIR=/opt/ahjzu-teaching-group-choice \
 
 在建议的 2 vCPU、2 GiB 虚拟机上，应用容器默认限制为 1.5 CPU 和 1 GiB 内存，给
 Docker、SQLite 页缓存、`cloudflared` 与系统服务保留余量。可通过 `.env` 中的
-`APP_CPU_LIMIT`、`APP_MEMORY_LIMIT` 调整，但正式环境不应取消资源上限。应用保持单个
-Uvicorn worker：名额写入由 SQLite 单写事务串行化，多 worker 不会提高原子抢位吞吐，
-反而会扩大写锁竞争。
+`APP_CPU_LIMIT`、`APP_MEMORY_LIMIT` 调整，但正式环境不应取消资源上限。容器还把
+`nofile` 软硬限制显式设为 8192，可通过 `APP_NOFILE_LIMIT` 调整；这为登录、轮询、凭证
+下载等短时连接高峰保留文件描述符余量，同时继续受宿主机和容器资源边界约束。应用保持
+单个 Uvicorn worker：名额写入由 SQLite 单写事务串行化，多 worker 不会提高原子抢位
+吞吐，反而会扩大写锁竞争。
 
 ## 更新
 
@@ -112,6 +114,7 @@ sudo APP_DIR=/opt/ahjzu-teaching-group-choice \
 ORIGIN_BIND=127.0.0.1
 APP_CPU_LIMIT=1.5
 APP_MEMORY_LIMIT=1g
+APP_NOFILE_LIMIT=8192
 PUBLIC_BASE_URL=https://class.miyuo.net
 COOKIE_SECURE=true
 TRUSTED_PROXY_IPS=172.18.0.1
