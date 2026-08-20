@@ -506,6 +506,16 @@ def test_signed_receipt_verifies_and_tampering_or_revocation_invalidates_it(
     assert receipt["token"] not in str(qr_image.request.url)
     assert qr_image.request.url.path == "/api/student/receipt/qr.png"
     assert not qr_image.request.url.query
+    cache_before = client.app.state.receipt_qr_cache.cache_info()
+    repeated_qr = client.post(
+        "/api/student/receipt/qr.png",
+        headers=qr_headers,
+        json={"token": receipt["token"]},
+    )
+    cache_after = client.app.state.receipt_qr_cache.cache_info()
+    assert repeated_qr.status_code == 200
+    assert repeated_qr.content == qr_image.content
+    assert cache_after.hits == cache_before.hits + 1
     encoded_claims = receipt["token"].split(".")[1]
     claims = json.loads(
         base64.urlsafe_b64decode(encoded_claims + "=" * (-len(encoded_claims) % 4))

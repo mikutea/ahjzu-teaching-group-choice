@@ -437,7 +437,7 @@ def test_countdown_uses_server_clock_and_opens_atomically_without_sleeping(
         student.close()
 
 
-def test_selection_projection_failure_returns_committed_fallback(
+def test_selection_returns_committed_payload_without_post_commit_projection(
     app,
     client: TestClient,
     admin_headers: dict[str, str],
@@ -509,7 +509,7 @@ def test_selection_projection_failure_returns_committed_fallback(
         )
         assert selected.status_code == 200, selected.text
         payload = selected.json()
-        assert projection_failure_triggered is True
+        assert projection_failure_triggered is False
         assert payload["selection"]["group_id"] == group_id
         assert payload["receipt"]["token"]
         assert payload["groups"] == []
@@ -757,6 +757,7 @@ def test_one_hundred_fifty_students_after_countdown_never_oversell(
 
         clock["now"] = base + timedelta(seconds=10)
         barrier = threading.Barrier(150)
+        writer_before = app.state.sqlite_writer.stats()
 
         def submit(index: int):
             barrier.wait(timeout=20)
@@ -768,6 +769,10 @@ def test_one_hundred_fifty_students_after_countdown_never_oversell(
 
         with ThreadPoolExecutor(max_workers=150) as pool:
             responses = list(pool.map(submit, range(150)))
+
+        writer_after = app.state.sqlite_writer.stats()
+        assert writer_after["commits"] - writer_before["commits"] < 150
+        assert writer_after["max_batch_size"] > 1
 
         statuses = [response.status_code for response in responses]
         assert statuses.count(200) == 30
@@ -799,6 +804,140 @@ def test_one_hundred_fifty_students_after_countdown_never_oversell(
             "selected": 30,
             "unselected": 120,
         }
+    finally:
+        for student in clients:
+            student.close()
+
+
+def test_same_student_same_group_retry_is_idempotent_after_commit(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    activity_id = int(dashboard["settings"]["activity_id"])
+    major_name = dashboard["majors"][0]["name"]
+    group = dashboard["groups"][0]
+    document_number = fictional_document_number("IDEMPOTENT-SELECTION")
+    imported = import_roster(
+        client,
+        admin_headers,
+        major_name,
+        [("20550000999", "Idempotent Student", document_number)],
+    )
+    assert imported.status_code == 200, imported.text
+    open_selection_now(client, admin_headers)
+    student, login = login_student(
+        app,
+        student_no="20550000999",
+        name="Idempotent Student",
+        activation_code=document_number[-6:],
+    )
+    try:
+        headers = student_headers(login, activity_id)
+        first = student.post(
+            "/api/student/select",
+            headers=headers,
+            json={"group_id": group["id"]},
+        )
+        replay = student.post(
+            "/api/student/select",
+            headers=headers,
+            json={"group_id": group["id"]},
+        )
+        assert first.status_code == 200, first.text
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["selection"] == first.json()["selection"]
+        assert replay.json()["receipt"]["token"] == first.json()["receipt"]["token"]
+        connection = connect(client.app.state.config.database_path)
+        try:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM selections WHERE revoked_at IS NULL"
+            ).fetchone()[0] == 1
+            assert connection.execute(
+                "SELECT COUNT(*) FROM audit_logs WHERE action = 'selection.create'"
+            ).fetchone()[0] == 1
+        finally:
+            connection.close()
+    finally:
+        student.close()
+
+
+def test_three_hundred_simultaneous_valid_choices_commit_without_busy_errors(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    activity_id = int(dashboard["settings"]["activity_id"])
+    major = dashboard["majors"][0]
+    group = dashboard["groups"][0]
+    connection = connect(client.app.state.config.database_path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("UPDATE quotas SET capacity = 0")
+        connection.execute(
+            "UPDATE teaching_groups SET total_capacity = 300 WHERE id = ?",
+            (group["id"],),
+        )
+        connection.execute(
+            "UPDATE quotas SET capacity = 300 WHERE major_id = ? AND group_id = ?",
+            (major["id"], group["id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    rows = [
+        (
+            f"2060000{index:04d}",
+            f"BatchStudent{chr(65 + (index // 26) // 26)}{chr(65 + (index // 26) % 26)}{chr(65 + index % 26)}",
+            fictional_document_number(f"BATCH-300-{index:04d}"),
+        )
+        for index in range(300)
+    ]
+    imported = import_roster(client, admin_headers, major["name"], rows)
+    assert imported.status_code == 200, imported.text
+    open_selection_now(client, admin_headers)
+
+    clients: list[TestClient] = []
+    payloads: list[dict] = []
+    try:
+        for student_no, name, document_number in rows:
+            student, payload = login_student(
+                app,
+                student_no=student_no,
+                name=name,
+                activation_code=document_number[-6:],
+            )
+            clients.append(student)
+            payloads.append(payload)
+
+        barrier = threading.Barrier(300)
+        before = app.state.sqlite_writer.stats()
+
+        def submit(index: int):
+            barrier.wait(timeout=30)
+            return clients[index].post(
+                "/api/student/select",
+                headers=student_headers(payloads[index], activity_id),
+                json={"group_id": group["id"]},
+            )
+
+        with ThreadPoolExecutor(max_workers=300) as pool:
+            responses = list(pool.map(submit, range(300)))
+
+        assert [response.status_code for response in responses] == [200] * 300
+        after = app.state.sqlite_writer.stats()
+        assert after["commits"] - before["commits"] <= 20
+        assert after["max_batch_size"] >= 16
+        connection = connect(client.app.state.config.database_path)
+        try:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM selections WHERE revoked_at IS NULL"
+            ).fetchone()[0] == 300
+        finally:
+            connection.close()
     finally:
         for student in clients:
             student.close()

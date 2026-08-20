@@ -114,7 +114,12 @@ const studentState = {
   resultCardInFlight: false,
   resultCardLogoPromise: null,
   resultCardPreviewKey: null,
+  resultCardPreviewBlob: null,
+  resultCardPreviewError: null,
   resultCardPreviewPendingKey: null,
+  resultCardPreviewPromise: null,
+  resultCardPreviewScheduledKey: null,
+  resultCardPreviewTimer: null,
   resultCardPreviewUrl: null,
   serverClockEpochMs: null,
   serverClockMonotonicMs: null,
@@ -923,31 +928,85 @@ function resultCardPreviewKey(payload) {
   ]);
 }
 
+const RESULT_CARD_PREVIEW_SPREAD_MS = 15000;
+
+function clearStudentResultCardPreviewSchedule() {
+  clearTimeout(studentState.resultCardPreviewTimer);
+  studentState.resultCardPreviewTimer = null;
+  studentState.resultCardPreviewScheduledKey = null;
+}
+
+function scheduleStudentResultCardPreview(payload) {
+  const key = resultCardPreviewKey(payload);
+  if (
+    !key
+    || key === studentState.resultCardPreviewKey
+    || key === studentState.resultCardPreviewPendingKey
+    || key === studentState.resultCardPreviewScheduledKey
+  ) return;
+  clearStudentResultCardPreviewSchedule();
+  const studentId = Number(payload?.student?.id);
+  const delay = Number.isSafeInteger(studentId) && studentId > 0
+    ? (studentId * 7919) % RESULT_CARD_PREVIEW_SPREAD_MS
+    : 0;
+  studentState.resultCardPreviewScheduledKey = key;
+  studentEls.resultCardPreviewImage.hidden = true;
+  studentEls.resultCardPreviewStatus.hidden = false;
+  studentEls.resultCardPreviewStatus.textContent = delay > 0
+    ? "服务器已确认，防伪凭证预览将在 15 秒内自动生成…"
+    : "正在生成 9:16 防伪凭证预览…";
+  studentState.resultCardPreviewTimer = setTimeout(() => {
+    studentState.resultCardPreviewTimer = null;
+    studentState.resultCardPreviewScheduledKey = null;
+    if (key !== resultCardPreviewKey(studentState.payload)) return;
+    void ensureStudentResultCardPreview(studentState.payload);
+  }, delay);
+}
+
 async function ensureStudentResultCardPreview(payload) {
   const key = resultCardPreviewKey(payload);
-  if (!key || key === studentState.resultCardPreviewKey || key === studentState.resultCardPreviewPendingKey) return;
+  if (!key) return null;
+  if (key === studentState.resultCardPreviewKey && studentState.resultCardPreviewBlob) {
+    return studentState.resultCardPreviewBlob;
+  }
+  if (key === studentState.resultCardPreviewPendingKey && studentState.resultCardPreviewPromise) {
+    return await studentState.resultCardPreviewPromise;
+  }
   studentState.resultCardPreviewPendingKey = key;
+  studentState.resultCardPreviewError = null;
   studentEls.resultCardPreviewImage.hidden = true;
   studentEls.resultCardPreviewStatus.hidden = false;
   studentEls.resultCardPreviewStatus.textContent = "正在生成 9:16 凭证预览…";
-  try {
-    const blob = await createResultCardBlob(payload);
-    if (key !== resultCardPreviewKey(studentState.payload)) return;
-    const nextUrl = await resultCardDataUrl(blob);
-    if (key !== resultCardPreviewKey(studentState.payload)) return;
-    studentState.resultCardPreviewUrl = nextUrl;
-    studentState.resultCardPreviewKey = key;
-    studentEls.resultCardPreviewImage.src = nextUrl;
-    studentEls.resultCardPreviewImage.hidden = false;
-    studentEls.resultCardPreviewStatus.hidden = true;
-  } catch (error) {
-    if (key !== resultCardPreviewKey(studentState.payload)) return;
-    studentEls.resultCardPreviewImage.hidden = true;
-    studentEls.resultCardPreviewStatus.hidden = false;
-    studentEls.resultCardPreviewStatus.textContent = error.message || "凭证预览生成失败，可点击下方按钮重试下载";
-  } finally {
-    if (studentState.resultCardPreviewPendingKey === key) studentState.resultCardPreviewPendingKey = null;
-  }
+  const previewPromise = (async () => {
+    try {
+      const blob = await createResultCardBlob(payload);
+      if (key !== resultCardPreviewKey(studentState.payload)) return null;
+      const nextUrl = await resultCardDataUrl(blob);
+      if (key !== resultCardPreviewKey(studentState.payload)) return null;
+      studentState.resultCardPreviewBlob = blob;
+      studentState.resultCardPreviewError = null;
+      studentState.resultCardPreviewUrl = nextUrl;
+      studentState.resultCardPreviewKey = key;
+      studentEls.resultCardPreviewImage.src = nextUrl;
+      studentEls.resultCardPreviewImage.hidden = false;
+      studentEls.resultCardPreviewStatus.hidden = true;
+      return blob;
+    } catch (error) {
+      if (key !== resultCardPreviewKey(studentState.payload)) return null;
+      studentState.resultCardPreviewError = error;
+      studentEls.resultCardPreviewImage.hidden = true;
+      studentEls.resultCardPreviewStatus.hidden = false;
+      studentEls.resultCardPreviewStatus.textContent = error.message || "凭证预览生成失败，可点击下方按钮重试下载";
+      return null;
+    } finally {
+      if (studentState.resultCardPreviewPendingKey === key) {
+        studentState.resultCardPreviewPendingKey = null;
+        studentState.resultCardPreviewPromise = null;
+      }
+    }
+  })();
+  studentState.resultCardPreviewPromise = previewPromise;
+  return await previewPromise;
 }
 
 async function downloadStudentResultCard() {
@@ -955,8 +1014,12 @@ async function downloadStudentResultCard() {
   studentState.resultCardInFlight = true;
   studentEls.downloadResultCard.disabled = true;
   studentEls.downloadResultCard.textContent = "正在生成手机高清凭证…";
+  clearStudentResultCardPreviewSchedule();
   try {
-    const blob = await createResultCardBlob(studentState.payload);
+    const blob = await ensureStudentResultCardPreview(studentState.payload);
+    if (!blob) {
+      throw studentState.resultCardPreviewError || new Error("防伪凭证生成失败，请稍后重试");
+    }
     const objectUrl = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     const safeStudentNo = String(studentState.payload.student.student_no).replace(/[^A-Za-z0-9_-]/g, "_");
@@ -1066,10 +1129,11 @@ function renderStudentPayload(payload) {
     studentEls.successView.classList.remove("is-hidden");
     studentEls.successMessage.textContent = `已成功选择「${payload.selection.group_name}」`;
     studentEls.successTime.textContent = formatStudentTime(payload.selection.selected_at);
-    void ensureStudentResultCardPreview(payload);
+    scheduleStudentResultCardPreview(payload);
     return;
   }
 
+  clearStudentResultCardPreviewSchedule();
   studentEls.successView.classList.add("is-hidden");
   const phase = studentPhase(payload);
   announceStudentPhaseTransition(phase);
@@ -1386,6 +1450,7 @@ studentEls.confirmDialog.addEventListener("close", async () => {
 async function studentLogout() {
   clearInterval(studentState.pollTimer);
   clearInterval(studentState.heartbeatTimer);
+  clearStudentResultCardPreviewSchedule();
   let reloadDelay = 0;
   try {
     await studentApi("/api/student/logout", { method: "POST", body: JSON.stringify({}) });

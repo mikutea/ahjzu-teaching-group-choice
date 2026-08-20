@@ -31,7 +31,10 @@ Docker、SQLite 页缓存、`cloudflared` 与系统服务保留余量。可通�
 `nofile` 软硬限制显式设为 8192，可通过 `APP_NOFILE_LIMIT` 调整；这为登录、轮询、凭证
 下载等短时连接高峰保留文件描述符余量，同时继续受宿主机和容器资源边界约束。应用保持
 单个 Uvicorn worker：名额写入由 SQLite 单写事务串行化，多 worker 不会提高原子抢位
-吞吐，反而会扩大写锁竞争。
+吞吐，反而会扩大写锁竞争。应用会把同时到达的登录、心跳和选择写入合并为少量事务；
+可用 `SQLITE_WRITE_BATCH_SIZE`、`SQLITE_WRITE_QUEUE_LIMIT`、
+`SQLITE_WRITE_BATCH_WINDOW_MS` 调整批量大小、有界队列和短聚合窗口。生产默认值分别为
+64、4096、4ms；调整后必须重新进行外网全链路压测。
 
 ## 更新
 
@@ -115,6 +118,9 @@ ORIGIN_BIND=127.0.0.1
 APP_CPU_LIMIT=1.5
 APP_MEMORY_LIMIT=1g
 APP_NOFILE_LIMIT=8192
+SQLITE_WRITE_BATCH_SIZE=64
+SQLITE_WRITE_QUEUE_LIMIT=4096
+SQLITE_WRITE_BATCH_WINDOW_MS=4
 PUBLIC_BASE_URL=https://choice.example.com
 COOKIE_SECURE=true
 TRUSTED_PROXY_IPS=172.18.0.1
