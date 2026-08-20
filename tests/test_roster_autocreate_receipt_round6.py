@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import csv
 from dataclasses import replace
@@ -56,6 +57,149 @@ def test_concurrent_receipt_qr_cache_misses_share_one_render(
 
     assert render_count == 1
     assert len(set(outputs)) == 1
+
+
+def test_distinct_receipt_qr_renders_are_bounded_outside_the_sync_pool() -> None:
+    active = 0
+    max_active = 0
+    render_lock = threading.Lock()
+
+    def render(verify_url: str) -> bytes:
+        nonlocal active, max_active
+        with render_lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.03)
+            return verify_url.encode("ascii")
+        finally:
+            with render_lock:
+                active -= 1
+
+    async def exercise() -> list[bytes]:
+        with ThreadPoolExecutor(
+            max_workers=server_main.RECEIPT_QR_RENDER_PARALLELISM
+        ) as executor:
+            return await asyncio.gather(
+                *(
+                    server_main.render_receipt_qr_limited(
+                        executor,
+                        render,
+                        f"https://class.miyuo.net/receipt#token={index}",
+                    )
+                    for index in range(20)
+                )
+            )
+
+    outputs = asyncio.run(exercise())
+    assert len(outputs) == 20
+    assert max_active == server_main.RECEIPT_QR_RENDER_PARALLELISM
+
+
+def test_cancelled_receipt_qr_requests_keep_running_work_charged() -> None:
+    active = 0
+    max_active = 0
+    started = threading.Event()
+    release = threading.Event()
+    render_lock = threading.Lock()
+
+    def render(verify_url: str) -> bytes:
+        nonlocal active, max_active
+        with render_lock:
+            active += 1
+            max_active = max(max_active, active)
+            if active == 2:
+                started.set()
+        try:
+            assert release.wait(timeout=10)
+            return verify_url.encode("ascii")
+        finally:
+            with render_lock:
+                active -= 1
+
+    async def exercise(executor: ThreadPoolExecutor) -> list[bytes]:
+        cancelled = [
+            asyncio.create_task(
+                server_main.render_receipt_qr_limited(
+                    executor,
+                    render,
+                    f"https://class.miyuo.net/receipt#token=cancel-{index}",
+                )
+            )
+            for index in range(2)
+        ]
+        assert await asyncio.to_thread(started.wait, 10)
+        for task in cancelled:
+            task.cancel()
+        await asyncio.gather(*cancelled, return_exceptions=True)
+        queued = [
+            asyncio.create_task(
+                server_main.render_receipt_qr_limited(
+                    executor,
+                    render,
+                    f"https://class.miyuo.net/receipt#token=queued-{index}",
+                )
+            )
+            for index in range(2)
+        ]
+        await asyncio.sleep(0.05)
+        with render_lock:
+            assert active == 2
+            assert max_active == 2
+        release.set()
+        return await asyncio.gather(*queued)
+
+    executor = ThreadPoolExecutor(max_workers=2)
+    try:
+        outputs = asyncio.run(exercise(executor))
+    finally:
+        release.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+    assert len(outputs) == 2
+    assert max_active == 2
+
+
+def test_receipt_qr_executor_is_safe_across_event_loops() -> None:
+    active = 0
+    max_active = 0
+    render_lock = threading.Lock()
+
+    def render(verify_url: str) -> bytes:
+        nonlocal active, max_active
+        with render_lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.02)
+            return verify_url.encode("ascii")
+        finally:
+            with render_lock:
+                active -= 1
+
+    executor = ThreadPoolExecutor(max_workers=4)
+
+    def run_loop(prefix: str) -> list[bytes]:
+        async def exercise() -> list[bytes]:
+            return await asyncio.gather(
+                *(
+                    server_main.render_receipt_qr_limited(
+                        executor,
+                        render,
+                        f"https://class.miyuo.net/receipt#token={prefix}-{index}",
+                    )
+                    for index in range(8)
+                )
+            )
+
+        return asyncio.run(exercise())
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as loops:
+            outputs = list(loops.map(run_loop, ("first", "second")))
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    assert [len(group) for group in outputs] == [8, 8]
+    assert max_active == 4
 
 
 def signed_receipt_token(secret: str, claims: dict[str, object]) -> str:
