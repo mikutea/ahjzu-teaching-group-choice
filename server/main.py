@@ -91,6 +91,7 @@ RECEIPT_INVALID_IP_LIMIT = 5_000
 STUDENT_SELECT_RATE_WINDOW_SECONDS = 30
 STUDENT_SELECT_TOKEN_LIMIT = 6
 STUDENT_SELECT_SHARED_IP_LIMIT = 1_500
+STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT = 2_000
 RESPONSE_FINALIZER_SCOPE_KEY = "teaching_choice.response_finalizer"
 PUBLIC_STATUS_CACHE_SECONDS = 0.05
 PUBLIC_STATUS_EXECUTOR_WORKERS = 2
@@ -668,6 +669,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     receipt_invalid_limiter = RateLimiter()
     receipt_qr_limiter = RateLimiter()
     student_select_ip_limiter = DistinctRateLimiter()
+    student_select_ip_request_limiter = RateLimiter()
     student_select_token_limiter = RateLimiter()
     student_login_response_gate = PrincipalResponseGate()
     public_status_cache_lock = threading.Lock()
@@ -749,6 +751,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.state.config = config
     app.state.sqlite_writer = sqlite_writer
     app.state.student_select_ip_limiter = student_select_ip_limiter
+    app.state.student_select_ip_request_limiter = student_select_ip_request_limiter
     app.state.student_select_token_limiter = student_select_token_limiter
     app.add_middleware(
         ImportBodyLimitMiddleware,
@@ -2597,13 +2600,24 @@ def create_app(config: Config | None = None) -> FastAPI:
         if not request.headers.get("X-CSRF-Token", ""):
             raise HTTPException(status_code=403, detail="请求校验失败，请刷新页面后重试")
         # These isolated, in-memory gates run before database admission.  The
-        # shared-IP allowance covers a full 1000-student campus NAT burst plus
-        # bounded retries, while one fabricated cookie cannot occupy the FIFO.
+        # shared-IP allowances cover a full 1000-student campus NAT burst plus
+        # bounded retries, while fabricated cookies cannot occupy the FIFO.
         select_token_key = student_login_principal_key(
             "student-select-token", session_token
         )
+        select_ip_key = client_key(request, "student-select-ip")
+        if student_select_ip_request_limiter.record_failure(
+            select_ip_key,
+            limit=STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT,
+            window_seconds=STUDENT_SELECT_RATE_WINDOW_SECONDS,
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail="当前来源的选座请求过多，请稍后重试",
+                headers={"Retry-After": str(STUDENT_SELECT_RATE_WINDOW_SECONDS)},
+            )
         if student_select_ip_limiter.record_distinct(
-            client_key(request, "student-select-ip"),
+            select_ip_key,
             select_token_key,
             limit=STUDENT_SELECT_SHARED_IP_LIMIT,
             window_seconds=STUDENT_SELECT_RATE_WINDOW_SECONDS,

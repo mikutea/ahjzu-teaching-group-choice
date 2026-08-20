@@ -806,7 +806,55 @@ def test_selection_fabricated_cookie_is_throttled_before_writer_admission(
     ]
     assert submitted == main_module.STUDENT_SELECT_TOKEN_LIMIT
     assert main_module.STUDENT_SELECT_SHARED_IP_LIMIT >= 1_000
-    assert main_module.STUDENT_SELECT_SHARED_IP_LIMIT < 4_096
+    assert (
+        main_module.STUDENT_SELECT_SHARED_IP_LIMIT
+        <= main_module.STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT
+    )
+    assert 1_000 <= main_module.STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT < 4_096
+
+
+def test_selection_fabricated_cookies_share_an_aggregate_ip_admission_limit(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    group_id = int(dashboard["groups"][0]["id"])
+    writer = app.state.sqlite_writer
+    original_submit_async = writer.submit_async
+    submitted = 0
+
+    async def counted_submit_async(callback, *, priority=0):
+        nonlocal submitted
+        submitted += 1
+        return await original_submit_async(callback, priority=priority)
+
+    monkeypatch.setattr(writer, "submit_async", counted_submit_async)
+    monkeypatch.setattr(main_module, "STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT", 3)
+    headers = {
+        "X-CSRF-Token": "fabricated-csrf-token",
+        "X-Activity-ID": admin_headers["X-Activity-ID"],
+    }
+    responses = []
+    for index in range(4):
+        client.cookies.set(
+            main_module.STUDENT_COOKIE,
+            f"fabricated-session-token-{index}",
+        )
+        responses.append(
+            client.post(
+                "/api/student/select",
+                headers=headers,
+                json={"group_id": group_id},
+            )
+        )
+
+    assert [response.status_code for response in responses] == [401, 401, 401, 429]
+    assert responses[-1].headers["Retry-After"] == str(
+        main_module.STUDENT_SELECT_RATE_WINDOW_SECONDS
+    )
+    assert submitted == 3
 
 
 def test_overlapping_student_login_cannot_publish_a_superseded_cookie(
