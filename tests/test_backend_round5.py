@@ -22,6 +22,7 @@ from server.security import (
     hash_password,
     new_session_token,
     new_student_session_token,
+    student_session_token_subject,
     validate_password_hash,
     verify_password,
     verify_student_session_token,
@@ -220,8 +221,20 @@ def test_password_hash_validator_accepts_only_current_canonical_structure():
 
 
 def test_student_session_token_has_a_strict_tamper_evident_envelope(app_config):
-    token = new_student_session_token(app_config.app_secret)
+    token = new_student_session_token(app_config.app_secret, 37, 4_000_000_000)
     assert verify_student_session_token(app_config.app_secret, token) is True
+    assert (
+        student_session_token_subject(
+            app_config.app_secret, token, now_epoch=3_999_999_999
+        )
+        == 37
+    )
+    assert (
+        student_session_token_subject(
+            app_config.app_secret, token, now_epoch=4_000_000_000
+        )
+        is None
+    )
     replacement = "0" if token[-1] != "0" else "1"
     assert (
         verify_student_session_token(

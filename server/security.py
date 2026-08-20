@@ -5,6 +5,7 @@ import binascii
 import hashlib
 import hmac
 import secrets
+import time
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -101,32 +102,53 @@ def new_session_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def new_student_session_token(app_secret: str) -> str:
+def new_student_session_token(
+    app_secret: str,
+    student_id: int,
+    expires_at_epoch: int,
+) -> str:
+    if student_id < 1 or expires_at_epoch < 1:
+        raise ValueError("student session claims must be positive")
     nonce = secrets.token_urlsafe(STUDENT_SESSION_TOKEN_NONCE_BYTES)
+    claims = f"{student_id}\0{expires_at_epoch}\0{nonce}".encode("ascii")
     signature = hmac.new(
         app_secret.encode("utf-8"),
-        b"student-session-token-v1\0" + nonce.encode("ascii"),
+        b"student-session-token-v1\0" + claims,
         hashlib.sha256,
     ).hexdigest()
-    return f"{STUDENT_SESSION_TOKEN_VERSION}.{nonce}.{signature}"
+    return (
+        f"{STUDENT_SESSION_TOKEN_VERSION}.{student_id}."
+        f"{expires_at_epoch}.{nonce}.{signature}"
+    )
 
 
-def verify_student_session_token(app_secret: str, token: object) -> bool:
-    """Validate the MAC envelope without touching session storage."""
+def student_session_token_subject(
+    app_secret: str,
+    token: object,
+    *,
+    now_epoch: int | None = None,
+) -> int | None:
+    """Return the signed, unexpired student id without touching storage."""
 
     if not isinstance(token, str):
-        return False
+        return None
     parts = token.split(".")
-    if len(parts) != 3:
-        return False
-    version, nonce, signature = parts
+    if len(parts) != 5:
+        return None
+    version, student_id_text, expires_at_text, nonce, signature = parts
     if (
         version != STUDENT_SESSION_TOKEN_VERSION
+        or not student_id_text.isascii()
+        or not student_id_text.isdecimal()
+        or not expires_at_text.isascii()
+        or not expires_at_text.isdecimal()
         or len(nonce) != 43
         or len(signature) != 64
     ):
-        return False
+        return None
     try:
+        student_id = int(student_id_text)
+        expires_at_epoch = int(expires_at_text)
         nonce_bytes = base64.b64decode(
             (nonce + "=").encode("ascii"),
             altchars=b"-_",
@@ -134,19 +156,31 @@ def verify_student_session_token(app_secret: str, token: object) -> bool:
         )
         bytes.fromhex(signature)
     except (UnicodeEncodeError, ValueError, binascii.Error):
-        return False
+        return None
     if (
-        len(nonce_bytes) != STUDENT_SESSION_TOKEN_NONCE_BYTES
+        student_id < 1
+        or student_id_text != str(student_id)
+        or expires_at_epoch < 1
+        or expires_at_text != str(expires_at_epoch)
+        or len(nonce_bytes) != STUDENT_SESSION_TOKEN_NONCE_BYTES
         or base64.urlsafe_b64encode(nonce_bytes).decode("ascii").rstrip("=")
         != nonce
     ):
-        return False
+        return None
+    claims = f"{student_id}\0{expires_at_epoch}\0{nonce}".encode("ascii")
     expected = hmac.new(
         app_secret.encode("utf-8"),
-        b"student-session-token-v1\0" + nonce.encode("ascii"),
+        b"student-session-token-v1\0" + claims,
         hashlib.sha256,
     ).hexdigest()
-    return hmac.compare_digest(signature, expected)
+    if not hmac.compare_digest(signature, expected):
+        return None
+    current_epoch = int(time.time()) if now_epoch is None else now_epoch
+    return student_id if expires_at_epoch > current_epoch else None
+
+
+def verify_student_session_token(app_secret: str, token: object) -> bool:
+    return student_session_token_subject(app_secret, token) is not None
 
 
 def session_token_hash(token: str) -> str:

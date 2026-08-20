@@ -789,7 +789,9 @@ def test_selection_replayed_signed_cookie_is_throttled_before_writer_admission(
     monkeypatch.setattr(writer, "submit_async", counted_submit_async)
     client.cookies.set(
         main_module.STUDENT_COOKIE,
-        main_module.new_student_session_token(app_config.app_secret),
+        main_module.new_student_session_token(
+            app_config.app_secret, 1_001, 4_000_000_000
+        ),
     )
     headers = {
         "X-CSRF-Token": "fabricated-csrf-token",
@@ -801,20 +803,83 @@ def test_selection_replayed_signed_cookie_is_throttled_before_writer_admission(
             headers=headers,
             json={"group_id": group_id},
         )
-        for _ in range(main_module.STUDENT_SELECT_TOKEN_LIMIT + 1)
+        for _ in range(main_module.STUDENT_SELECT_STUDENT_LIMIT + 1)
     ]
 
     assert [response.status_code for response in responses] == [
-        *([401] * main_module.STUDENT_SELECT_TOKEN_LIMIT),
+        *([401] * main_module.STUDENT_SELECT_STUDENT_LIMIT),
         429,
     ]
-    assert submitted == main_module.STUDENT_SELECT_TOKEN_LIMIT
+    assert submitted == main_module.STUDENT_SELECT_STUDENT_LIMIT
     assert main_module.STUDENT_SELECT_SHARED_IP_LIMIT >= 1_000
     assert (
         main_module.STUDENT_SELECT_SHARED_IP_LIMIT
         <= main_module.STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT
     )
     assert 1_000 <= main_module.STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT < 4_096
+
+
+def test_superseded_signed_cookies_share_the_stable_student_limit(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    app_config,
+    monkeypatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    group_id = int(dashboard["groups"][0]["id"])
+    writer = app.state.sqlite_writer
+    original_submit_async = writer.submit_async
+    original_ip_record = app.state.student_select_ip_request_limiter.record_failure
+    submitted = 0
+    shared_ip_records = 0
+
+    async def counted_submit_async(callback, *, priority=0):
+        nonlocal submitted
+        submitted += 1
+        return await original_submit_async(callback, priority=priority)
+
+    def counted_ip_record(key, *, limit, window_seconds):
+        nonlocal shared_ip_records
+        shared_ip_records += 1
+        return original_ip_record(
+            key,
+            limit=limit,
+            window_seconds=window_seconds,
+        )
+
+    monkeypatch.setattr(writer, "submit_async", counted_submit_async)
+    monkeypatch.setattr(
+        app.state.student_select_ip_request_limiter,
+        "record_failure",
+        counted_ip_record,
+    )
+    headers = {
+        "X-CSRF-Token": "fabricated-csrf-token",
+        "X-Activity-ID": admin_headers["X-Activity-ID"],
+    }
+    responses = []
+    for _ in range(main_module.STUDENT_SELECT_STUDENT_LIMIT + 1):
+        client.cookies.set(
+            main_module.STUDENT_COOKIE,
+            main_module.new_student_session_token(
+                app_config.app_secret, 1_002, 4_000_000_000
+            ),
+        )
+        responses.append(
+            client.post(
+                "/api/student/select",
+                headers=headers,
+                json={"group_id": group_id},
+            )
+        )
+
+    assert [response.status_code for response in responses] == [
+        *([401] * main_module.STUDENT_SELECT_STUDENT_LIMIT),
+        429,
+    ]
+    assert submitted == main_module.STUDENT_SELECT_STUDENT_LIMIT
+    assert shared_ip_records == main_module.STUDENT_SELECT_STUDENT_LIMIT
 
 
 def test_selection_signed_cookies_share_an_aggregate_ip_admission_limit(
@@ -845,7 +910,9 @@ def test_selection_signed_cookies_share_an_aggregate_ip_admission_limit(
     for index in range(4):
         client.cookies.set(
             main_module.STUDENT_COOKIE,
-            main_module.new_student_session_token(app_config.app_secret),
+            main_module.new_student_session_token(
+                app_config.app_secret, 2_000 + index, 4_000_000_000
+            ),
         )
         responses.append(
             client.post(

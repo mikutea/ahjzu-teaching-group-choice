@@ -48,6 +48,7 @@ from .security import (
     new_session_token,
     new_student_session_token,
     session_token_hash,
+    student_session_token_subject,
     verify_activation_ciphertext,
     verify_activation_code,
     verify_password,
@@ -91,7 +92,7 @@ RECEIPT_TOKEN_VERIFY_LIMIT = 30
 RECEIPT_SHARED_IP_DISTINCT_LIMIT = 500
 RECEIPT_INVALID_IP_LIMIT = 5_000
 STUDENT_SELECT_RATE_WINDOW_SECONDS = 30
-STUDENT_SELECT_TOKEN_LIMIT = 6
+STUDENT_SELECT_STUDENT_LIMIT = 6
 STUDENT_SELECT_SHARED_IP_LIMIT = 1_500
 STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT = 2_000
 RESPONSE_FINALIZER_SCOPE_KEY = "teaching_choice.response_finalizer"
@@ -672,7 +673,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     receipt_qr_limiter = RateLimiter()
     student_select_ip_limiter = DistinctRateLimiter()
     student_select_ip_request_limiter = RateLimiter()
-    student_select_token_limiter = RateLimiter()
+    student_select_student_limiter = RateLimiter(max_keys=4_096, evict_oldest=False)
     student_login_response_gate = PrincipalResponseGate()
     public_status_cache_lock = threading.Lock()
     public_status_cache: tuple[float, dict[str, Any]] | None = None
@@ -754,7 +755,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.state.sqlite_writer = sqlite_writer
     app.state.student_select_ip_limiter = student_select_ip_limiter
     app.state.student_select_ip_request_limiter = student_select_ip_request_limiter
-    app.state.student_select_token_limiter = student_select_token_limiter
+    app.state.student_select_student_limiter = student_select_student_limiter
     app.add_middleware(
         ImportBodyLimitMiddleware,
         database_path=config.database_path,
@@ -1306,8 +1307,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         token: str,
         csrf_token: str,
         now_dt: datetime,
+        expires_at: datetime | None = None,
     ) -> None:
-        expires = now_dt + timedelta(hours=config.session_hours)
+        expires = expires_at or now_dt + timedelta(hours=config.session_hours)
         connection.execute(
             "DELETE FROM sessions WHERE expires_at <= ?", (session_utc_now(),)
         )
@@ -2352,7 +2354,6 @@ def create_app(config: Config | None = None) -> FastAPI:
     async def student_login(payload: StudentLogin, request: Request):
         ip_key = client_key(request, "student-login-ip")
         student_ip_limiter.check(ip_key, limit=500, window_seconds=300)
-        token = new_student_session_token(config.app_secret)
         csrf_token = new_csrf_token()
         family_key = student_login_principal_key(
             "student-login-account-family", payload.student_no
@@ -2426,6 +2427,12 @@ def create_app(config: Config | None = None) -> FastAPI:
             )
 
         candidate_id = int(row["id"])
+        session_expires_at = datetime.now(UTC) + timedelta(hours=config.session_hours)
+        token = new_student_session_token(
+            config.app_secret,
+            candidate_id,
+            int(session_expires_at.timestamp()),
+        )
         release_response_gate = student_login_response_gate.try_acquire(candidate_id)
         if release_response_gate is None:
             raise HTTPException(
@@ -2453,6 +2460,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 token=token,
                 csrf_token=csrf_token,
                 now_dt=datetime.now(UTC),
+                expires_at=session_expires_at,
             )
             return student_id
 
@@ -2605,7 +2613,10 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="请先登录")
         if not request.headers.get("X-CSRF-Token", ""):
             raise HTTPException(status_code=403, detail="请求校验失败，请刷新页面后重试")
-        if not verify_student_session_token(config.app_secret, session_token):
+        signed_student_id = student_session_token_subject(
+            config.app_secret, session_token
+        )
+        if signed_student_id is None:
             raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
         # These isolated, in-memory gates run before database admission.  The
         # shared-IP allowances cover a full 1000-student campus NAT burst plus
@@ -2614,6 +2625,19 @@ def create_app(config: Config | None = None) -> FastAPI:
             "student-select-token", session_token
         )
         select_ip_key = client_key(request, "student-select-ip")
+        select_student_key = student_login_principal_key(
+            "student-select-student-id", str(signed_student_id)
+        )
+        if student_select_student_limiter.record_failure(
+            select_student_key,
+            limit=STUDENT_SELECT_STUDENT_LIMIT,
+            window_seconds=STUDENT_SELECT_RATE_WINDOW_SECONDS,
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail="重复提交次数过多，请稍后重试",
+                headers={"Retry-After": str(STUDENT_SELECT_RATE_WINDOW_SECONDS)},
+            )
         if student_select_ip_request_limiter.record_failure(
             select_ip_key,
             limit=STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT,
@@ -2635,20 +2659,10 @@ def create_app(config: Config | None = None) -> FastAPI:
                 detail="当前来源的选座请求过多，请稍后重试",
                 headers={"Retry-After": str(STUDENT_SELECT_RATE_WINDOW_SECONDS)},
             )
-        if student_select_token_limiter.record_failure(
-            select_token_key,
-            limit=STUDENT_SELECT_TOKEN_LIMIT,
-            window_seconds=STUDENT_SELECT_RATE_WINDOW_SECONDS,
-        ):
-            raise HTTPException(
-                status_code=429,
-                detail="重复提交次数过多，请稍后重试",
-                headers={"Retry-After": str(STUDENT_SELECT_RATE_WINDOW_SECONDS)},
-            )
         result = await choose_group(
             request=request,
             identity=None,
-            student_id=None,
+            student_id=signed_student_id,
             group_id=payload.group_id,
             source="student",
             operator=None,
