@@ -26,6 +26,9 @@ class Config:
     public_base_url: str
     trusted_proxy_ips: tuple[str, ...]
     seed_demo_structure: bool
+    sqlite_write_batch_size: int = 64
+    sqlite_write_queue_limit: int = 4_096
+    sqlite_write_batch_window_ms: int = 4
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -39,6 +42,17 @@ class Config:
 
         if len(app_secret) < 32:
             raise RuntimeError("APP_SECRET 必须至少 32 个字符")
+
+        write_batch_size = max(
+            1, min(256, int(os.getenv("SQLITE_WRITE_BATCH_SIZE", "64")))
+        )
+        write_queue_limit = max(
+            write_batch_size,
+            min(16_384, int(os.getenv("SQLITE_WRITE_QUEUE_LIMIT", "4096"))),
+        )
+        write_batch_window_ms = max(
+            0, min(100, int(os.getenv("SQLITE_WRITE_BATCH_WINDOW_MS", "4")))
+        )
 
         return cls(
             environment=environment,
@@ -55,4 +69,7 @@ class Config:
                 if value.strip()
             ),
             seed_demo_structure=_as_bool(os.getenv("SEED_DEMO_STRUCTURE"), False),
+            sqlite_write_batch_size=write_batch_size,
+            sqlite_write_queue_limit=write_queue_limit,
+            sqlite_write_batch_window_ms=write_batch_window_ms,
         )

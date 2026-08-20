@@ -33,6 +33,11 @@ def test_container_has_explicit_open_file_headroom_for_peak_login_bursts() -> No
     assert 'APP_NOFILE_LIMIT_VALUE="${APP_NOFILE_LIMIT:-8192}"' in bootstrap
     assert 'echo "APP_NOFILE_LIMIT=${APP_NOFILE_LIMIT_VALUE}"' in bootstrap
     assert "APP_NOFILE_LIMIT=8192" in deployment
+    assert "SQLITE_WRITE_BATCH_SIZE=64" in env_example
+    assert 'SQLITE_WRITE_BATCH_SIZE_VALUE="${SQLITE_WRITE_BATCH_SIZE:-64}"' in bootstrap
+    assert 'echo "SQLITE_WRITE_BATCH_SIZE=${SQLITE_WRITE_BATCH_SIZE_VALUE}"' in bootstrap
+    assert "SQLITE_WRITE_QUEUE_LIMIT=4096" in env_example
+    assert "SQLITE_WRITE_BATCH_WINDOW_MS=4" in env_example
 
 
 def test_bootstrap_never_persists_the_plaintext_admin_password() -> None:
