@@ -88,6 +88,7 @@ RECEIPT_RATE_WINDOW_SECONDS = 300
 RECEIPT_TOKEN_VERIFY_LIMIT = 30
 RECEIPT_SHARED_IP_DISTINCT_LIMIT = 500
 RECEIPT_INVALID_IP_LIMIT = 5_000
+RESPONSE_FINALIZER_SCOPE_KEY = "teaching_choice.response_finalizer"
 
 
 class PrincipalResponseGate:
@@ -115,18 +116,21 @@ class PrincipalResponseGate:
         return release
 
 
-class FinalizingJSONResponse(JSONResponse):
-    """Run a synchronous finalizer after the complete ASGI response attempt."""
+class ResponseFinalizerMiddleware:
+    """Run request finalizers after the outer server-facing ASGI send."""
 
-    def __init__(self, content: Any, *, finalizer: Callable[[], None]) -> None:
-        super().__init__(content=content)
-        self._finalizer = finalizer
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
 
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
         try:
-            await super().__call__(scope, receive, send)
+            await self.app(scope, receive, send)
         finally:
-            self._finalizer()
+            finalizer = scope.pop(RESPONSE_FINALIZER_SCOPE_KEY, None)
+            if callable(finalizer):
+                finalizer()
 RECEIPT_TOKEN_VERSION = "v2"
 RECEIPT_SNAPSHOT_VERSION = 1
 
@@ -710,6 +714,10 @@ def create_app(config: Config | None = None) -> FastAPI:
             if not response.headers.get("Cache-Control"):
                 response.headers["Cache-Control"] = "no-store"
         return response
+
+    # This pure ASGI layer is intentionally registered after BaseHTTPMiddleware
+    # so it is outermost and observes the actual server-facing send completion.
+    app.add_middleware(ResponseFinalizerMiddleware)
 
     @app.exception_handler(sqlite3.IntegrityError)
     async def sqlite_integrity_error(_: Request, exc: sqlite3.IntegrityError):
@@ -2303,11 +2311,11 @@ def create_app(config: Config | None = None) -> FastAPI:
             student_data = await asyncio.to_thread(project_committed_login)
             if id_key is not None:
                 student_id_limiter.clear(id_key)
-            login_response = FinalizingJSONResponse(
-                {"csrf_token": csrf_token, **student_data},
-                finalizer=release_response_gate,
+            login_response = JSONResponse(
+                {"csrf_token": csrf_token, **student_data}
             )
             set_session_cookie(login_response, "student", token)
+            request.scope[RESPONSE_FINALIZER_SCOPE_KEY] = release_response_gate
             response_owns_gate = True
             return login_response
         finally:
