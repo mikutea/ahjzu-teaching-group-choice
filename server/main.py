@@ -88,6 +88,9 @@ RECEIPT_RATE_WINDOW_SECONDS = 300
 RECEIPT_TOKEN_VERIFY_LIMIT = 30
 RECEIPT_SHARED_IP_DISTINCT_LIMIT = 500
 RECEIPT_INVALID_IP_LIMIT = 5_000
+STUDENT_SELECT_RATE_WINDOW_SECONDS = 30
+STUDENT_SELECT_TOKEN_LIMIT = 6
+STUDENT_SELECT_SHARED_IP_LIMIT = 1_500
 RESPONSE_FINALIZER_SCOPE_KEY = "teaching_choice.response_finalizer"
 PUBLIC_STATUS_CACHE_SECONDS = 0.05
 PUBLIC_STATUS_EXECUTOR_WORKERS = 2
@@ -664,6 +667,8 @@ def create_app(config: Config | None = None) -> FastAPI:
     receipt_verify_ip_limiter = DistinctRateLimiter()
     receipt_invalid_limiter = RateLimiter()
     receipt_qr_limiter = RateLimiter()
+    student_select_ip_limiter = DistinctRateLimiter()
+    student_select_token_limiter = RateLimiter()
     student_login_response_gate = PrincipalResponseGate()
     public_status_cache_lock = threading.Lock()
     public_status_cache: tuple[float, dict[str, Any]] | None = None
@@ -743,6 +748,8 @@ def create_app(config: Config | None = None) -> FastAPI:
     )
     app.state.config = config
     app.state.sqlite_writer = sqlite_writer
+    app.state.student_select_ip_limiter = student_select_ip_limiter
+    app.state.student_select_token_limiter = student_select_token_limiter
     app.add_middleware(
         ImportBodyLimitMiddleware,
         database_path=config.database_path,
@@ -2584,10 +2591,38 @@ def create_app(config: Config | None = None) -> FastAPI:
         # The session and CSRF values are authoritatively verified inside the
         # writer callback so requests enter its FIFO in event-loop arrival order;
         # a shared authentication executor must not reorder scarce-seat claims.
-        if not request.cookies.get(STUDENT_COOKIE, ""):
+        session_token = request.cookies.get(STUDENT_COOKIE, "")
+        if not session_token:
             raise HTTPException(status_code=401, detail="请先登录")
         if not request.headers.get("X-CSRF-Token", ""):
             raise HTTPException(status_code=403, detail="请求校验失败，请刷新页面后重试")
+        # These isolated, in-memory gates run before database admission.  The
+        # shared-IP allowance covers a full 1000-student campus NAT burst plus
+        # bounded retries, while one fabricated cookie cannot occupy the FIFO.
+        select_token_key = student_login_principal_key(
+            "student-select-token", session_token
+        )
+        if student_select_ip_limiter.record_distinct(
+            client_key(request, "student-select-ip"),
+            select_token_key,
+            limit=STUDENT_SELECT_SHARED_IP_LIMIT,
+            window_seconds=STUDENT_SELECT_RATE_WINDOW_SECONDS,
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail="当前来源的选座请求过多，请稍后重试",
+                headers={"Retry-After": str(STUDENT_SELECT_RATE_WINDOW_SECONDS)},
+            )
+        if student_select_token_limiter.record_failure(
+            select_token_key,
+            limit=STUDENT_SELECT_TOKEN_LIMIT,
+            window_seconds=STUDENT_SELECT_RATE_WINDOW_SECONDS,
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail="重复提交次数过多，请稍后重试",
+                headers={"Retry-After": str(STUDENT_SELECT_RATE_WINDOW_SECONDS)},
+            )
         result = await choose_group(
             request=request,
             identity=None,

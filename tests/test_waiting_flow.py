@@ -768,6 +768,47 @@ def test_selection_fifo_admission_precedes_slow_session_validation(
         second.close()
 
 
+def test_selection_fabricated_cookie_is_throttled_before_writer_admission(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    group_id = int(dashboard["groups"][0]["id"])
+    writer = app.state.sqlite_writer
+    original_submit_async = writer.submit_async
+    submitted = 0
+
+    async def counted_submit_async(callback, *, priority=0):
+        nonlocal submitted
+        submitted += 1
+        return await original_submit_async(callback, priority=priority)
+
+    monkeypatch.setattr(writer, "submit_async", counted_submit_async)
+    client.cookies.set(main_module.STUDENT_COOKIE, "fabricated-session-token")
+    headers = {
+        "X-CSRF-Token": "fabricated-csrf-token",
+        "X-Activity-ID": admin_headers["X-Activity-ID"],
+    }
+    responses = [
+        client.post(
+            "/api/student/select",
+            headers=headers,
+            json={"group_id": group_id},
+        )
+        for _ in range(main_module.STUDENT_SELECT_TOKEN_LIMIT + 1)
+    ]
+
+    assert [response.status_code for response in responses] == [
+        *([401] * main_module.STUDENT_SELECT_TOKEN_LIMIT),
+        429,
+    ]
+    assert submitted == main_module.STUDENT_SELECT_TOKEN_LIMIT
+    assert main_module.STUDENT_SELECT_SHARED_IP_LIMIT >= 1_000
+    assert main_module.STUDENT_SELECT_SHARED_IP_LIMIT < 4_096
+
+
 def test_overlapping_student_login_cannot_publish_a_superseded_cookie(
     app,
     client: TestClient,
