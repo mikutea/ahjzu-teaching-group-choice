@@ -1527,8 +1527,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         connection: sqlite3.Connection,
         *,
         identity: Identity,
+        revalidate: bool = True,
     ) -> sqlite3.Row:
-        revalidate_identity(request, connection, identity)
+        if revalidate:
+            revalidate_identity(request, connection, identity)
         supplied = request.headers.get("X-Activity-ID", "").strip()
         if not supplied:
             raise HTTPException(status_code=428, detail="缺少活动版本，请刷新页面后重试")
@@ -1818,24 +1820,47 @@ def create_app(config: Config | None = None) -> FastAPI:
     async def choose_group(
         *,
         request: Request,
-        identity: Identity,
-        student_id: int,
+        identity: Identity | None,
+        student_id: int | None,
         group_id: int,
         source: Literal["student", "admin"],
-        operator: str,
+        operator: str | None,
         require_open: bool,
     ) -> dict[str, Any]:
         def persist_selection(
             connection: sqlite3.Connection,
         ) -> dict[str, Any]:
-            activity = require_expected_activity(
-                request, connection, identity=identity
+            current_identity = identity
+            identity_loaded_in_writer = current_identity is None
+            if current_identity is None:
+                if source != "student":
+                    raise HTTPException(status_code=403, detail="登录身份与操作来源不一致")
+                current_identity = require_session_from_connection(
+                    request,
+                    "student",
+                    connection,
+                    csrf=True,
+                )
+            current_student_id = (
+                current_identity.subject_id if student_id is None else student_id
             )
-            if identity.role != source:
+            current_operator = (
+                str(current_identity.subject_id) if operator is None else operator
+            )
+            activity = require_expected_activity(
+                request,
+                connection,
+                identity=current_identity,
+                revalidate=not identity_loaded_in_writer,
+            )
+            if current_identity.role != source:
                 raise HTTPException(status_code=403, detail="登录身份与操作来源不一致")
-            if source == "student" and identity.subject_id != student_id:
+            if (
+                source == "student"
+                and current_identity.subject_id != current_student_id
+            ):
                 raise HTTPException(status_code=403, detail="不能代替其他学生提交选择")
-            if operator != str(identity.subject_id):
+            if current_operator != str(current_identity.subject_id):
                 raise HTTPException(status_code=403, detail="操作人身份校验失败")
             student = connection.execute(
                 """
@@ -1844,7 +1869,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 FROM students s JOIN majors m ON m.id = s.major_id
                 WHERE s.id = ?
                 """,
-                (student_id,),
+                (current_student_id,),
             ).fetchone()
             if not student or not student["active"] or not student["major_active"]:
                 raise HTTPException(status_code=403, detail="学生或所属专业已停用")
@@ -1860,7 +1885,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 receipt = build_selection_receipt(
                     settings=settings,
                     selection_id=selection_id,
-                    student_id=student_id,
+                    student_id=current_student_id,
                     group_id=selection_group_id,
                     selected_at=selected_at,
                     student_no=str(student["student_no"]),
@@ -1875,7 +1900,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                     "student_login_allowed": settings["student_login_allowed"],
                     "status_message": settings["status_message"],
                     "student": {
-                        "id": student_id,
+                        "id": current_student_id,
                         "student_no": student["student_no"],
                         "name": student["name"],
                         "major_id": student["major_id"],
@@ -1898,7 +1923,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 JOIN teaching_groups g ON g.id = se.group_id
                 WHERE se.student_id = ? AND se.revoked_at IS NULL
                 """,
-                (student_id,),
+                (current_student_id,),
             ).fetchone()
             if existing:
                 if source == "student" and int(existing["group_id"]) == group_id:
@@ -1952,7 +1977,13 @@ def create_app(config: Config | None = None) -> FastAPI:
                         (student_id, group_id, selected_at, source, operator)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (student_id, group_id, now, source, operator),
+                    (
+                        current_student_id,
+                        group_id,
+                        now,
+                        source,
+                        current_operator,
+                    ),
                 )
             except sqlite3.IntegrityError as exc:
                 message = str(exc).lower()
@@ -1974,7 +2005,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                         JOIN teaching_groups g ON g.id = se.group_id
                         WHERE se.student_id = ? AND se.revoked_at IS NULL
                         """,
-                        (student_id,),
+                        (current_student_id,),
                     ).fetchone()
                     if (
                         source == "student"
@@ -2003,11 +2034,11 @@ def create_app(config: Config | None = None) -> FastAPI:
             audit(
                 connection,
                 actor_type=source,
-                actor_id=operator,
+                actor_id=current_operator,
                 action="selection.create",
                 entity_type="selection",
                 entity_id=selection_id,
-                details={"student_id": student_id, "group_id": group_id},
+                details={"student_id": current_student_id, "group_id": group_id},
             )
             return committed_payload
 
@@ -2549,23 +2580,21 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/api/student/select")
     async def student_select(payload: StudentSelect, request: Request):
-        # A classroom-wide release can put every session lookup on this route at
-        # the same instant.  Keep those synchronous SQLite reads off the event
-        # loop so public countdown/status requests remain responsive while the
-        # dedicated writer serializes the actual seat claims.
-        identity = await asyncio.to_thread(
-            require_session,
-            request,
-            "student",
-            csrf=True,
-        )
+        # Reject empty envelopes without consuming the bounded seat-claim queue.
+        # The session and CSRF values are authoritatively verified inside the
+        # writer callback so requests enter its FIFO in event-loop arrival order;
+        # a shared authentication executor must not reorder scarce-seat claims.
+        if not request.cookies.get(STUDENT_COOKIE, ""):
+            raise HTTPException(status_code=401, detail="请先登录")
+        if not request.headers.get("X-CSRF-Token", ""):
+            raise HTTPException(status_code=403, detail="请求校验失败，请刷新页面后重试")
         result = await choose_group(
             request=request,
-            identity=identity,
-            student_id=identity.subject_id,
+            identity=None,
+            student_id=None,
             group_id=payload.group_id,
             source="student",
-            operator=str(identity.subject_id),
+            operator=None,
             require_open=True,
         )
         return {"ok": True, **result}

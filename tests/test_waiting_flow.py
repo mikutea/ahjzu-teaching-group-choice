@@ -620,7 +620,7 @@ def test_selected_student_refresh_skips_capacity_matrix_projection(
         student.close()
 
 
-def test_selection_session_lookup_runs_off_the_event_loop(
+def test_selection_session_validation_enters_bounded_writer_before_database_read(
     app,
     client: TestClient,
     admin_headers: dict[str, str],
@@ -666,11 +666,106 @@ def test_selection_session_lookup_runs_off_the_event_loop(
             json={"group_id": group["id"]},
         )
         assert selected.status_code == 200, selected.text
+        # Authentication and the seat claim share the bounded writer callback;
+        # no separate connection may be opened by asyncio's default executor
+        # before the request is admitted to the FIFO.
         assert connection_threads
-        assert all("asyncio-portal" not in name for name in connection_threads)
-        assert any(name.startswith("asyncio_") for name in connection_threads)
+        assert set(connection_threads) == {"sqlite-batch-writer"}
     finally:
         student.close()
+
+
+def test_selection_fifo_admission_precedes_slow_session_validation(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    major = dashboard["majors"][0]
+    group = dashboard["groups"][0]
+    first_document = fictional_document_number("FIFO-FIRST")
+    second_document = fictional_document_number("FIFO-SECOND")
+    imported = import_roster(
+        client,
+        admin_headers,
+        major["name"],
+        [
+            ("20550000997", "First Student", first_document),
+            ("20550000998", "Second Student", second_document),
+        ],
+    )
+    assert imported.status_code == 200, imported.text
+    quota = client.put(
+        f"/api/admin/quotas/{major['id']}/{group['id']}",
+        headers=admin_headers,
+        json={"capacity": 1},
+    )
+    assert quota.status_code == 200, quota.text
+    open_selection_now(client, admin_headers)
+    first, first_login = login_student(
+        app,
+        student_no="20550000997",
+        name="First Student",
+        activation_code=first_document[-6:],
+    )
+    second, second_login = login_student(
+        app,
+        student_no="20550000998",
+        name="Second Student",
+        activation_code=second_document[-6:],
+    )
+    release_first_validation = threading.Event()
+    first_validation_started = threading.Event()
+    first_token = first.cookies.get(main_module.STUDENT_COOKIE)
+    original_session_token_hash = main_module.session_token_hash
+    blocked_once = False
+    blocked_lock = threading.Lock()
+
+    def delayed_first_session_token_hash(token: str) -> str:
+        nonlocal blocked_once
+        should_block = False
+        with blocked_lock:
+            if token == first_token and not blocked_once:
+                blocked_once = True
+                should_block = True
+        if should_block:
+            first_validation_started.set()
+            assert release_first_validation.wait(timeout=10)
+        return original_session_token_hash(token)
+
+    monkeypatch.setattr(
+        main_module,
+        "session_token_hash",
+        delayed_first_session_token_hash,
+    )
+    activity_id = int(admin_headers["X-Activity-ID"])
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(
+                first.post,
+                "/api/student/select",
+                headers=student_headers(first_login, activity_id),
+                json={"group_id": group["id"]},
+            )
+            assert first_validation_started.wait(timeout=10)
+            second_future = pool.submit(
+                second.post,
+                "/api/student/select",
+                headers=student_headers(second_login, activity_id),
+                json={"group_id": group["id"]},
+            )
+            time.sleep(0.2)
+            assert not second_future.done()
+            release_first_validation.set()
+            first_response = first_future.result(timeout=10)
+            second_response = second_future.result(timeout=10)
+        assert first_response.status_code == 200, first_response.text
+        assert second_response.status_code == 409, second_response.text
+    finally:
+        release_first_validation.set()
+        first.close()
+        second.close()
 
 
 def test_overlapping_student_login_cannot_publish_a_superseded_cookie(

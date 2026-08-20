@@ -462,6 +462,25 @@ function studentPhase(payload = studentState.payload) {
   return "waiting";
 }
 
+function rememberPreparedCountdownSnapshot(payload) {
+  const phase = String(studentField(payload, "phase") || "").toLowerCase();
+  const activityId = payload?.settings?.activity_id ?? payload?.activity_id;
+  const selectionOpensAt = studentField(payload, "selection_opens_at") || "";
+  if (
+    ["countdown", "open"].includes(phase)
+    && activityId !== null
+    && activityId !== undefined
+    && selectionOpensAt
+    && Array.isArray(payload?.groups)
+  ) {
+    studentState.preparedCountdownKey = `${activityId}:${selectionOpensAt}`;
+    return;
+  }
+  if (!["countdown", "open"].includes(phase)) {
+    studentState.preparedCountdownKey = null;
+  }
+}
+
 function renderStudentSettings(settings, payload = { settings }) {
   document.title = `${settings.activity_title} · 建筑与空间规划学院`;
   studentEls.activityTitle.textContent = settings.activity_title;
@@ -1219,6 +1238,7 @@ async function loadStudentSession() {
   try {
     const data = await studentApi("/api/student/me");
     studentState.csrf = data.csrf_token;
+    rememberPreparedCountdownSnapshot(data);
     markStudentConnectionHealthy();
     renderStudentPayload(data);
     startStudentPolling();
@@ -1372,6 +1392,7 @@ studentEls.loginForm.addEventListener("submit", async (event) => {
     });
     studentState.csrf = data.csrf_token;
     studentState.selectedGroupId = null;
+    rememberPreparedCountdownSnapshot(data);
     markStudentConnectionHealthy();
     renderStudentPayload(data);
     startStudentPolling();

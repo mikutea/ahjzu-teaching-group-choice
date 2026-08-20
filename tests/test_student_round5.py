@@ -572,6 +572,60 @@ eval(pollingBlock);
     assert result["selection"]["group_id"] == 3
 
 
+def test_late_login_prepares_countdown_snapshot_before_rendering() -> None:
+    _, _, javascript = _student_sources()
+    helper_block = "function rememberPreparedCountdownSnapshot" + javascript.split(
+        "function rememberPreparedCountdownSnapshot", 1
+    )[1].split("function renderStudentSettings", 1)[0]
+    session_block = "async function loadStudentSession" + javascript.split(
+        "async function loadStudentSession", 1
+    )[1].split("function startStudentPolling", 1)[0]
+
+    script = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const helperBlock = "function rememberPreparedCountdownSnapshot" + source
+  .split("function rememberPreparedCountdownSnapshot", 2)[1]
+  .split("function renderStudentSettings", 1)[0];
+const sessionBlock = "async function loadStudentSession" + source
+  .split("async function loadStudentSession", 2)[1]
+  .split("function startStudentPolling", 1)[0];
+const selectionOpensAt = "2026-08-15T00:00:10Z";
+const studentState = {csrf: "", preparedCountdownKey: null};
+const renderedKeys = [];
+function studentField(payload, key) { return payload?.[key] ?? payload?.settings?.[key] ?? null; }
+async function studentApi(path) {
+  if (path !== "/api/student/me") throw new Error(`unexpected ${path}`);
+  return {
+    csrf_token: "csrf",
+    phase: "countdown",
+    selection_opens_at: selectionOpensAt,
+    selection: null,
+    groups: [{id: 1, name: "已准备教学组"}],
+    student: {id: 1},
+    settings: {activity_id: 7, phase: "countdown", selection_opens_at: selectionOpensAt},
+  };
+}
+function markStudentConnectionHealthy() {}
+function startStudentPolling() {}
+function showStudentMessage(message) { throw new Error(message); }
+function renderStudentPayload() { renderedKeys.push(studentState.preparedCountdownKey); }
+eval(helperBlock + sessionBlock);
+(async () => {
+  await loadStudentSession();
+  process.stdout.write(JSON.stringify({prepared: studentState.preparedCountdownKey, renderedKeys}));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    result = _run_node(script)
+
+    assert helper_block
+    assert "rememberPreparedCountdownSnapshot(data)" in session_block
+    assert result == {
+        "prepared": "7:2026-08-15T00:00:10Z",
+        "renderedKeys": ["7:2026-08-15T00:00:10Z"],
+    }
+
+
 def test_countdown_boundary_reuses_prepared_snapshot_without_refetch() -> None:
     _, _, javascript = _student_sources()
     script = r"""
