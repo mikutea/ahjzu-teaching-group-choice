@@ -553,16 +553,31 @@ def test_overlapping_student_login_cannot_publish_a_superseded_cookie(
 
 
 @pytest.mark.parametrize("fail_send", [False, True])
-def test_login_response_gate_releases_only_after_asgi_send(fail_send: bool):
+def test_login_response_gate_releases_only_after_outer_asgi_send(app, fail_send: bool):
     async def exercise() -> None:
         gate = main_module.PrincipalResponseGate()
         release = gate.try_acquire(42)
         assert release is not None
-        response = main_module.FinalizingJSONResponse(
-            {"ok": True}, finalizer=release
-        )
         body_send_started = asyncio.Event()
         allow_body_send = asyncio.Event()
+
+        async def inner(scope, receive, send):
+            scope[main_module.RESPONSE_FINALIZER_SCOPE_KEY] = release
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b'{"ok":true}',
+                }
+            )
+
+        middleware = main_module.ResponseFinalizerMiddleware(inner)
 
         async def receive():
             return {"type": "http.disconnect"}
@@ -576,7 +591,7 @@ def test_login_response_gate_releases_only_after_asgi_send(fail_send: bool):
                 raise RuntimeError("simulated client disconnect")
 
         response_task = asyncio.create_task(
-            response({"type": "http"}, receive, send)
+            middleware({"type": "http"}, receive, send)
         )
         await asyncio.wait_for(body_send_started.wait(), timeout=2)
         assert gate.try_acquire(42) is None
@@ -590,6 +605,7 @@ def test_login_response_gate_releases_only_after_asgi_send(fail_send: bool):
         assert next_release is not None
         next_release()
 
+    assert app.user_middleware[0].cls is main_module.ResponseFinalizerMiddleware
     asyncio.run(exercise())
 
 
