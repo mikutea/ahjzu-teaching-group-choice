@@ -47,7 +47,7 @@ class Config:
             1, min(256, int(os.getenv("SQLITE_WRITE_BATCH_SIZE", "64")))
         )
         write_queue_limit = max(
-            write_batch_size,
+            write_batch_size * 2,
             min(16_384, int(os.getenv("SQLITE_WRITE_QUEUE_LIMIT", "4096"))),
         )
         write_batch_window_ms = max(

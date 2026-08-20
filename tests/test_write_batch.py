@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from server.config import Config
 from server.write_batch import SQLiteBatchWriter, SQLiteWriteQueueFull
 
 
@@ -103,8 +104,20 @@ def test_one_rejected_job_rolls_back_only_its_savepoint(tmp_path: Path) -> None:
 
 
 def test_batch_writer_rejects_invalid_capacity_configuration(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="queue_limit"):
-        SQLiteBatchWriter(tmp_path / "invalid.db", batch_size=8, queue_limit=7)
+    with pytest.raises(ValueError, match="twice batch_size"):
+        SQLiteBatchWriter(tmp_path / "invalid.db", batch_size=8, queue_limit=15)
+
+
+def test_environment_scales_queue_to_twice_the_active_batch(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("APP_SECRET", "s" * 32)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("SQLITE_WRITE_BATCH_SIZE", "256")
+    monkeypatch.setenv("SQLITE_WRITE_QUEUE_LIMIT", "256")
+    config = Config.from_env()
+    assert config.sqlite_write_batch_size == 256
+    assert config.sqlite_write_queue_limit == 512
 
 
 def test_fully_stopped_writer_can_serve_a_new_application_lifespan(
@@ -153,30 +166,28 @@ def test_low_priority_burst_cannot_consume_reserved_selection_capacity(
         return callback
 
     try:
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             slow = pool.submit(writer.submit, insert("slow", slow=True), priority=10)
             assert slow_started.wait(timeout=10)
             low_one = pool.submit(writer.submit, insert("low-1"), priority=10)
-            low_two = pool.submit(writer.submit, insert("low-2"), priority=10)
             deadline = time.monotonic() + 10
-            while writer.stats()["pending_jobs"] < 3 and time.monotonic() < deadline:
+            while writer.stats()["pending_jobs"] < 2 and time.monotonic() < deadline:
                 time.sleep(0.005)
-            assert writer.stats()["pending_jobs"] == 3
+            assert writer.stats()["pending_jobs"] == 2
             with pytest.raises(SQLiteWriteQueueFull):
                 writer.submit(insert("rejected-low"), priority=10)
             critical = pool.submit(writer.submit, insert("selection"), priority=0)
             deadline = time.monotonic() + 10
-            while writer.stats()["pending_jobs"] < 4 and time.monotonic() < deadline:
+            while writer.stats()["pending_jobs"] < 3 and time.monotonic() < deadline:
                 time.sleep(0.005)
-            assert writer.stats()["pending_jobs"] == 4
+            assert writer.stats()["pending_jobs"] == 3
             release_slow.set()
             assert slow.result(timeout=10) == "slow"
             assert low_one.result(timeout=10) == "low-1"
-            assert low_two.result(timeout=10) == "low-2"
             assert critical.result(timeout=10) == "selection"
         with sqlite3.connect(database_path) as connection:
             values = {row[0] for row in connection.execute("SELECT value FROM events")}
-        assert values == {"slow", "low-1", "low-2", "selection"}
+        assert values == {"slow", "low-1", "selection"}
     finally:
         release_slow.set()
         writer.close()
@@ -201,6 +212,77 @@ def test_small_writer_preserves_low_priority_capacity(tmp_path: Path) -> None:
         assert stats["priority_reserve"] == 64
         assert 256 - stats["priority_reserve"] == 192
     finally:
+        writer.close()
+
+
+def test_reserve_covers_a_maximum_active_batch(tmp_path: Path) -> None:
+    writer = SQLiteBatchWriter(
+        tmp_path / "active-batch-reserve.db",
+        batch_size=128,
+        queue_limit=256,
+    )
+    try:
+        stats = writer.stats()
+        assert stats["priority_reserve"] == 128
+        assert 256 - stats["priority_reserve"] == 128
+    finally:
+        writer.close()
+
+
+def test_active_low_priority_batch_cannot_consume_critical_reserve(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "active-low-batch.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE events (value TEXT)")
+    writer = SQLiteBatchWriter(
+        database_path,
+        batch_size=2,
+        queue_limit=4,
+        batch_window_seconds=1,
+    )
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+
+    def insert(value: str, *, slow: bool = False):
+        def callback(connection: sqlite3.Connection) -> str:
+            if slow:
+                slow_started.set()
+                assert release_slow.wait(timeout=10)
+            connection.execute("INSERT INTO events VALUES (?)", (value,))
+            return value
+
+        return callback
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            low_one = pool.submit(
+                writer.submit, insert("low-1", slow=True), priority=10
+            )
+            low_two = pool.submit(writer.submit, insert("low-2"), priority=10)
+            assert slow_started.wait(timeout=10)
+            assert writer.stats()["active_jobs"] == 2
+            critical = [
+                pool.submit(
+                    writer.submit, insert(f"selection-{index}"), priority=0
+                )
+                for index in range(2)
+            ]
+            deadline = time.monotonic() + 10
+            while writer.stats()["pending_jobs"] < 4 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert writer.stats()["pending_jobs"] == 4
+            with pytest.raises(SQLiteWriteQueueFull):
+                writer.submit(insert("selection-overflow"), priority=0)
+            release_slow.set()
+            assert low_one.result(timeout=10) == "low-1"
+            assert low_two.result(timeout=10) == "low-2"
+            assert sorted(future.result(timeout=10) for future in critical) == [
+                "selection-0",
+                "selection-1",
+            ]
+    finally:
+        release_slow.set()
         writer.close()
 
 
