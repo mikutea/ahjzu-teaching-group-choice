@@ -6,6 +6,9 @@ const CONTROL_CHARACTER_PATTERN = /\p{C}/u;
 const STUDENT_NO_PATTERN = /^\d{11}$/;
 const STUDENT_NAME_PATTERN = /^[A-Za-z\p{Script=Han}]+(?:[ ·•・][A-Za-z\p{Script=Han}]+)*$/u;
 const ACTIVATION_CODE_PATTERN = /^[A-Z0-9]{6}$/;
+const STUDENT_WAITING_POLL_INTERVAL_MS = 2500;
+const STUDENT_SELECTED_SYNC_INTERVAL_MS = 10000;
+const STUDENT_HEARTBEAT_INTERVAL_MS = 15000;
 
 function normalizeCompatibilityText(value) {
   return String(value ?? "").normalize("NFKC");
@@ -1232,7 +1235,7 @@ function startStudentPolling() {
     const pollStartedAt = studentMonotonicNow();
     if (
       studentState.payload?.selection
-      && pollStartedAt - studentState.lastSelectedSyncAt < 5000
+      && pollStartedAt - studentState.lastSelectedSyncAt < STUDENT_SELECTED_SYNC_INTERVAL_MS
     ) return;
     if (studentState.payload?.selection) studentState.lastSelectedSyncAt = pollStartedAt;
     studentState.pollInFlight = true;
@@ -1287,7 +1290,7 @@ function startStudentPolling() {
     } finally {
       studentState.pollInFlight = false;
     }
-  }, 1000);
+  }, STUDENT_WAITING_POLL_INTERVAL_MS);
   studentState.heartbeatTimer = setInterval(async () => {
     if (studentState.heartbeatInFlight || !studentState.payload || studentState.payload.selection) return;
     studentState.heartbeatInFlight = true;
@@ -1311,7 +1314,7 @@ function startStudentPolling() {
     } finally {
       studentState.heartbeatInFlight = false;
     }
-  }, 5000);
+  }, STUDENT_HEARTBEAT_INTERVAL_MS);
 }
 
 function tickStudentCountdown() {
@@ -1337,7 +1340,7 @@ function tickStudentCountdown() {
     studentState.boundaryRefreshPending = true;
     studentApi("/api/student/me")
       .then((latest) => renderStudentPayload(latest))
-      .catch(() => { /* the one-second poll will retry */ })
+      .catch(() => { /* the next lightweight status poll will retry */ })
       .finally(() => { studentState.boundaryRefreshPending = false; });
   }
 }

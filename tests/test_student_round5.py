@@ -363,7 +363,15 @@ def test_success_view_keeps_syncing_for_administrator_revocation() -> None:
     assert "clearInterval(studentState.pollTimer)" not in render_block
     assert "if (studentState.payload?.selection) return" not in polling_block
     assert "const hadSelection = Boolean(studentState.payload?.selection)" in polling_block
-    assert "pollStartedAt - studentState.lastSelectedSyncAt < 5000" in polling_block
+    assert (
+        "pollStartedAt - studentState.lastSelectedSyncAt < "
+        "STUDENT_SELECTED_SYNC_INTERVAL_MS"
+    ) in polling_block
+    assert "const STUDENT_WAITING_POLL_INTERVAL_MS = 2500" in javascript
+    assert "const STUDENT_SELECTED_SYNC_INTERVAL_MS = 10000" in javascript
+    assert "const STUDENT_HEARTBEAT_INTERVAL_MS = 15000" in javascript
+    assert "}, STUDENT_WAITING_POLL_INTERVAL_MS);" in polling_block
+    assert "}, STUDENT_HEARTBEAT_INTERVAL_MS);" in polling_block
     assert "hadSelection && !data.selection" in polling_block
     assert "原选择已被管理员撤销" in polling_block
 
@@ -397,6 +405,9 @@ const renders = [];
 const renderedTimingTags = [];
 const synchronizedTimingTags = [];
 const studentResponseClockTimings = new WeakMap();
+const STUDENT_WAITING_POLL_INTERVAL_MS = 2500;
+const STUDENT_SELECTED_SYNC_INTERVAL_MS = 10000;
+const STUDENT_HEARTBEAT_INTERVAL_MS = 15000;
 let intervalCallback = null;
 let now = 1000;
 const studentState = {
@@ -419,7 +430,7 @@ const studentState = {
 };
 global.clearInterval = () => {};
 global.setInterval = (callback, delay) => {
-  if (delay === 1000) intervalCallback = callback;
+  if (delay === STUDENT_WAITING_POLL_INTERVAL_MS) intervalCallback = callback;
   return delay;
 };
 function studentMonotonicNow() { return now; }
@@ -494,6 +505,9 @@ const pollingBlock = "function startStudentPolling" + source
   .split("function tickStudentCountdown", 1)[0];
 const calls = [];
 const renders = [];
+const STUDENT_WAITING_POLL_INTERVAL_MS = 2500;
+const STUDENT_SELECTED_SYNC_INTERVAL_MS = 10000;
+const STUDENT_HEARTBEAT_INTERVAL_MS = 15000;
 let heartbeatCallback = null;
 const studentState = {
   csrf: "csrf",
@@ -513,7 +527,7 @@ const studentState = {
 };
 global.clearInterval = () => {};
 global.setInterval = (callback, delay) => {
-  if (delay === 5000) heartbeatCallback = callback;
+  if (delay === STUDENT_HEARTBEAT_INTERVAL_MS) heartbeatCallback = callback;
   return delay;
 };
 function studentMonotonicNow() { return 1000; }

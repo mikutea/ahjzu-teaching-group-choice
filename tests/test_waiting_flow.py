@@ -524,6 +524,40 @@ def test_public_status_burst_shares_one_database_projection(
     assert all(payload["server_now"] for payload in payloads)
 
 
+def test_health_check_is_not_queued_behind_a_slow_status_projection(
+    client: TestClient, monkeypatch
+) -> None:
+    original_connect = main_module.connect
+    projection_started = threading.Event()
+    release_projection = threading.Event()
+    counter_lock = threading.Lock()
+    connection_count = 0
+
+    def controlled_connect(database_path):
+        nonlocal connection_count
+        with counter_lock:
+            connection_count += 1
+            call_number = connection_count
+        if call_number == 1:
+            projection_started.set()
+            assert release_projection.wait(timeout=10)
+        return original_connect(database_path)
+
+    monkeypatch.setattr(main_module, "connect", controlled_connect)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        status_future = pool.submit(client.get, "/api/public/status")
+        assert projection_started.wait(timeout=10)
+        health_future = pool.submit(client.get, "/api/health")
+        try:
+            health = health_future.result(timeout=2)
+        finally:
+            release_projection.set()
+        status = status_future.result(timeout=10)
+
+    assert health.status_code == 200, health.text
+    assert status.status_code == 200, status.text
+
+
 def test_selected_student_refresh_skips_capacity_matrix_projection(
     app,
     client: TestClient,
@@ -582,6 +616,59 @@ def test_selected_student_refresh_skips_capacity_matrix_projection(
             "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY" in statement
             for statement in normalized
         )
+    finally:
+        student.close()
+
+
+def test_selection_session_lookup_runs_off_the_event_loop(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    major = dashboard["majors"][0]
+    group = dashboard["groups"][0]
+    student_no = "20550000999"
+    document_number = fictional_document_number("SELECT-AUTH-WORKER")
+    imported = import_roster(
+        client,
+        admin_headers,
+        major["name"],
+        [(student_no, "Selection Worker Student", document_number)],
+    )
+    assert imported.status_code == 200, imported.text
+    quota = client.put(
+        f"/api/admin/quotas/{major['id']}/{group['id']}",
+        headers=admin_headers,
+        json={"capacity": 1},
+    )
+    assert quota.status_code == 200, quota.text
+    open_selection_now(client, admin_headers)
+    student, login = login_student(
+        app,
+        student_no=student_no,
+        name="Selection Worker Student",
+        activation_code=document_number[-6:],
+    )
+    try:
+        connection_threads: list[str] = []
+        original_connect = main_module.connect
+
+        def traced_connect(database_path):
+            connection_threads.append(threading.current_thread().name)
+            return original_connect(database_path)
+
+        monkeypatch.setattr(main_module, "connect", traced_connect)
+        selected = student.post(
+            "/api/student/select",
+            headers=student_headers(login, int(admin_headers["X-Activity-ID"])),
+            json={"group_id": group["id"]},
+        )
+        assert selected.status_code == 200, selected.text
+        assert connection_threads
+        assert all("asyncio-portal" not in name for name in connection_threads)
+        assert any(name.startswith("asyncio_") for name in connection_threads)
     finally:
         student.close()
 

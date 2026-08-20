@@ -90,7 +90,8 @@ RECEIPT_SHARED_IP_DISTINCT_LIMIT = 500
 RECEIPT_INVALID_IP_LIMIT = 5_000
 RESPONSE_FINALIZER_SCOPE_KEY = "teaching_choice.response_finalizer"
 PUBLIC_STATUS_CACHE_SECONDS = 0.05
-RECEIPT_QR_RENDER_PARALLELISM = 4
+PUBLIC_STATUS_EXECUTOR_WORKERS = 2
+RECEIPT_QR_RENDER_PARALLELISM = 8
 
 
 class PrincipalResponseGate:
@@ -676,7 +677,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         with executor_lock:
             if public_status_executor is None:
                 public_status_executor = ThreadPoolExecutor(
-                    max_workers=1,
+                    # Status projections remain single-flight, while the spare
+                    # worker keeps liveness checks independent of a slow read.
+                    max_workers=PUBLIC_STATUS_EXECUTOR_WORKERS,
                     thread_name_prefix="public-status",
                 )
             return public_status_executor
@@ -2546,7 +2549,16 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/api/student/select")
     async def student_select(payload: StudentSelect, request: Request):
-        identity = require_session(request, "student", csrf=True)
+        # A classroom-wide release can put every session lookup on this route at
+        # the same instant.  Keep those synchronous SQLite reads off the event
+        # loop so public countdown/status requests remain responsive while the
+        # dedicated writer serializes the actual seat claims.
+        identity = await asyncio.to_thread(
+            require_session,
+            request,
+            "student",
+            csrf=True,
+        )
         result = await choose_group(
             request=request,
             identity=identity,
