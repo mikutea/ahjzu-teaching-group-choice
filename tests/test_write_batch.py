@@ -137,6 +137,7 @@ def test_low_priority_burst_cannot_consume_reserved_selection_capacity(
         batch_size=2,
         queue_limit=4,
         batch_window_seconds=0,
+        priority_reserve=1,
     )
     slow_started = threading.Event()
     release_slow = threading.Event()
@@ -176,6 +177,81 @@ def test_low_priority_burst_cannot_consume_reserved_selection_capacity(
         with sqlite3.connect(database_path) as connection:
             values = {row[0] for row in connection.execute("SELECT value FROM events")}
         assert values == {"slow", "low-1", "low-2", "selection"}
+    finally:
+        release_slow.set()
+        writer.close()
+
+
+def test_default_writer_reserves_one_thousand_selection_slots(tmp_path: Path) -> None:
+    writer = SQLiteBatchWriter(tmp_path / "default-reserve.db")
+    try:
+        assert writer.stats()["priority_reserve"] == 1_000
+    finally:
+        writer.close()
+
+
+def test_critical_burst_displaces_queued_low_priority_jobs(tmp_path: Path) -> None:
+    database_path = tmp_path / "priority-displacement.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE events (value TEXT)")
+    writer = SQLiteBatchWriter(
+        database_path,
+        batch_size=2,
+        queue_limit=8,
+        batch_window_seconds=0,
+        priority_reserve=2,
+    )
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+
+    def insert(value: str, *, slow: bool = False):
+        def callback(connection: sqlite3.Connection) -> str:
+            if slow:
+                slow_started.set()
+                assert release_slow.wait(timeout=10)
+            connection.execute("INSERT INTO events VALUES (?)", (value,))
+            return value
+
+        return callback
+
+    try:
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            slow = pool.submit(writer.submit, insert("slow", slow=True), priority=10)
+            assert slow_started.wait(timeout=10)
+            low_futures = [
+                pool.submit(writer.submit, insert(f"low-{index}"), priority=10)
+                for index in range(5)
+            ]
+            deadline = time.monotonic() + 10
+            while writer.stats()["pending_jobs"] < 6 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert writer.stats()["pending_jobs"] == 6
+            critical_futures = [
+                pool.submit(writer.submit, insert(f"selection-{index}"), priority=0)
+                for index in range(4)
+            ]
+            deadline = time.monotonic() + 10
+            while writer.stats()["pending_jobs"] < 8 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert writer.stats()["pending_jobs"] == 8
+            release_slow.set()
+            assert slow.result(timeout=10) == "slow"
+            low_results: list[str | BaseException] = []
+            for future in low_futures:
+                try:
+                    low_results.append(future.result(timeout=10))
+                except BaseException as exc:
+                    low_results.append(exc)
+            assert sum(isinstance(value, SQLiteWriteQueueFull) for value in low_results) == 2
+            assert sorted(future.result(timeout=10) for future in critical_futures) == [
+                f"selection-{index}" for index in range(4)
+            ]
+        stats = writer.stats()
+        assert stats["jobs_evicted"] == 2
+        with sqlite3.connect(database_path) as connection:
+            values = {row[0] for row in connection.execute("SELECT value FROM events")}
+        assert {f"selection-{index}" for index in range(4)} <= values
+        assert len({value for value in values if value.startswith("low-")}) == 3
     finally:
         release_slow.set()
         writer.close()
