@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
@@ -140,14 +140,17 @@ RECEIPT_SNAPSHOT_VERSION = 1
 
 
 async def render_receipt_qr_limited(
-    slots: asyncio.Semaphore,
+    executor: ThreadPoolExecutor,
     renderer: Callable[[str], bytes],
     verify_url: str,
 ) -> bytes:
-    """Keep CPU-bound QR work bounded and outside Starlette's sync pool."""
+    """Run QR work in a cross-loop-safe executor with a hard worker bound."""
 
-    async with slots:
-        return await asyncio.to_thread(renderer, verify_url)
+    return await asyncio.get_running_loop().run_in_executor(
+        executor,
+        renderer,
+        verify_url,
+    )
 
 
 def session_utc_now() -> str:
@@ -663,7 +666,30 @@ def create_app(config: Config | None = None) -> FastAPI:
     student_login_response_gate = PrincipalResponseGate()
     public_status_cache_lock = threading.Lock()
     public_status_cache: tuple[float, dict[str, Any]] | None = None
-    receipt_qr_render_slots = asyncio.Semaphore(RECEIPT_QR_RENDER_PARALLELISM)
+    public_status_refresh: Future[dict[str, Any]] | None = None
+    executor_lock = threading.Lock()
+    public_status_executor: ThreadPoolExecutor | None = None
+    receipt_qr_executor: ThreadPoolExecutor | None = None
+
+    def get_public_status_executor() -> ThreadPoolExecutor:
+        nonlocal public_status_executor
+        with executor_lock:
+            if public_status_executor is None:
+                public_status_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="public-status",
+                )
+            return public_status_executor
+
+    def get_receipt_qr_executor() -> ThreadPoolExecutor:
+        nonlocal receipt_qr_executor
+        with executor_lock:
+            if receipt_qr_executor is None:
+                receipt_qr_executor = ThreadPoolExecutor(
+                    max_workers=RECEIPT_QR_RENDER_PARALLELISM,
+                    thread_name_prefix="receipt-qr",
+                )
+            return receipt_qr_executor
     # Resolve ``connect`` at execution time so tests and operational probes can
     # instrument the exact writer connection without bypassing the coordinator.
     sqlite_writer = SQLiteBatchWriter(
@@ -678,7 +704,8 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        nonlocal lifespan_users
+        nonlocal lifespan_users, public_status_cache, public_status_refresh
+        nonlocal public_status_executor, receipt_qr_executor
         with lifespan_lock:
             if lifespan_users == 0:
                 sqlite_writer.open()
@@ -686,10 +713,23 @@ def create_app(config: Config | None = None) -> FastAPI:
         try:
             yield
         finally:
+            executors_to_close: list[ThreadPoolExecutor] = []
             with lifespan_lock:
                 lifespan_users -= 1
                 if lifespan_users == 0:
                     sqlite_writer.close()
+                    with executor_lock:
+                        if public_status_executor is not None:
+                            executors_to_close.append(public_status_executor)
+                            public_status_executor = None
+                        if receipt_qr_executor is not None:
+                            executors_to_close.append(receipt_qr_executor)
+                            receipt_qr_executor = None
+                    with public_status_cache_lock:
+                        public_status_cache = None
+                        public_status_refresh = None
+            for executor in executors_to_close:
+                executor.shutdown(wait=True, cancel_futures=True)
 
     app = FastAPI(
         title="教学组抢选系统",
@@ -1972,26 +2012,32 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/api/health")
     async def health() -> dict[str, str]:
-        connection = connect(config.database_path)
-        try:
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            tables = {
-                row["name"]
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                ).fetchall()
-            }
-            if version != SCHEMA_VERSION or not {
-                "settings",
-                "activities",
-                "students",
-                "selections",
-            } <= tables:
-                raise RuntimeError("数据库结构未就绪")
-            current_activity(connection)
-        finally:
-            connection.close()
-        return {"status": "ok"}
+        def check_health() -> dict[str, str]:
+            connection = connect(config.database_path)
+            try:
+                version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                tables = {
+                    row["name"]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                if version != SCHEMA_VERSION or not {
+                    "settings",
+                    "activities",
+                    "students",
+                    "selections",
+                } <= tables:
+                    raise RuntimeError("数据库结构未就绪")
+                current_activity(connection)
+            finally:
+                connection.close()
+            return {"status": "ok"}
+
+        return await asyncio.get_running_loop().run_in_executor(
+            get_public_status_executor(),
+            check_health,
+        )
 
     @app.get("/api/public/info")
     def public_info() -> dict[str, Any]:
@@ -2011,32 +2057,61 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/api/public/status")
     async def public_status() -> dict[str, Any]:
-        nonlocal public_status_cache
-        now = time.monotonic()
+        nonlocal public_status_cache, public_status_refresh
+
+        def project_public_status() -> dict[str, Any]:
+            connection = connect(config.database_path)
+            try:
+                connection.execute("BEGIN")
+                settings = setting_dict(connection)
+                return {
+                    "activity_id": settings["activity_id"],
+                    "status": settings["status"],
+                    "phase": settings["phase"],
+                    "server_now": settings["server_now"],
+                    "selection_opens_at": settings["selection_opens_at"],
+                    "student_login_allowed": settings["student_login_allowed"],
+                    "status_message": settings["status_message"],
+                }
+            finally:
+                connection.close()
+
+        cached_payload: dict[str, Any] | None = None
+        refresh: Future[dict[str, Any]] | None = None
+        status_executor = get_public_status_executor()
         with public_status_cache_lock:
+            now = time.monotonic()
             cached = public_status_cache
-            if cached is None or cached[0] <= now:
-                connection = connect(config.database_path)
-                try:
-                    connection.execute("BEGIN")
-                    settings = setting_dict(connection)
-                    cached_payload = {
-                        "activity_id": settings["activity_id"],
-                        "status": settings["status"],
-                        "phase": settings["phase"],
-                        "server_now": settings["server_now"],
-                        "selection_opens_at": settings["selection_opens_at"],
-                        "student_login_allowed": settings["student_login_allowed"],
-                        "status_message": settings["status_message"],
-                    }
-                finally:
-                    connection.close()
-                public_status_cache = (
-                    now + PUBLIC_STATUS_CACHE_SECONDS,
-                    cached_payload,
-                )
-            else:
+            if cached is not None and cached[0] > now:
                 cached_payload = cached[1]
+            else:
+                refresh = public_status_refresh
+                if refresh is None:
+                    refresh = status_executor.submit(project_public_status)
+                    public_status_refresh = refresh
+
+        if cached_payload is None:
+            assert refresh is not None
+            try:
+                projected = await asyncio.shield(asyncio.wrap_future(refresh))
+            except BaseException:
+                if refresh.done():
+                    with public_status_cache_lock:
+                        if public_status_refresh is refresh:
+                            public_status_refresh = None
+                raise
+            with public_status_cache_lock:
+                if public_status_refresh is refresh:
+                    public_status_cache = (
+                        time.monotonic() + PUBLIC_STATUS_CACHE_SECONDS,
+                        projected,
+                    )
+                    public_status_refresh = None
+                cached_payload = (
+                    public_status_cache[1]
+                    if public_status_cache is not None
+                    else projected
+                )
         # Keep phase and server_now from the same database projection. The shared
         # snapshot lives for only 50 ms, well below the one-second UI resolution.
         return dict(cached_payload)
@@ -2065,7 +2140,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
         verify_url = await asyncio.to_thread(prepare_receipt_qr)
         rendered = await render_receipt_qr_limited(
-            receipt_qr_render_slots,
+            get_receipt_qr_executor(),
             receipt_qr_png_bytes,
             verify_url,
         )

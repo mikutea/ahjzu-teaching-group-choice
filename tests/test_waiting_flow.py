@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
@@ -484,15 +485,21 @@ def test_same_student_overlapping_logins_acknowledge_only_one_session(
 def test_public_status_burst_shares_one_database_projection(
     client: TestClient, monkeypatch
 ) -> None:
-    monkeypatch.setattr(main_module, "PUBLIC_STATUS_CACHE_SECONDS", 60.0)
+    monkeypatch.setattr(main_module, "PUBLIC_STATUS_CACHE_SECONDS", 0.2)
     original_connect = main_module.connect
     connection_count = 0
+    connection_threads: list[str] = []
     counter_lock = threading.Lock()
 
     def counted_connect(database_path):
         nonlocal connection_count
         with counter_lock:
             connection_count += 1
+            current_count = connection_count
+            connection_threads.append(threading.current_thread().name)
+        if current_count == 1:
+            # Longer than the TTL: expiry must start only after this projection.
+            time.sleep(0.25)
         return original_connect(database_path)
 
     monkeypatch.setattr(main_module, "connect", counted_connect)
@@ -509,7 +516,10 @@ def test_public_status_burst_shares_one_database_projection(
         start.wait(timeout=10)
         payloads = [future.result(timeout=10) for future in futures]
 
+    immediate_repeat = client.get("/api/public/status")
+    assert immediate_repeat.status_code == 200, immediate_repeat.text
     assert connection_count == 1
+    assert connection_threads == ["public-status_0"]
     assert {payload["activity_id"] for payload in payloads} == {1}
     assert all(payload["server_now"] for payload in payloads)
 
