@@ -46,10 +46,12 @@ from .security import (
     hash_password,
     new_csrf_token,
     new_session_token,
+    new_student_session_token,
     session_token_hash,
     verify_activation_ciphertext,
     verify_activation_code,
     verify_password,
+    verify_student_session_token,
 )
 from .student_identity import (
     ACTIVATION_CODE_LENGTH,
@@ -1243,6 +1245,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         token = request.cookies.get(cookie_name, "")
         if not token:
             raise HTTPException(status_code=401, detail="请先登录")
+        if role == "student" and not verify_student_session_token(
+            config.app_secret, token
+        ):
+            raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
         token_hash = session_token_hash(token)
         row = connection.execute(
             """
@@ -2346,7 +2352,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     async def student_login(payload: StudentLogin, request: Request):
         ip_key = client_key(request, "student-login-ip")
         student_ip_limiter.check(ip_key, limit=500, window_seconds=300)
-        token = new_session_token()
+        token = new_student_session_token(config.app_secret)
         csrf_token = new_csrf_token()
         family_key = student_login_principal_key(
             "student-login-account-family", payload.student_no
@@ -2599,6 +2605,8 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="请先登录")
         if not request.headers.get("X-CSRF-Token", ""):
             raise HTTPException(status_code=403, detail="请求校验失败，请刷新页面后重试")
+        if not verify_student_session_token(config.app_secret, session_token):
+            raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
         # These isolated, in-memory gates run before database admission.  The
         # shared-IP allowances cover a full 1000-student campus NAT burst plus
         # bounded retries, while fabricated cookies cannot occupy the FIFO.

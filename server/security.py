@@ -17,6 +17,8 @@ PASSWORD_SALT_BYTES = 16
 PASSWORD_DIGEST_BYTES = 32
 PASSWORD_MIN_LENGTH = 12
 PASSWORD_MAX_LENGTH = 256
+STUDENT_SESSION_TOKEN_NONCE_BYTES = 32
+STUDENT_SESSION_TOKEN_VERSION = "s1"
 
 
 def hash_password(password: str) -> str:
@@ -97,6 +99,54 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def new_session_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def new_student_session_token(app_secret: str) -> str:
+    nonce = secrets.token_urlsafe(STUDENT_SESSION_TOKEN_NONCE_BYTES)
+    signature = hmac.new(
+        app_secret.encode("utf-8"),
+        b"student-session-token-v1\0" + nonce.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{STUDENT_SESSION_TOKEN_VERSION}.{nonce}.{signature}"
+
+
+def verify_student_session_token(app_secret: str, token: object) -> bool:
+    """Validate the MAC envelope without touching session storage."""
+
+    if not isinstance(token, str):
+        return False
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    version, nonce, signature = parts
+    if (
+        version != STUDENT_SESSION_TOKEN_VERSION
+        or len(nonce) != 43
+        or len(signature) != 64
+    ):
+        return False
+    try:
+        nonce_bytes = base64.b64decode(
+            (nonce + "=").encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        bytes.fromhex(signature)
+    except (UnicodeEncodeError, ValueError, binascii.Error):
+        return False
+    if (
+        len(nonce_bytes) != STUDENT_SESSION_TOKEN_NONCE_BYTES
+        or base64.urlsafe_b64encode(nonce_bytes).decode("ascii").rstrip("=")
+        != nonce
+    ):
+        return False
+    expected = hmac.new(
+        app_secret.encode("utf-8"),
+        b"student-session-token-v1\0" + nonce.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(signature, expected)
 
 
 def session_token_hash(token: str) -> str:

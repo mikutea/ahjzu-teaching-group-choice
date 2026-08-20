@@ -20,8 +20,11 @@ from server.security import (
     activation_code_hash,
     encrypt_activation_code,
     hash_password,
+    new_session_token,
+    new_student_session_token,
     validate_password_hash,
     verify_password,
+    verify_student_session_token,
 )
 from server.student_identity import (
     StudentIdentityError,
@@ -214,6 +217,23 @@ def test_password_hash_validator_accepts_only_current_canonical_structure():
     for invalid_password in ("x" * 10, "x" * 11, "x" * 257):
         with pytest.raises(ValueError, match="12 至 256"):
             hash_password(invalid_password)
+
+
+def test_student_session_token_has_a_strict_tamper_evident_envelope(app_config):
+    token = new_student_session_token(app_config.app_secret)
+    assert verify_student_session_token(app_config.app_secret, token) is True
+    replacement = "0" if token[-1] != "0" else "1"
+    assert (
+        verify_student_session_token(
+            app_config.app_secret,
+            token[:-1] + replacement,
+        )
+        is False
+    )
+    assert (
+        verify_student_session_token(app_config.app_secret, new_session_token())
+        is False
+    )
 
 
 def test_initialization_rejects_overlong_admin_password(app_config, tmp_path):

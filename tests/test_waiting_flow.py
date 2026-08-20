@@ -768,10 +768,11 @@ def test_selection_fifo_admission_precedes_slow_session_validation(
         second.close()
 
 
-def test_selection_fabricated_cookie_is_throttled_before_writer_admission(
+def test_selection_replayed_signed_cookie_is_throttled_before_writer_admission(
     app,
     client: TestClient,
     admin_headers: dict[str, str],
+    app_config,
     monkeypatch,
 ) -> None:
     dashboard = client.get("/api/admin/dashboard").json()
@@ -786,7 +787,10 @@ def test_selection_fabricated_cookie_is_throttled_before_writer_admission(
         return await original_submit_async(callback, priority=priority)
 
     monkeypatch.setattr(writer, "submit_async", counted_submit_async)
-    client.cookies.set(main_module.STUDENT_COOKIE, "fabricated-session-token")
+    client.cookies.set(
+        main_module.STUDENT_COOKIE,
+        main_module.new_student_session_token(app_config.app_secret),
+    )
     headers = {
         "X-CSRF-Token": "fabricated-csrf-token",
         "X-Activity-ID": admin_headers["X-Activity-ID"],
@@ -813,10 +817,11 @@ def test_selection_fabricated_cookie_is_throttled_before_writer_admission(
     assert 1_000 <= main_module.STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT < 4_096
 
 
-def test_selection_fabricated_cookies_share_an_aggregate_ip_admission_limit(
+def test_selection_signed_cookies_share_an_aggregate_ip_admission_limit(
     app,
     client: TestClient,
     admin_headers: dict[str, str],
+    app_config,
     monkeypatch,
 ) -> None:
     dashboard = client.get("/api/admin/dashboard").json()
@@ -840,7 +845,7 @@ def test_selection_fabricated_cookies_share_an_aggregate_ip_admission_limit(
     for index in range(4):
         client.cookies.set(
             main_module.STUDENT_COOKIE,
-            f"fabricated-session-token-{index}",
+            main_module.new_student_session_token(app_config.app_secret),
         )
         responses.append(
             client.post(
@@ -855,6 +860,81 @@ def test_selection_fabricated_cookies_share_an_aggregate_ip_admission_limit(
         main_module.STUDENT_SELECT_RATE_WINDOW_SECONDS
     )
     assert submitted == 3
+
+
+def test_invalid_cookie_flood_does_not_charge_shared_selection_admission(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    monkeypatch,
+) -> None:
+    dashboard = client.get("/api/admin/dashboard").json()
+    major = dashboard["majors"][0]
+    group = dashboard["groups"][0]
+    student_no = "20550000996"
+    document_number = fictional_document_number("SIGNED-SELECT-SESSION")
+    imported = import_roster(
+        client,
+        admin_headers,
+        major["name"],
+        [(student_no, "Signed Session Student", document_number)],
+    )
+    assert imported.status_code == 200, imported.text
+    quota = client.put(
+        f"/api/admin/quotas/{major['id']}/{group['id']}",
+        headers=admin_headers,
+        json={"capacity": 1},
+    )
+    assert quota.status_code == 200, quota.text
+    open_selection_now(client, admin_headers)
+    student, login = login_student(
+        app,
+        student_no=student_no,
+        name="Signed Session Student",
+        activation_code=document_number[-6:],
+    )
+    writer = app.state.sqlite_writer
+    original_submit_async = writer.submit_async
+    submitted = 0
+
+    async def counted_submit_async(callback, *, priority=0):
+        nonlocal submitted
+        submitted += 1
+        return await original_submit_async(callback, priority=priority)
+
+    monkeypatch.setattr(writer, "submit_async", counted_submit_async)
+    monkeypatch.setattr(main_module, "STUDENT_SELECT_SHARED_IP_LIMIT", 1)
+    monkeypatch.setattr(main_module, "STUDENT_SELECT_SHARED_IP_REQUEST_LIMIT", 1)
+    invalid_headers = {
+        "X-CSRF-Token": "fabricated-csrf-token",
+        "X-Activity-ID": admin_headers["X-Activity-ID"],
+    }
+    try:
+        invalid_statuses = []
+        for index in range(10):
+            client.cookies.set(
+                main_module.STUDENT_COOKIE,
+                f"fabricated-session-token-{index}",
+            )
+            invalid_statuses.append(
+                client.post(
+                    "/api/student/select",
+                    headers=invalid_headers,
+                    json={"group_id": group["id"]},
+                ).status_code
+            )
+        assert invalid_statuses == [401] * 10
+        assert submitted == 0
+
+        selected = student.post(
+            "/api/student/select",
+            headers=student_headers(login, int(admin_headers["X-Activity-ID"])),
+            json={"group_id": group["id"]},
+        )
+        assert selected.status_code == 200, selected.text
+        assert submitted == 1
+    finally:
+        student.close()
 
 
 def test_overlapping_student_login_cannot_publish_a_superseded_cookie(
