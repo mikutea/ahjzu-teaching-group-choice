@@ -1710,7 +1710,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         def persist_selection(
             connection: sqlite3.Connection,
-        ) -> dict[str, Any] | None:
+        ) -> dict[str, Any]:
             activity = require_expected_activity(
                 request, connection, identity=identity
             )
@@ -1731,10 +1731,55 @@ def create_app(config: Config | None = None) -> FastAPI:
             ).fetchone()
             if not student or not student["active"] or not student["major_active"]:
                 raise HTTPException(status_code=403, detail="学生或所属专业已停用")
+
+            def committed_selection_payload(
+                *,
+                settings: dict[str, Any],
+                selection_id: int,
+                selection_group_id: int,
+                selected_at: str,
+                group_name: str,
+            ) -> dict[str, Any]:
+                receipt = build_selection_receipt(
+                    settings=settings,
+                    selection_id=selection_id,
+                    student_id=student_id,
+                    group_id=selection_group_id,
+                    selected_at=selected_at,
+                    student_no=str(student["student_no"]),
+                    student_name=str(student["name"]),
+                    major_name=str(student["major_name"]),
+                    group_name=group_name,
+                )
+                return {
+                    "server_now": settings["server_now"],
+                    "selection_opens_at": settings["selection_opens_at"],
+                    "phase": settings["phase"],
+                    "student_login_allowed": settings["student_login_allowed"],
+                    "status_message": settings["status_message"],
+                    "student": {
+                        "id": student_id,
+                        "student_no": student["student_no"],
+                        "name": student["name"],
+                        "major_id": student["major_id"],
+                        "major_name": student["major_name"],
+                    },
+                    "selection": {
+                        "group_id": selection_group_id,
+                        "selected_at": selected_at,
+                        "group_name": group_name,
+                    },
+                    "receipt": receipt,
+                    "groups": [],
+                    "settings": settings,
+                }
+
             existing = connection.execute(
                 """
-                SELECT id, group_id FROM selections
-                WHERE student_id = ? AND revoked_at IS NULL
+                SELECT se.id, se.group_id, se.selected_at, g.name AS group_name
+                FROM selections se
+                JOIN teaching_groups g ON g.id = se.group_id
+                WHERE se.student_id = ? AND se.revoked_at IS NULL
                 """,
                 (student_id,),
             ).fetchone()
@@ -1742,9 +1787,16 @@ def create_app(config: Config | None = None) -> FastAPI:
                 if source == "student" and int(existing["group_id"]) == group_id:
                     # A client may retry after losing the successful response. The
                     # unique active-selection invariant makes the same choice safe
-                    # to replay without a second insert or audit record. The full
-                    # projection is deliberately built after this transaction.
-                    return None
+                    # to replay without a second insert or audit record. Freeze the
+                    # exact committed selection while holding the writer lock so a
+                    # later administrative revocation cannot change this response.
+                    return committed_selection_payload(
+                        settings=setting_dict(connection),
+                        selection_id=int(existing["id"]),
+                        selection_group_id=int(existing["group_id"]),
+                        selected_at=str(existing["selected_at"]),
+                        group_name=str(existing["group_name"]),
+                    )
                 raise HTTPException(status_code=409, detail="你已经完成选择，不能重复提交")
             phase = activity_phase(activity)
             if source == "admin" and phase == "countdown":
@@ -1769,10 +1821,10 @@ def create_app(config: Config | None = None) -> FastAPI:
             ).fetchone()
             if not quota:
                 raise HTTPException(status_code=409, detail="该专业尚未配置此教学组配额")
-            # Receipt generation is part of the successful selection contract.  Validate
+            # Receipt generation is part of the successful selection contract. Validate
             # its trusted public origin before inserting anything so a broken setting
-            # still fails atomically, while the expensive per-student projection can be
-            # built after the short write transaction has committed.
+            # still fails atomically. The lightweight committed response is frozen below
+            # without running the full group-capacity projection.
             settings = setting_dict(connection)
             selection_receipt_public_origin(settings)
             now = utc_now()
@@ -1799,8 +1851,11 @@ def create_app(config: Config | None = None) -> FastAPI:
                 if "unique" in message:
                     replay = connection.execute(
                         """
-                        SELECT group_id FROM selections
-                        WHERE student_id = ? AND revoked_at IS NULL
+                        SELECT se.id, se.group_id, se.selected_at,
+                               g.name AS group_name
+                        FROM selections se
+                        JOIN teaching_groups g ON g.id = se.group_id
+                        WHERE se.student_id = ? AND se.revoked_at IS NULL
                         """,
                         (student_id,),
                     ).fetchone()
@@ -1809,45 +1864,25 @@ def create_app(config: Config | None = None) -> FastAPI:
                         and replay is not None
                         and int(replay["group_id"]) == group_id
                     ):
-                        return None
+                        return committed_selection_payload(
+                            settings=settings,
+                            selection_id=int(replay["id"]),
+                            selection_group_id=int(replay["group_id"]),
+                            selected_at=str(replay["selected_at"]),
+                            group_name=str(replay["group_name"]),
+                        )
                     raise HTTPException(
                         status_code=409, detail="你已经完成选择，不能重复提交"
                     ) from exc
                 raise
             selection_id = int(selection.lastrowid)
-            receipt = build_selection_receipt(
+            committed_payload = committed_selection_payload(
                 settings=settings,
                 selection_id=selection_id,
-                student_id=student_id,
-                group_id=group_id,
+                selection_group_id=group_id,
                 selected_at=now,
-                student_no=str(student["student_no"]),
-                student_name=str(student["name"]),
-                major_name=str(student["major_name"]),
                 group_name=str(group["name"]),
             )
-            committed_payload = {
-                "server_now": settings["server_now"],
-                "selection_opens_at": settings["selection_opens_at"],
-                "phase": settings["phase"],
-                "student_login_allowed": settings["student_login_allowed"],
-                "status_message": settings["status_message"],
-                "student": {
-                    "id": student_id,
-                    "student_no": student["student_no"],
-                    "name": student["name"],
-                    "major_id": student["major_id"],
-                    "major_name": student["major_name"],
-                },
-                "selection": {
-                    "group_id": group_id,
-                    "selected_at": now,
-                    "group_name": group["name"],
-                },
-                "receipt": receipt,
-                "groups": [],
-                "settings": settings,
-            }
             audit(
                 connection,
                 actor_type=source,
@@ -1859,16 +1894,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             )
             return committed_payload
 
-        committed_payload = await sqlite_writer.submit_async(
-            persist_selection, priority=0
-        )
-        if committed_payload is not None:
-            return committed_payload
-        projection_connection = connect(config.database_path)
-        try:
-            return student_payload_from_connection(projection_connection, student_id)
-        finally:
-            projection_connection.close()
+        return await sqlite_writer.submit_async(persist_selection, priority=0)
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
@@ -2250,23 +2276,38 @@ def create_app(config: Config | None = None) -> FastAPI:
             write_cutoff = (
                 parse_utc(now_text) - timedelta(seconds=HEARTBEAT_WRITE_INTERVAL_SECONDS)
             ).isoformat(timespec="seconds")
-            if not row or not row["last_seen_at"] or row["last_seen_at"] <= write_cutoff:
-                def persist_heartbeat(write_connection: sqlite3.Connection) -> None:
-                    require_expected_activity(
-                        request, write_connection, identity=identity
-                    )
-                    write_connection.execute(
-                        """
-                        UPDATE sessions SET last_seen_at = ?
-                        WHERE token_hash = ?
-                          AND (last_seen_at IS NULL OR last_seen_at <= ?)
-                        """,
-                        (now_text, identity.token_hash, write_cutoff),
-                    )
+            needs_write = (
+                not row
+                or not row["last_seen_at"]
+                or row["last_seen_at"] <= write_cutoff
+            )
+        finally:
+            connection.close()
 
-                await sqlite_writer.submit_async(persist_heartbeat, priority=10)
+        if needs_write:
+
+            def persist_heartbeat(write_connection: sqlite3.Connection) -> None:
+                require_expected_activity(
+                    request, write_connection, identity=identity
+                )
+                write_connection.execute(
+                    """
+                    UPDATE sessions SET last_seen_at = ?
+                    WHERE token_hash = ?
+                      AND (last_seen_at IS NULL OR last_seen_at <= ?)
+                    """,
+                    (now_text, identity.token_hash, write_cutoff),
+                )
+
+            await sqlite_writer.submit_async(persist_heartbeat, priority=10)
+
+        response_connection = connect(config.database_path)
+        try:
+            require_expected_activity(
+                request, response_connection, identity=identity
+            )
             has_selection = bool(
-                connection.execute(
+                response_connection.execute(
                     """
                     SELECT EXISTS(
                         SELECT 1 FROM selections
@@ -2276,7 +2317,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                     (identity.subject_id,),
                 ).fetchone()[0]
             )
-            settings = setting_dict(connection)
+            settings = setting_dict(response_connection)
             return {
                 "ok": True,
                 "has_selection": has_selection,
@@ -2287,7 +2328,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "status_message": settings["status_message"],
             }
         finally:
-            connection.close()
+            response_connection.close()
 
     @app.post("/api/student/select")
     async def student_select(payload: StudentSelect, request: Request):

@@ -53,6 +53,7 @@ class SQLiteBatchWriter:
         batch_size: int = 64,
         queue_limit: int = 4_096,
         batch_window_seconds: float = 0.004,
+        priority_reserve: int = 1_000,
         connect_factory: Callable[[Path], sqlite3.Connection] = connect,
     ) -> None:
         if batch_size < 1:
@@ -61,13 +62,15 @@ class SQLiteBatchWriter:
             raise ValueError("queue_limit must be at least batch_size")
         if batch_window_seconds < 0:
             raise ValueError("batch_window_seconds must not be negative")
+        if priority_reserve < 1:
+            raise ValueError("priority_reserve must be positive")
         self._database_path = database_path
         self._batch_size = batch_size
         self._queue_limit = queue_limit
         # Keep enough admission headroom for the seat-claim path (priority 0).
         # Lower-priority session and heartbeat traffic may use the rest of the
         # queue, but can never consume these reserved slots.
-        self._priority_reserve = min(batch_size, max(1, queue_limit // 4))
+        self._priority_reserve = min(priority_reserve, max(1, queue_limit - 1))
         self._batch_window_seconds = batch_window_seconds
         self._connect_factory = connect_factory
         self._condition = threading.Condition()
@@ -81,6 +84,7 @@ class SQLiteBatchWriter:
             "commits": 0,
             "jobs_succeeded": 0,
             "jobs_failed": 0,
+            "jobs_evicted": 0,
             "max_batch_size": 0,
             "max_queue_depth": 0,
         }
@@ -145,7 +149,24 @@ class SQLiteBatchWriter:
                 else self._queue_limit - self._priority_reserve
             )
             if pending_jobs >= admission_limit:
-                raise SQLiteWriteQueueFull("SQLite write queue is full")
+                evicted = None
+                if priority <= 0 and pending_jobs >= self._queue_limit:
+                    evicted = self._evict_queued_lower_priority(priority)
+                if evicted is None:
+                    raise SQLiteWriteQueueFull("SQLite write queue is full")
+                evicted.error = SQLiteWriteQueueFull(
+                    "SQLite write was displaced by a priority request"
+                )
+                self._stats["jobs_failed"] += 1
+                self._stats["jobs_evicted"] += 1
+                evicted.completed.set()
+                if evicted.async_loop is not None and evicted.async_future is not None:
+                    try:
+                        evicted.async_loop.call_soon_threadsafe(
+                            self._resolve_async_job, evicted
+                        )
+                    except RuntimeError:
+                        pass
             self._sequence += 1
             job = _QueuedWrite(
                 priority=priority,
@@ -166,6 +187,29 @@ class SQLiteBatchWriter:
                 )
                 self._thread.start()
             self._condition.notify()
+        return job
+
+    def _evict_queued_lower_priority(
+        self, incoming_priority: int
+    ) -> _QueuedWrite[Any] | None:
+        """Remove the least important not-yet-started job for a critical write."""
+
+        candidates = [
+            (index, job)
+            for index, job in enumerate(self._queue)
+            if job.priority > incoming_priority
+        ]
+        if not candidates:
+            return None
+        index, job = max(
+            candidates,
+            key=lambda candidate: (
+                candidate[1].priority,
+                candidate[1].sequence,
+            ),
+        )
+        self._queue.pop(index)
+        heapq.heapify(self._queue)
         return job
 
     def stats(self) -> dict[str, int]:

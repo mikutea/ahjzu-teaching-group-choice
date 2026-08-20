@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -859,11 +860,44 @@ def test_same_student_same_group_retry_is_idempotent_after_commit(
             return connection
 
         monkeypatch.setattr(main_module, "connect", traced_connect)
-        replay = student.post(
-            "/api/student/select",
-            headers=headers,
-            json={"group_id": group["id"]},
+        replay_committed = threading.Event()
+        allow_replay_response = threading.Event()
+        original_submit_async = app.state.sqlite_writer.submit_async
+
+        async def gated_submit_async(callback, *, priority=0):
+            result = await original_submit_async(callback, priority=priority)
+            replay_committed.set()
+            allowed = await asyncio.to_thread(
+                allow_replay_response.wait, 10
+            )
+            assert allowed
+            return result
+
+        monkeypatch.setattr(
+            app.state.sqlite_writer, "submit_async", gated_submit_async
         )
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                replay_future = pool.submit(
+                    student.post,
+                    "/api/student/select",
+                    headers=headers,
+                    json={"group_id": group["id"]},
+                )
+                assert replay_committed.wait(timeout=10)
+                revoked = client.post(
+                    "/api/admin/selections/revoke",
+                    headers=admin_headers,
+                    json={
+                        "student_id": first.json()["student"]["id"],
+                        "reason": "synthetic replay response race",
+                    },
+                )
+                assert revoked.status_code == 200, revoked.text
+                allow_replay_response.set()
+                replay = replay_future.result(timeout=10)
+        finally:
+            allow_replay_response.set()
         assert replay.status_code == 200, replay.text
         assert replay.json()["phase"] == "closed"
         assert replay.json()["selection"] == first.json()["selection"]
@@ -876,17 +910,16 @@ def test_same_student_same_group_retry_is_idempotent_after_commit(
             in " ".join(statement.upper().split())
             for statement in writer_statements
         )
-        assert any(
+        assert not any(
             "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY"
             in " ".join(statement.upper().split())
-            for thread_name, statements in traces
-            if thread_name != "sqlite-batch-writer"
+            for _, statements in traces
             for statement in statements
         )
         connection = connect(client.app.state.config.database_path)
         try:
             assert connection.execute(
-                "SELECT COUNT(*) FROM selections WHERE revoked_at IS NULL"
+                "SELECT COUNT(*) FROM selections"
             ).fetchone()[0] == 1
             assert connection.execute(
                 "SELECT COUNT(*) FROM audit_logs WHERE action = 'selection.create'"
@@ -1013,25 +1046,35 @@ def test_activity_rollover_cannot_race_heartbeat_into_old_activity(
         connection.close()
     heartbeat_waiting = threading.Event()
     allow_heartbeat = threading.Event()
+    initial_read_closed = threading.Event()
+    read_closed_before_writer_wait: list[bool] = []
     pause_lock = threading.Lock()
     paused_once = False
 
     class ConnectionProxy:
         def __init__(self, connection):
             self._connection = connection
+            self._saw_begin = False
 
         def execute(self, sql, parameters=()):
             nonlocal paused_once
             should_pause = False
             if sql.strip().upper() == "BEGIN IMMEDIATE":
+                self._saw_begin = True
                 with pause_lock:
                     if not paused_once:
                         paused_once = True
                         should_pause = True
             if should_pause:
+                read_closed_before_writer_wait.append(initial_read_closed.is_set())
                 heartbeat_waiting.set()
                 assert allow_heartbeat.wait(timeout=10)
             return self._connection.execute(sql, parameters)
+
+        def close(self):
+            if not self._saw_begin:
+                initial_read_closed.set()
+            return self._connection.close()
 
         def __getattr__(self, name):
             return getattr(self._connection, name)
@@ -1049,6 +1092,7 @@ def test_activity_rollover_cannot_race_heartbeat_into_old_activity(
                 headers=student_headers(login, activity_id),
             )
             assert heartbeat_waiting.wait(timeout=10)
+            assert read_closed_before_writer_wait == [True]
             rollover = client.post(
                 "/api/admin/activities",
                 headers=admin_headers,
