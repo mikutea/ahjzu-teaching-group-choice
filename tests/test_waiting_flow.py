@@ -359,6 +359,197 @@ def test_waiting_room_presence_heartbeat_and_absent_roster(
         student.close()
 
 
+def test_same_student_batched_logins_acknowledge_only_the_surviving_session(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    app_config,
+    monkeypatch,
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    major_name = dashboard["majors"][0]["name"]
+    student_no = "20520000004"
+    student_name = "Concurrent Login Student"
+    activation_seed = "SAMELOGIN"
+    imported = import_roster(
+        client,
+        admin_headers,
+        major_name,
+        [
+            (
+                student_no,
+                student_name,
+                fictional_document_number(activation_seed),
+            )
+        ],
+    )
+    assert imported.status_code == 200, imported.text
+
+    projection_threads: list[str] = []
+    original_connect = main_module.connect
+
+    class ConnectionProxy:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, parameters=()):
+            if "SELECT G.ID, G.NAME, G.TOTAL_CAPACITY" in " ".join(
+                sql.upper().split()
+            ):
+                projection_threads.append(threading.current_thread().name)
+            return self._connection.execute(sql, parameters)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    monkeypatch.setattr(
+        main_module,
+        "connect",
+        lambda path: ConnectionProxy(original_connect(path)),
+    )
+    read_time = datetime.now(UTC).replace(microsecond=0)
+    write_time = read_time + timedelta(seconds=40)
+
+    class ControlledDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = (
+                write_time
+                if threading.current_thread().name == "sqlite-batch-writer"
+                else read_time
+            )
+            return current if tz is not None else current.replace(tzinfo=None)
+
+    monkeypatch.setattr(main_module, "datetime", ControlledDateTime)
+    writer = app.state.sqlite_writer
+    original_batch_size = writer._batch_size
+    original_batch_window = writer._batch_window_seconds
+    writer._batch_size = 2
+    writer._batch_window_seconds = 10
+    students = [TestClient(app), TestClient(app)]
+    barrier = threading.Barrier(2)
+    payload = {
+        "student_no": student_no,
+        "name": student_name,
+        "activation_code": fictional_activation_code(activation_seed),
+    }
+
+    def login(student: TestClient):
+        barrier.wait(timeout=10)
+        return student.post("/api/student/login", json=payload)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(pool.map(login, students))
+        assert sorted(response.status_code for response in responses) == [200, 409]
+        winner_index = next(
+            index for index, response in enumerate(responses) if response.status_code == 200
+        )
+        loser_index = 1 - winner_index
+        assert "另一个请求替代" in responses[loser_index].json()["detail"]
+        assert students[winner_index].get("/api/student/me").status_code == 200
+        assert students[loser_index].cookies.get(main_module.STUDENT_COOKIE) is None
+        assert projection_threads
+        assert all("asyncio-portal" not in name for name in projection_threads)
+        connection = connect(app_config.database_path)
+        try:
+            sessions = connection.execute(
+                """
+                SELECT created_at FROM sessions
+                WHERE role = 'student'
+                """
+            ).fetchall()
+            assert len(sessions) == 1
+            assert sessions[0]["created_at"] == write_time.isoformat(
+                timespec="seconds"
+            )
+        finally:
+            connection.close()
+    finally:
+        writer._batch_size = original_batch_size
+        writer._batch_window_seconds = original_batch_window
+        for student in students:
+            student.close()
+
+
+def test_queued_heartbeat_uses_writer_execution_time(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    app_config,
+    monkeypatch,
+):
+    dashboard = client.get("/api/admin/dashboard").json()
+    activity_id = int(dashboard["settings"]["activity_id"])
+    major_name = dashboard["majors"][0]["name"]
+    imported = import_roster(
+        client,
+        admin_headers,
+        major_name,
+        [
+            (
+                "20520000005",
+                "Delayed Heartbeat Student",
+                fictional_document_number("LATEHEART"),
+            )
+        ],
+    )
+    assert imported.status_code == 200, imported.text
+    student, login_payload = login_student(
+        app,
+        student_no="20520000005",
+        name="Delayed Heartbeat Student",
+        activation_code=fictional_activation_code("LATEHEART"),
+    )
+    student_id = int(login_payload["student"]["id"])
+    connection = connect(app_config.database_path)
+    try:
+        connection.execute(
+            """
+            UPDATE sessions SET last_seen_at = '2000-01-01T00:00:00+00:00'
+            WHERE role = 'student' AND subject_id = ?
+            """,
+            (student_id,),
+        )
+    finally:
+        connection.close()
+
+    write_time = datetime.now(UTC).replace(microsecond=0)
+    read_time = write_time - timedelta(
+        seconds=main_module.PRESENCE_FRESH_SECONDS + 5
+    )
+
+    def controlled_utc_now() -> str:
+        current = (
+            write_time
+            if threading.current_thread().name == "sqlite-batch-writer"
+            else read_time
+        )
+        return current.isoformat(timespec="seconds")
+
+    monkeypatch.setattr(main_module, "utc_now", controlled_utc_now)
+    try:
+        heartbeat = student.post(
+            "/api/student/heartbeat",
+            headers=student_headers(login_payload, activity_id),
+        )
+        assert heartbeat.status_code == 200, heartbeat.text
+        connection = connect(app_config.database_path)
+        try:
+            last_seen_at = connection.execute(
+                """
+                SELECT last_seen_at FROM sessions
+                WHERE role = 'student' AND subject_id = ?
+                """,
+                (student_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        assert last_seen_at == write_time.isoformat(timespec="seconds")
+    finally:
+        student.close()
+
+
 def test_countdown_uses_server_clock_and_opens_atomically_without_sleeping(
     app,
     client: TestClient,

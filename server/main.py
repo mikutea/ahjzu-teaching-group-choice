@@ -2136,7 +2136,6 @@ def create_app(config: Config | None = None) -> FastAPI:
         student_ip_limiter.check(ip_key, limit=500, window_seconds=300)
         token = new_session_token()
         csrf_token = new_csrf_token()
-        now_dt = datetime.now(UTC)
         family_key = student_login_principal_key(
             "student-login-account-family", payload.student_no
         )
@@ -2157,53 +2156,56 @@ def create_app(config: Config | None = None) -> FastAPI:
                 )
             )
 
-        connection = connect(config.database_path)
-        try:
-            row = connection.execute(
-                """
-                SELECT id, student_no, name, activation_hash,
-                       activation_ciphertext, active
-                FROM students WHERE student_no = ?
-                """,
-                (payload.student_no,),
-            ).fetchone()
+        def read_login_candidate() -> sqlite3.Row | None:
+            connection = connect(config.database_path)
+            try:
+                return connection.execute(
+                    """
+                    SELECT id, student_no, name, activation_hash,
+                           activation_ciphertext, active
+                    FROM students WHERE student_no = ?
+                    """,
+                    (payload.student_no,),
+                ).fetchone()
+            finally:
+                connection.close()
 
-            if row is not None:
-                id_key = student_login_principal_key(
-                    "student-login-account-id", str(row["id"])
-                )
-                if student_id_limiter.is_limited(
-                    id_key, limit=10, window_seconds=300
-                ):
-                    family_was_limited = student_family_limiter.record_failure(
-                        family_key, limit=10, window_seconds=300
-                    )
-                    raise HTTPException(
-                        status_code=429 if family_was_limited else 401,
-                        detail=(
-                            "尝试次数过多，请稍后再试"
-                            if family_was_limited
-                            else "学号、姓名或激活码不正确"
-                        ),
-                    )
-
-            if not credentials_match(row):
+        row = await asyncio.to_thread(read_login_candidate)
+        if row is not None:
+            id_key = student_login_principal_key(
+                "student-login-account-id", str(row["id"])
+            )
+            if student_id_limiter.is_limited(
+                id_key, limit=10, window_seconds=300
+            ):
                 family_was_limited = student_family_limiter.record_failure(
                     family_key, limit=10, window_seconds=300
                 )
-                if id_key is not None:
-                    student_id_limiter.record_failure(
-                        id_key, limit=10, window_seconds=300
-                    )
-                if family_was_limited:
-                    raise HTTPException(
-                        status_code=429, detail="尝试次数过多，请稍后再试"
-                    )
                 raise HTTPException(
-                    status_code=401, detail="学号、姓名或激活码不正确"
+                    status_code=429 if family_was_limited else 401,
+                    detail=(
+                        "尝试次数过多，请稍后再试"
+                        if family_was_limited
+                        else "学号、姓名或激活码不正确"
+                    ),
                 )
-        finally:
-            connection.close()
+
+        candidate_matches = await asyncio.to_thread(credentials_match, row)
+        if not candidate_matches:
+            family_was_limited = student_family_limiter.record_failure(
+                family_key, limit=10, window_seconds=300
+            )
+            if id_key is not None:
+                student_id_limiter.record_failure(
+                    id_key, limit=10, window_seconds=300
+                )
+            if family_was_limited:
+                raise HTTPException(
+                    status_code=429, detail="尝试次数过多，请稍后再试"
+                )
+            raise HTTPException(
+                status_code=401, detail="学号、姓名或激活码不正确"
+            )
 
         candidate_id = int(row["id"])
 
@@ -2225,23 +2227,36 @@ def create_app(config: Config | None = None) -> FastAPI:
                 subject_id=student_id,
                 token=token,
                 csrf_token=csrf_token,
-                now_dt=now_dt,
+                now_dt=datetime.now(UTC),
             )
             return student_id
 
         student_id = await sqlite_writer.submit_async(
             persist_student_login, priority=5
         )
+
+        def project_committed_login() -> dict[str, Any]:
+            projection_connection = connect(config.database_path)
+            try:
+                projection_connection.execute("BEGIN")
+                session_survives = projection_connection.execute(
+                    "SELECT 1 FROM sessions WHERE token_hash = ?",
+                    (session_token_hash(token),),
+                ).fetchone()
+                if session_survives is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="本次登录已被同一账号的另一个请求替代，请重新登录",
+                    )
+                return student_payload_from_connection(
+                    projection_connection, student_id
+                )
+            finally:
+                projection_connection.close()
+
+        student_data = await asyncio.to_thread(project_committed_login)
         if id_key is not None:
             student_id_limiter.clear(id_key)
-
-        projection_connection = connect(config.database_path)
-        try:
-            student_data = student_payload_from_connection(
-                projection_connection, student_id
-            )
-        finally:
-            projection_connection.close()
         set_session_cookie(response, "student", token)
         return {"csrf_token": csrf_token, **student_data}
 
@@ -2272,14 +2287,15 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "SELECT last_seen_at FROM sessions WHERE token_hash = ?",
                 (identity.token_hash,),
             ).fetchone()
-            now_text = utc_now()
-            write_cutoff = (
-                parse_utc(now_text) - timedelta(seconds=HEARTBEAT_WRITE_INTERVAL_SECONDS)
+            read_now_text = utc_now()
+            read_cutoff = (
+                parse_utc(read_now_text)
+                - timedelta(seconds=HEARTBEAT_WRITE_INTERVAL_SECONDS)
             ).isoformat(timespec="seconds")
             needs_write = (
                 not row
                 or not row["last_seen_at"]
-                or row["last_seen_at"] <= write_cutoff
+                or row["last_seen_at"] <= read_cutoff
             )
         finally:
             connection.close()
@@ -2290,13 +2306,18 @@ def create_app(config: Config | None = None) -> FastAPI:
                 require_expected_activity(
                     request, write_connection, identity=identity
                 )
+                write_now_text = utc_now()
+                write_cutoff = (
+                    parse_utc(write_now_text)
+                    - timedelta(seconds=HEARTBEAT_WRITE_INTERVAL_SECONDS)
+                ).isoformat(timespec="seconds")
                 write_connection.execute(
                     """
                     UPDATE sessions SET last_seen_at = ?
                     WHERE token_hash = ?
                       AND (last_seen_at IS NULL OR last_seen_at <= ?)
                     """,
-                    (now_text, identity.token_hash, write_cutoff),
+                    (write_now_text, identity.token_hash, write_cutoff),
                 )
 
             await sqlite_writer.submit_async(persist_heartbeat, priority=10)
