@@ -36,6 +36,11 @@ Docker、SQLite 页缓存、`cloudflared` 与系统服务保留余量。可通�
 `SQLITE_WRITE_BATCH_WINDOW_MS` 调整批量大小、有界队列和短聚合窗口。生产默认值分别为
 64、4096、4ms；调整后必须重新进行外网全链路压测。
 
+容器把 Uvicorn 的 HTTP keep-alive 设置为 95 秒，略长于 Cloudflare Tunnel 到源站连接
+默认的 90 秒空闲保留时间。这样由 Tunnel 先淘汰空闲连接，避免分阶段高并发时复用一个
+刚被 Uvicorn 关闭的连接而向客户端返回 502。若修改 Tunnel 的 `keepAliveTimeout`，必须
+继续保持源站 keep-alive 更长，并重新执行外网全链路压测。
+
 ## 更新
 
 首次安装更新器，或需要从已审核提交刷新更新器时，先从完整指定的提交提取并校验脚本；
