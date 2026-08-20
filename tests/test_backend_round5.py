@@ -572,10 +572,13 @@ def test_untrusted_slow_imports_do_not_consume_authenticated_import_slots(
             )
             for _ in range(4)
         ]
-        for _ in range(100):
-            if middleware._active_untrusted_imports == 4:
-                break
-            await asyncio.sleep(0)
+        loop = asyncio.get_running_loop()
+        startup_deadline = loop.time() + 2
+        while (
+            middleware._active_untrusted_imports != 4
+            and loop.time() < startup_deadline
+        ):
+            await asyncio.sleep(0.01)
         assert middleware._active_untrusted_imports == 4
 
         trusted_scope = {
