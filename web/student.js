@@ -1571,6 +1571,7 @@ studentEls.confirmDialog.addEventListener("close", async () => {
 });
 
 async function performStudentLogout() {
+  const unloadWasAllowed = studentState.allowReceiptUnload;
   let serverSessionClosed = false;
   try {
     await studentApi("/api/student/logout", { method: "POST", body: JSON.stringify({}) });
@@ -1580,7 +1581,7 @@ async function performStudentLogout() {
     else showStudentMessage(`${error.message}；注销尚未完成，请保持页面打开并重试`, "error");
   }
   if (!serverSessionClosed) {
-    studentState.allowReceiptUnload = false;
+    studentState.allowReceiptUnload = unloadWasAllowed || Boolean(studentState.sessionReloadTimer);
     return false;
   }
   studentState.allowReceiptUnload = true;

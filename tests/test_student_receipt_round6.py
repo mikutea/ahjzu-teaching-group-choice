@@ -102,6 +102,7 @@ const scheduled = [];
 let reloads = 0;
 let logoutCalls = 0;
 let logoutFailure = null;
+let delayedLogoutReject = null;
 let riskPrompts = 0;
 let closeHandler = null;
 const listeners = {{}};
@@ -135,6 +136,7 @@ function studentResultCardIsReady() {{ return false; }}
 async function studentApi(path) {{
   assert.equal(path, "/api/student/logout");
   logoutCalls += 1;
+  if (logoutFailure === "delayed") return new Promise((_, reject) => {{ delayedLogoutReject = reject; }});
   if (logoutFailure) throw logoutFailure;
 }}
 
@@ -160,6 +162,22 @@ async function studentApi(path) {{
   assert.equal(failedLogout, false);
   assert.equal(studentState.allowReceiptUnload, false, "failed server logout must restore the unload guard");
   assert.equal(scheduled.length, scheduledBeforeFailure, "failed server logout must not reload the page");
+  logoutFailure = null;
+
+  studentState.allowReceiptUnload = false;
+  studentState.sessionReloadTimer = null;
+  logoutFailure = "delayed";
+  const racingLogout = performStudentLogout();
+  await Promise.resolve();
+  handleStudentSessionExpired();
+  assert.equal(studentState.allowReceiptUnload, true);
+  delayedLogoutReject(Object.assign(new Error("offline after expiry"), {{status: 0}}));
+  assert.equal(await racingLogout, false);
+  assert.equal(
+    studentState.allowReceiptUnload,
+    true,
+    "a late logout failure must not reverse the session-expiry reload bypass",
+  );
   logoutFailure = null;
 
   studentState.allowReceiptUnload = false;
