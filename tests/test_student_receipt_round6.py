@@ -353,6 +353,82 @@ function showStudentMessage() {{}}
     assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
+def test_failed_receipt_is_not_automatically_requeued_but_manual_retry_still_works() -> None:
+    javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
+    preview_source = "function resultCardPreviewKey" + javascript.split(
+        "function resultCardPreviewKey", 1
+    )[1].split("async function downloadStudentResultCard", 1)[0]
+    harness = rf"""
+const assert = require("node:assert/strict");
+const payload = {{
+  student: {{ id: 17, student_no: "20260000017", name: "测试学生", major_name: "建筑学" }},
+  selection: {{ group_id: 1, group_name: "第一教学组", selected_at: "2026-08-20T10:00:00+00:00" }},
+  receipt: {{ verification_code: "ABCD-EFGH-IJKL", qr_image_url: "/api/student/receipt/qr.png" }},
+  settings: {{ activity_id: 1, activity_title: "失败重试测试" }},
+}};
+const studentState = {{
+  payload,
+  resultCardPreviewKey: null,
+  resultCardPreviewBlob: null,
+  resultCardPreviewError: new Error("qr failed"),
+  resultCardPreviewErrorKey: null,
+  resultCardPreviewPendingKey: null,
+  resultCardPreviewPromise: null,
+  resultCardPreviewScheduledKey: null,
+  resultCardPreviewTimer: null,
+  resultCardProgressTimer: null,
+  resultCardPreviewUrl: null,
+  resultCardDownloadedKey: null,
+}};
+const studentEls = {{
+  downloadResultCard: {{ disabled: false, textContent: "重新生成凭证" }},
+  resultCardPreviewImage: {{ hidden: true, src: "" }},
+  resultCardPreviewStatus: {{ hidden: false, textContent: "生成失败" }},
+  resultCardProgress: {{ dataset: {{ state: "error" }}, setAttribute() {{}} }},
+  resultCardProgressFill: {{ style: {{ width: "0%" }} }},
+  resultCardProgressLabel: {{ textContent: "生成失败" }},
+  resultCardProgressPercent: {{ textContent: "0%" }},
+  successLogout: {{ disabled: false, textContent: "生成失败，风险退出" }},
+}};
+let timerCalls = 0;
+function setTimeout() {{ timerCalls += 1; return timerCalls; }}
+function setInterval() {{ timerCalls += 1; return timerCalls; }}
+function clearTimeout() {{}}
+function clearInterval() {{}}
+function studentMonotonicNow() {{ return 0; }}
+let generationCalls = 0;
+async function createResultCardBlob() {{ generationCalls += 1; return {{ kind: "receipt-png" }}; }}
+async function resultCardDataUrl() {{ return "data:image/png;base64,preview"; }}
+
+{preview_source}
+
+(async () => {{
+  const key = resultCardPreviewKey(payload);
+  studentState.resultCardPreviewErrorKey = key;
+  scheduleStudentResultCardPreview(payload);
+  assert.equal(timerCalls, 0, "poll rerenders must not automatically requeue a failed receipt");
+  assert.equal(studentEls.successLogout.disabled, false, "risk logout must remain continuously available");
+  assert.equal(studentEls.successLogout.textContent, "生成失败，风险退出");
+
+  const blob = await ensureStudentResultCardPreview(payload);
+  assert.equal(generationCalls, 1, "an explicit retry must still regenerate the receipt");
+  assert.equal(blob.kind, "receipt-png");
+  assert.equal(studentState.resultCardPreviewError, null);
+  assert.equal(studentState.resultCardPreviewErrorKey, null);
+  assert.equal(studentEls.resultCardProgress.dataset.state, "ready");
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+    completed = subprocess.run(
+        ["node", "-e", harness],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
 def test_signed_receipt_qr_uses_csp_compatible_decode_and_fails_closed() -> None:
     javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
     qr_loader_source = "function resultCardSameOriginImageUrl" + javascript.split(

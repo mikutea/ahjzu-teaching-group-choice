@@ -121,6 +121,7 @@ const studentState = {
   resultCardPreviewKey: null,
   resultCardPreviewBlob: null,
   resultCardPreviewError: null,
+  resultCardPreviewErrorKey: null,
   resultCardPreviewPendingKey: null,
   resultCardPreviewPromise: null,
   resultCardPreviewScheduledKey: null,
@@ -1023,6 +1024,7 @@ function scheduleStudentResultCardPreview(payload) {
     || key === studentState.resultCardPreviewKey
     || key === studentState.resultCardPreviewPendingKey
     || key === studentState.resultCardPreviewScheduledKey
+    || key === studentState.resultCardPreviewErrorKey
   ) return;
   clearStudentResultCardPreviewSchedule();
   const studentId = Number(payload?.student?.id);
@@ -1098,6 +1100,7 @@ async function ensureStudentResultCardPreview(payload) {
       if (key !== resultCardPreviewKey(studentState.payload)) return null;
       studentState.resultCardPreviewBlob = blob;
       studentState.resultCardPreviewError = null;
+      studentState.resultCardPreviewErrorKey = null;
       studentState.resultCardPreviewUrl = nextUrl;
       studentState.resultCardPreviewKey = key;
       studentEls.resultCardPreviewImage.src = nextUrl;
@@ -1108,6 +1111,7 @@ async function ensureStudentResultCardPreview(payload) {
     } catch (error) {
       if (key !== resultCardPreviewKey(studentState.payload)) return null;
       studentState.resultCardPreviewError = error;
+      studentState.resultCardPreviewErrorKey = key;
       studentEls.resultCardPreviewImage.hidden = true;
       studentEls.resultCardPreviewStatus.hidden = false;
       studentEls.resultCardPreviewStatus.textContent = error.message || "凭证预览生成失败，可点击下方按钮重试下载";
