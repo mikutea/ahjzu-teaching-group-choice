@@ -113,6 +113,7 @@ const studentState = {
   connectionInterrupted: false,
   lastBackgroundErrorAt: 0,
   sessionReloadTimer: null,
+  studentLogoutInFlight: false,
   allowReceiptUnload: false,
   lastPhase: null,
   resultCardInFlight: false,
@@ -1571,29 +1572,38 @@ studentEls.confirmDialog.addEventListener("close", async () => {
 });
 
 async function performStudentLogout() {
+  if (studentState.studentLogoutInFlight) return false;
+  studentState.studentLogoutInFlight = true;
   const unloadWasAllowed = studentState.allowReceiptUnload;
-  let serverSessionClosed = false;
   try {
-    await studentApi("/api/student/logout", { method: "POST", body: JSON.stringify({}) });
-    serverSessionClosed = true;
-  } catch (error) {
-    if (error.status === 401) serverSessionClosed = true;
-    else showStudentMessage(`${error.message}；注销尚未完成，请保持页面打开并重试`, "error");
+    let serverSessionClosed = false;
+    try {
+      await studentApi("/api/student/logout", { method: "POST", body: JSON.stringify({}) });
+      serverSessionClosed = true;
+    } catch (error) {
+      if (error.status === 401) serverSessionClosed = true;
+      else showStudentMessage(`${error.message}；注销尚未完成，请保持页面打开并重试`, "error");
+    }
+    if (!serverSessionClosed) {
+      studentState.allowReceiptUnload = unloadWasAllowed
+        || studentState.allowReceiptUnload
+        || Boolean(studentState.sessionReloadTimer);
+      return false;
+    }
+    studentState.allowReceiptUnload = true;
+    clearInterval(studentState.pollTimer);
+    clearInterval(studentState.heartbeatTimer);
+    clearStudentResultCardPreviewSchedule();
+    setTimeout(() => window.location.reload(), 0);
+    return true;
+  } finally {
+    studentState.studentLogoutInFlight = false;
   }
-  if (!serverSessionClosed) {
-    studentState.allowReceiptUnload = unloadWasAllowed || Boolean(studentState.sessionReloadTimer);
-    return false;
-  }
-  studentState.allowReceiptUnload = true;
-  clearInterval(studentState.pollTimer);
-  clearInterval(studentState.heartbeatTimer);
-  clearStudentResultCardPreviewSchedule();
-  setTimeout(() => window.location.reload(), 0);
-  return true;
 }
 
 async function studentLogout() {
   if (studentState.payload?.selection && studentState.resultCardPreviewError) {
+    studentEls.receiptExitDialog.returnValue = "";
     studentEls.receiptExitDialog.showModal();
     return;
   }

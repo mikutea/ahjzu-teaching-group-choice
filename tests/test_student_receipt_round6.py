@@ -112,6 +112,7 @@ const window = {{
 }};
 const studentState = {{
   sessionReloadTimer: null,
+  studentLogoutInFlight: false,
   pollTimer: 1,
   heartbeatTimer: 2,
   csrf: "csrf",
@@ -123,7 +124,7 @@ const studentState = {{
 const studentEls = {{
   receiptExitDialog: {{
     returnValue: "",
-    showModal() {{ riskPrompts += 1; }},
+    showModal() {{ assert.equal(this.returnValue, ""); riskPrompts += 1; }},
     addEventListener(name, handler) {{ assert.equal(name, "close"); closeHandler = handler; }},
   }},
 }};
@@ -163,6 +164,24 @@ async function studentApi(path) {{
   assert.equal(studentState.allowReceiptUnload, false, "failed server logout must restore the unload guard");
   assert.equal(scheduled.length, scheduledBeforeFailure, "failed server logout must not reload the page");
   logoutFailure = null;
+
+  studentState.allowReceiptUnload = false;
+  studentState.sessionReloadTimer = null;
+  logoutFailure = "delayed";
+  const firstOverlappingLogout = performStudentLogout();
+  await Promise.resolve();
+  const secondOverlappingLogout = await performStudentLogout();
+  assert.equal(secondOverlappingLogout, false);
+  assert.equal(logoutCalls, 3, "overlapping attempts must use only one server request");
+  studentState.allowReceiptUnload = true;
+  delayedLogoutReject(Object.assign(new Error("older request failed"), {{status: 0}}));
+  assert.equal(await firstOverlappingLogout, false);
+  assert.equal(studentState.allowReceiptUnload, true, "a late failure must preserve a newer unload permission");
+  logoutFailure = null;
+
+  studentEls.receiptExitDialog.returnValue = "confirm";
+  await studentLogout();
+  assert.equal(studentEls.receiptExitDialog.returnValue, "", "the dialog result must reset before reopening");
 
   studentState.allowReceiptUnload = false;
   studentState.sessionReloadTimer = null;
