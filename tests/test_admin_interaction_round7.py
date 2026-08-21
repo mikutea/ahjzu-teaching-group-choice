@@ -108,7 +108,7 @@ def test_structure_editor_has_one_save_summary_and_large_matrix_tools() -> None:
     assert "renderStructureSaveSummary" in javascript
     assert 'adminEls.quotaMatrix.addEventListener("paste"' in javascript
     assert 'adminApi("/api/admin/quotas/batch"' in javascript
-    assert '/assets/app.css?v=20260816-round8' in html
+    assert '/assets/app.css?v=20260822-docs1' in html
     assert '/assets/admin.js?v=20260816-round8' in html
 
 

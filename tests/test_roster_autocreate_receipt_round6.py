@@ -44,7 +44,7 @@ def test_concurrent_receipt_qr_cache_misses_share_one_render(
         return original_make_image(qr, *args, **kwargs)
 
     monkeypatch.setattr(server_main.qrcode.QRCode, "make_image", slow_make_image)
-    verify_url = "https://class.miyuo.net/receipt#token=single-flight-test"
+    verify_url = "https://choice.example.com/receipt#token=single-flight-test"
 
     def render() -> bytes:
         start.wait(timeout=10)
@@ -85,7 +85,7 @@ def test_distinct_receipt_qr_renders_are_bounded_outside_the_sync_pool() -> None
                     server_main.render_receipt_qr_limited(
                         executor,
                         render,
-                        f"https://class.miyuo.net/receipt#token={index}",
+                        f"https://choice.example.com/receipt#token={index}",
                     )
                     for index in range(20)
                 )
@@ -123,7 +123,7 @@ def test_cancelled_receipt_qr_requests_keep_running_work_charged() -> None:
                 server_main.render_receipt_qr_limited(
                     executor,
                     render,
-                    f"https://class.miyuo.net/receipt#token=cancel-{index}",
+                    f"https://choice.example.com/receipt#token=cancel-{index}",
                 )
             )
             for index in range(2)
@@ -137,7 +137,7 @@ def test_cancelled_receipt_qr_requests_keep_running_work_charged() -> None:
                 server_main.render_receipt_qr_limited(
                     executor,
                     render,
-                    f"https://class.miyuo.net/receipt#token=queued-{index}",
+                    f"https://choice.example.com/receipt#token=queued-{index}",
                 )
             )
             for index in range(2)
@@ -185,7 +185,7 @@ def test_receipt_qr_executor_is_safe_across_event_loops() -> None:
                     server_main.render_receipt_qr_limited(
                         executor,
                         render,
-                        f"https://class.miyuo.net/receipt#token={prefix}-{index}",
+                        f"https://choice.example.com/receipt#token={prefix}-{index}",
                     )
                     for index in range(8)
                 )

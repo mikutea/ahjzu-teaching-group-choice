@@ -15,7 +15,7 @@ git clone https://github.com/mikutea/ahjzu-teaching-group-choice.git /opt/ahjzu-
 cd /opt/ahjzu-teaching-group-choice
 chmod +x deploy/bootstrap.sh
 sudo APP_DIR=/opt/ahjzu-teaching-group-choice \
-  PUBLIC_URL=https://class.miyuo.net \
+  PUBLIC_URL=https://choice.example.com \
   ORIGIN_BIND=127.0.0.1 \
   ./deploy/bootstrap.sh
 ```
@@ -86,7 +86,8 @@ sudo UPDATE_TARGET="${commit}" /usr/local/sbin/teaching-choice-update
 
 ## Cloudflare Tunnel
 
-生产域名为 `https://class.miyuo.net`，使用独立的远程管理 Tunnel
+生产域名必须通过部署参数提供，本手册统一以保留示例地址
+`https://choice.example.com` 表示。使用独立的远程管理 Tunnel
 `ahjzu-teaching-choice`，源站规则指向 VM 本机 `http://127.0.0.1:80`。
 Compose 默认把宿主机 80 端口绑定到 `127.0.0.1`；Tunnel 由
 `cloudflared` 主动建立出站连接，因此不需要开放源站入站端口。
@@ -126,20 +127,20 @@ APP_NOFILE_LIMIT=8192
 SQLITE_WRITE_BATCH_SIZE=64
 SQLITE_WRITE_QUEUE_LIMIT=4096
 SQLITE_WRITE_BATCH_WINDOW_MS=4
-PUBLIC_BASE_URL=https://class.miyuo.net
+PUBLIC_BASE_URL=https://choice.example.com
 COOKIE_SECURE=true
 TRUSTED_PROXY_IPS=172.18.0.1
 ```
 
 ## HTTPS 与 HSTS
 
-先在 Cloudflare 验证 `class.miyuo.net` 始终可用 HTTPS，并启用该主机名的 HTTP 到
+先在 Cloudflare 验证 `choice.example.com` 始终可用 HTTPS，并启用该主机名的 HTTP 到
 HTTPS 跳转。Cloudflare 的 `Always Use HTTPS` 会影响同一区域中的全部主机名；只有
-`miyuo.net` 的所有站点都支持 HTTPS 时才能在区域级启用，否则应使用仅匹配
-`class.miyuo.net` 的 Redirect Rule。
+`example.com` 区域中的所有站点都支持 HTTPS 时才能在区域级启用，否则应使用仅匹配
+`choice.example.com` 的 Redirect Rule。实际配置时请把示例主机名替换为受控生产域名。
 
 为避免影响同一区域的其他子域，优先建立只匹配
-`(http.host eq "class.miyuo.net")` 的 Response Header Transform Rule，以 `Set static`
+`(http.host eq "choice.example.com")` 的 Response Header Transform Rule，以 `Set static`
 设置 `Strict-Transport-Security`。确认 Tunnel、边缘证书和恢复流程稳定后再分阶段调整：
 
 1. 先使用 `max-age=2592000`（30 天），不附加 `includeSubDomains` 或 `preload`；

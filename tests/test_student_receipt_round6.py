@@ -246,6 +246,7 @@ def test_result_preview_is_cached_and_uses_csp_compatible_data_url() -> None:
     assert ".result-card-preview__frame" in css
     assert "aspect-ratio: 9 / 16" in css
     assert "object-fit: contain" in css
+    assert ".result-card-preview__frame img[hidden] { display: none !important; }" in css
     assert '.student-body[data-student-view="success"] .student-hero { display: none; }' in css
     assert '.student-body[data-student-view="success"] .result-card-preview { width: min(34vw, 120px);' in css
     assert '.student-body[data-student-view="success"] .success-card__actions { grid-template-columns: 1fr 1fr;' in css
