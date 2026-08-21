@@ -227,6 +227,7 @@ async function studentApi(path) {{
 
 
 def test_result_preview_is_cached_and_uses_csp_compatible_data_url() -> None:
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
     javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
     css = (ROOT / "web" / "app.css").read_text(encoding="utf-8")
     preview_source = javascript.split("function resultCardPreviewKey", 1)[1].split(
@@ -250,6 +251,7 @@ def test_result_preview_is_cached_and_uses_csp_compatible_data_url() -> None:
     assert '.result-card-preview__status[data-state="pending"]::before' in css
     assert "studentEls.resultCardPreviewStatus?.dataset" in javascript
     assert "studentEls.resultCardPreviewStatus.dataset.state = state" in javascript
+    assert '/assets/student.js?v=20260822-docs1' in html
     assert '.student-body[data-student-view="success"] .student-hero { display: none; }' in css
     assert '.student-body[data-student-view="success"] .result-card-preview { width: min(34vw, 120px);' in css
     assert '.student-body[data-student-view="success"] .success-card__actions { grid-template-columns: 1fr 1fr;' in css
