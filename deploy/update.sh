@@ -374,13 +374,19 @@ PHASE="LOCAL_HEALTHY"
 
 systemctl start cloudflared.service
 systemctl is-active --quiet cloudflared.service
+PUBLIC_HEALTH_BASE="$("${COMPOSE[@]}" exec -T app python -c \
+  'from server.config import Config; from server.current_contract import normalize_public_base_url; from server.database import connect; cfg=Config.from_env(); c=connect(cfg.database_path); row=c.execute("SELECT public_base_url FROM settings WHERE id=1").fetchone(); print(normalize_public_base_url(row[0] if row and row[0] else cfg.public_base_url)); c.close()')"
+if [[ ! "${PUBLIC_HEALTH_BASE}" =~ ^https://[^/?#]+$ ]]; then
+  echo "PUBLIC_BASE_URL 必须是规范的 HTTPS 站点根地址，无法执行公网健康检查" >&2
+  exit 1
+fi
 for _ in $(seq 1 12); do
-  if curl -fsS --max-time 10 https://choice.example.com/api/health >/dev/null; then
+  if curl -fsS --max-time 10 "${PUBLIC_HEALTH_BASE}/api/health" >/dev/null; then
     break
   fi
   sleep 5
 done
-curl -fsS --max-time 10 https://choice.example.com/api/health >/dev/null
+curl -fsS --max-time 10 "${PUBLIC_HEALTH_BASE}/api/health" >/dev/null
 unit_copy="$(mktemp /run/teaching-choice-backup.service.XXXXXX)"
 sed "s|@APP_DIR@|${APP_DIR}|g" "${APP_DIR}/deploy/teaching-choice-backup.service" \
   > "${unit_copy}"

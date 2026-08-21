@@ -749,7 +749,7 @@ def test_public_base_url_accepts_only_a_canonical_site_origin(
     accepted = client.patch(
         "/api/admin/settings",
         headers=admin_headers,
-        json={"public_base_url": "HTTPS://CLASS.MIYUO.NET/"},
+        json={"public_base_url": "HTTPS://CHOICE.EXAMPLE.COM/"},
     )
     assert accepted.status_code == 200, accepted.text
     dashboard = client.get("/api/admin/dashboard").json()

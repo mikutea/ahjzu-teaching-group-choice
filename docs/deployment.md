@@ -86,7 +86,8 @@ sudo UPDATE_TARGET="${commit}" /usr/local/sbin/teaching-choice-update
 
 ## Cloudflare Tunnel
 
-生产域名为 `https://choice.example.com`，使用独立的远程管理 Tunnel
+生产域名必须通过部署参数提供，本手册统一以保留示例地址
+`https://choice.example.com` 表示。使用独立的远程管理 Tunnel
 `ahjzu-teaching-choice`，源站规则指向 VM 本机 `http://127.0.0.1:80`。
 Compose 默认把宿主机 80 端口绑定到 `127.0.0.1`；Tunnel 由
 `cloudflared` 主动建立出站连接，因此不需要开放源站入站端口。
@@ -135,8 +136,8 @@ TRUSTED_PROXY_IPS=172.18.0.1
 
 先在 Cloudflare 验证 `choice.example.com` 始终可用 HTTPS，并启用该主机名的 HTTP 到
 HTTPS 跳转。Cloudflare 的 `Always Use HTTPS` 会影响同一区域中的全部主机名；只有
-`miyuo.net` 的所有站点都支持 HTTPS 时才能在区域级启用，否则应使用仅匹配
-`choice.example.com` 的 Redirect Rule。
+`example.com` 区域中的所有站点都支持 HTTPS 时才能在区域级启用，否则应使用仅匹配
+`choice.example.com` 的 Redirect Rule。实际配置时请把示例主机名替换为受控生产域名。
 
 为避免影响同一区域的其他子域，优先建立只匹配
 `(http.host eq "choice.example.com")` 的 Response Header Transform Rule，以 `Set static`
