@@ -282,7 +282,9 @@ img { display: block; max-width: 100%; }
 .result-card-preview { width: min(100%, 240px); margin: 14px auto 10px; }
 .result-card-preview__frame { position: relative; display: grid; width: 100%; aspect-ratio: 9 / 16; place-items: center; border: 1px solid var(--rule-strong); border-radius: 15px; background: linear-gradient(145deg, #fff, var(--college-soft)); box-shadow: 0 10px 28px rgba(72,24,29,.1); overflow: hidden; }
 .result-card-preview__frame img { display: block; width: 100%; height: 100%; object-fit: contain; }
-.result-card-preview__status { margin: 0; padding: 14px; color: var(--muted); text-align: center; font-size: 11px; line-height: 1.6; }
+.result-card-preview__frame img[hidden] { display: none !important; }
+.result-card-preview__status { display: grid; justify-items: center; gap: 12px; margin: 0; padding: 14px; color: var(--muted); text-align: center; font-size: 11px; line-height: 1.6; }
+.result-card-preview__status[data-state="pending"]::before { content: ""; width: 28px; height: 28px; border: 3px solid #e1d1d3; border-top-color: var(--college); border-radius: 50%; animation: waiting-spin .9s linear infinite; }
 .result-card-preview figcaption { margin-top: 6px; color: var(--muted); text-align: center; font-size: 9px; line-height: 1.45; }
 .result-card-progress { display: grid; gap: 7px; width: min(100%, 360px); margin: 2px auto 9px; }
 .result-card-progress__track { height: 9px; overflow: hidden; border: 1px solid #dcc9cb; border-radius: 999px; background: #eee5e6; }

@@ -976,6 +976,9 @@ function setStudentResultCardProgress(value, message, state = "pending") {
     studentEls.resultCardProgress.dataset.state = state;
     studentEls.resultCardProgress.setAttribute("aria-valuenow", String(percent));
   }
+  if (studentEls.resultCardPreviewStatus?.dataset) {
+    studentEls.resultCardPreviewStatus.dataset.state = state;
+  }
   if (studentEls.resultCardProgressFill) {
     studentEls.resultCardProgressFill.style.width = `${percent}%`;
   }

@@ -726,12 +726,12 @@ def test_unicode_control_characters_are_rejected_and_xlsx_remains_usable(
     "invalid_url",
     [
         "https://",
-        "https://class.miyuo.net bad",
-        "https://user:password@class.miyuo.net",
-        "https://class.miyuo.net/admin",
-        "https://class.miyuo.net/?activity=1",
-        "https://class.miyuo.net/#board",
-        "ftp://class.miyuo.net",
+        "https://choice.example.com bad",
+        "https://user:password@choice.example.com",
+        "https://choice.example.com/admin",
+        "https://choice.example.com/?activity=1",
+        "https://choice.example.com/#board",
+        "ftp://choice.example.com",
     ],
 )
 def test_public_base_url_accepts_only_a_canonical_site_origin(
@@ -749,11 +749,11 @@ def test_public_base_url_accepts_only_a_canonical_site_origin(
     accepted = client.patch(
         "/api/admin/settings",
         headers=admin_headers,
-        json={"public_base_url": "HTTPS://CLASS.MIYUO.NET/"},
+        json={"public_base_url": "HTTPS://CHOICE.EXAMPLE.COM/"},
     )
     assert accepted.status_code == 200, accepted.text
     dashboard = client.get("/api/admin/dashboard").json()
-    assert dashboard["settings"]["public_base_url"] == "https://class.miyuo.net"
+    assert dashboard["settings"]["public_base_url"] == "https://choice.example.com"
 
 
 def test_selection_can_only_open_through_countdown_endpoint(
