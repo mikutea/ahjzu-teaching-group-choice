@@ -54,6 +54,178 @@ def test_student_result_receipt_is_mobile_portrait_and_never_contains_login_secr
     assert "证件号" not in card_source
 
 
+def test_receipt_generation_exposes_progress_and_blocks_early_exit() -> None:
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
+    css = (ROOT / "web" / "app.css").read_text(encoding="utf-8")
+    parser = ReceiptMarkupParser()
+    parser.feed(html)
+
+    progress = parser.by_id["result-card-progress"]
+    assert progress["role"] == "progressbar"
+    assert progress["aria-valuemin"] == "0"
+    assert progress["aria-valuemax"] == "100"
+    assert progress["aria-valuenow"] == "0"
+    assert "disabled" in parser.by_id["download-result-card"]
+    assert "disabled" in parser.by_id["success-logout"]
+    assert parser.by_id["receipt-exit-dialog"]["tag"] == "dialog"
+    assert parser.by_id["confirm-receipt-exit"]["value"] == "confirm"
+    assert "setStudentResultCardProgress(100" in javascript
+    assert "resultCardDownloadedKey" in javascript
+    assert "studentState.allowReceiptUnload = true" in javascript
+    assert "studentState.resultCardPreviewError" in javascript
+    assert "receiptExitDialog.showModal()" in javascript
+    assert "void performStudentLogout()" in javascript
+    assert 'window.addEventListener("beforeunload"' in javascript
+    assert "studentState.allowReceiptUnload" in javascript
+    assert "请先下载并保存抢选结果凭证，再安全退出" in javascript
+    assert "正在获取防伪二维码" in javascript
+    assert "正在编码高清图片" in javascript
+    assert ".result-card-progress__track" in css
+    assert '.result-card-progress[data-state="ready"]' in css
+
+
+def test_receipt_failure_allows_confirmed_logout_and_session_expiry_bypasses_unload_guard() -> None:
+    javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
+    expiry_source = "function handleStudentSessionExpired" + javascript.split(
+        "function handleStudentSessionExpired", 1
+    )[1].split("function studentField", 1)[0]
+    logout_source = "async function performStudentLogout" + javascript.split(
+        "async function performStudentLogout", 1
+    )[1].split("function syncStudentViewportHeight", 1)[0]
+    unload_source = 'window.addEventListener("beforeunload"' + javascript.split(
+        'window.addEventListener("beforeunload"', 1
+    )[1].split('window.addEventListener("resize"', 1)[0]
+    harness = rf"""
+const assert = require("node:assert/strict");
+const scheduled = [];
+let reloads = 0;
+let logoutCalls = 0;
+let logoutFailure = null;
+let delayedLogoutReject = null;
+let riskPrompts = 0;
+let closeHandler = null;
+const listeners = {{}};
+const window = {{
+  location: {{ reload() {{ reloads += 1; }} }},
+  addEventListener(name, handler) {{ listeners[name] = handler; }},
+}};
+const studentState = {{
+  sessionReloadTimer: null,
+  studentLogoutInFlight: false,
+  pollTimer: 1,
+  heartbeatTimer: 2,
+  csrf: "csrf",
+  allowReceiptUnload: false,
+  payload: {{ selection: {{ group_id: 1 }} }},
+  resultCardPreviewError: new Error("qr failed"),
+  resultCardDownloadedKey: null,
+}};
+const studentEls = {{
+  receiptExitDialog: {{
+    returnValue: "",
+    showModal() {{ assert.equal(this.returnValue, ""); riskPrompts += 1; }},
+    addEventListener(name, handler) {{ assert.equal(name, "close"); closeHandler = handler; }},
+  }},
+}};
+function clearInterval() {{}}
+function setTimeout(handler, delay) {{ scheduled.push({{handler, delay}}); return scheduled.length; }}
+function clearStudentResultCardPreviewSchedule() {{}}
+function showStudentMessage() {{}}
+function resultCardPreviewKey() {{ return "receipt-key"; }}
+function studentResultCardIsReady() {{ return false; }}
+async function studentApi(path) {{
+  assert.equal(path, "/api/student/logout");
+  logoutCalls += 1;
+  if (logoutFailure === "delayed") return new Promise((_, reject) => {{ delayedLogoutReject = reject; }});
+  if (logoutFailure) throw logoutFailure;
+}}
+
+{expiry_source}
+{logout_source}
+{unload_source}
+
+(async () => {{
+  await studentLogout();
+  assert.equal(riskPrompts, 1, "a failed receipt must offer an explicit risk confirmation");
+  assert.equal(logoutCalls, 0, "opening the confirmation must not log out yet");
+  studentEls.receiptExitDialog.returnValue = "confirm";
+  closeHandler();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(logoutCalls, 1);
+  assert.equal(studentState.allowReceiptUnload, true);
+
+  studentState.allowReceiptUnload = false;
+  logoutFailure = Object.assign(new Error("offline"), {{status: 0}});
+  const scheduledBeforeFailure = scheduled.length;
+  const failedLogout = await performStudentLogout();
+  assert.equal(failedLogout, false);
+  assert.equal(studentState.allowReceiptUnload, false, "failed server logout must restore the unload guard");
+  assert.equal(scheduled.length, scheduledBeforeFailure, "failed server logout must not reload the page");
+  logoutFailure = null;
+
+  studentState.allowReceiptUnload = false;
+  studentState.sessionReloadTimer = null;
+  logoutFailure = "delayed";
+  const firstOverlappingLogout = performStudentLogout();
+  await Promise.resolve();
+  const secondOverlappingLogout = await performStudentLogout();
+  assert.equal(secondOverlappingLogout, false);
+  assert.equal(logoutCalls, 3, "overlapping attempts must use only one server request");
+  studentState.allowReceiptUnload = true;
+  delayedLogoutReject(Object.assign(new Error("older request failed"), {{status: 0}}));
+  assert.equal(await firstOverlappingLogout, false);
+  assert.equal(studentState.allowReceiptUnload, true, "a late failure must preserve a newer unload permission");
+  logoutFailure = null;
+
+  studentEls.receiptExitDialog.returnValue = "confirm";
+  await studentLogout();
+  assert.equal(studentEls.receiptExitDialog.returnValue, "", "the dialog result must reset before reopening");
+
+  studentState.allowReceiptUnload = false;
+  studentState.sessionReloadTimer = null;
+  logoutFailure = "delayed";
+  const racingLogout = performStudentLogout();
+  await Promise.resolve();
+  handleStudentSessionExpired();
+  assert.equal(studentState.allowReceiptUnload, true);
+  delayedLogoutReject(Object.assign(new Error("offline after expiry"), {{status: 0}}));
+  assert.equal(await racingLogout, false);
+  assert.equal(
+    studentState.allowReceiptUnload,
+    true,
+    "a late logout failure must not reverse the session-expiry reload bypass",
+  );
+  logoutFailure = null;
+
+  studentState.allowReceiptUnload = false;
+  studentState.sessionReloadTimer = null;
+  handleStudentSessionExpired();
+  assert.equal(studentState.allowReceiptUnload, true, "expiry recovery must bypass the receipt unload warning");
+  assert.equal(studentState.csrf, "");
+
+  studentState.allowReceiptUnload = false;
+  const blocked = {{ prevented: false, returnValue: null, preventDefault() {{ this.prevented = true; }} }};
+  listeners.beforeunload(blocked);
+  assert.equal(blocked.prevented, true);
+  studentState.allowReceiptUnload = true;
+  const allowed = {{ prevented: false, returnValue: null, preventDefault() {{ this.prevented = true; }} }};
+  listeners.beforeunload(allowed);
+  assert.equal(allowed.prevented, false);
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+    completed = subprocess.run(
+        ["node", "-e", harness],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
 def test_result_preview_is_cached_and_uses_csp_compatible_data_url() -> None:
     javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
     css = (ROOT / "web" / "app.css").read_text(encoding="utf-8")
@@ -102,12 +274,19 @@ const studentState = {{
   resultCardPreviewPromise: null,
   resultCardPreviewScheduledKey: null,
   resultCardPreviewTimer: null,
+  resultCardProgressTimer: null,
   resultCardPreviewUrl: null,
+  resultCardDownloadedKey: null,
 }};
 const studentEls = {{
   downloadResultCard: {{ disabled: false, textContent: "下载抢选结果凭证" }},
   resultCardPreviewImage: {{ hidden: false, src: "" }},
   resultCardPreviewStatus: {{ hidden: true, textContent: "" }},
+  resultCardProgress: {{ dataset: {{}}, setAttribute(name, value) {{ this[name] = value; }} }},
+  resultCardProgressFill: {{ style: {{ width: "" }} }},
+  resultCardProgressLabel: {{ textContent: "" }},
+  resultCardProgressPercent: {{ textContent: "" }},
+  successLogout: {{ disabled: false, textContent: "安全退出" }},
 }};
 let generationCalls = 0;
 let releaseGeneration;
@@ -140,6 +319,8 @@ function showStudentMessage() {{}}
 (async () => {{
   const automaticPreview = ensureStudentResultCardPreview(payload);
   await Promise.resolve();
+  assert.equal(studentEls.downloadResultCard.disabled, true);
+  assert.equal(studentEls.successLogout.disabled, true);
   const manualDownload = downloadStudentResultCard();
   await Promise.resolve();
   assert.equal(generationCalls, 1, "download must join the in-flight preview render");
@@ -149,8 +330,92 @@ function showStudentMessage() {{}}
   assert.equal(studentState.resultCardPreviewBlob, generatedBlob);
   assert.equal(objectUrlCreates, 1);
   assert.equal(downloadClicks, 1);
+  assert.equal(studentState.resultCardDownloadedKey, resultCardPreviewKey(payload));
+  assert.equal(studentEls.resultCardProgress["aria-valuenow"], "100");
+  assert.equal(studentEls.resultCardProgressPercent.textContent, "100%");
+  assert.equal(studentEls.resultCardProgressLabel.textContent, "凭证已下载，可安全退出；建议同时备份到相册或文件");
+  assert.equal(studentEls.downloadResultCard.disabled, false);
+  assert.equal(studentEls.downloadResultCard.textContent, "再次下载抢选结果凭证");
+  assert.equal(studentEls.successLogout.disabled, false);
+  assert.equal(studentEls.successLogout.textContent, "安全退出");
   assert.equal(studentState.resultCardPreviewPendingKey, null);
   assert.equal(studentState.resultCardPreviewPromise, null);
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+    completed = subprocess.run(
+        ["node", "-e", harness],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+def test_failed_receipt_is_not_automatically_requeued_but_manual_retry_still_works() -> None:
+    javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
+    preview_source = "function resultCardPreviewKey" + javascript.split(
+        "function resultCardPreviewKey", 1
+    )[1].split("async function downloadStudentResultCard", 1)[0]
+    harness = rf"""
+const assert = require("node:assert/strict");
+const payload = {{
+  student: {{ id: 17, student_no: "20260000017", name: "测试学生", major_name: "建筑学" }},
+  selection: {{ group_id: 1, group_name: "第一教学组", selected_at: "2026-08-20T10:00:00+00:00" }},
+  receipt: {{ verification_code: "ABCD-EFGH-IJKL", qr_image_url: "/api/student/receipt/qr.png" }},
+  settings: {{ activity_id: 1, activity_title: "失败重试测试" }},
+}};
+const studentState = {{
+  payload,
+  resultCardPreviewKey: null,
+  resultCardPreviewBlob: null,
+  resultCardPreviewError: new Error("qr failed"),
+  resultCardPreviewErrorKey: null,
+  resultCardPreviewPendingKey: null,
+  resultCardPreviewPromise: null,
+  resultCardPreviewScheduledKey: null,
+  resultCardPreviewTimer: null,
+  resultCardProgressTimer: null,
+  resultCardPreviewUrl: null,
+  resultCardDownloadedKey: null,
+}};
+const studentEls = {{
+  downloadResultCard: {{ disabled: false, textContent: "重新生成凭证" }},
+  resultCardPreviewImage: {{ hidden: true, src: "" }},
+  resultCardPreviewStatus: {{ hidden: false, textContent: "生成失败" }},
+  resultCardProgress: {{ dataset: {{ state: "error" }}, setAttribute() {{}} }},
+  resultCardProgressFill: {{ style: {{ width: "0%" }} }},
+  resultCardProgressLabel: {{ textContent: "生成失败" }},
+  resultCardProgressPercent: {{ textContent: "0%" }},
+  successLogout: {{ disabled: false, textContent: "生成失败，风险退出" }},
+}};
+let timerCalls = 0;
+function setTimeout() {{ timerCalls += 1; return timerCalls; }}
+function setInterval() {{ timerCalls += 1; return timerCalls; }}
+function clearTimeout() {{}}
+function clearInterval() {{}}
+function studentMonotonicNow() {{ return 0; }}
+let generationCalls = 0;
+async function createResultCardBlob() {{ generationCalls += 1; return {{ kind: "receipt-png" }}; }}
+async function resultCardDataUrl() {{ return "data:image/png;base64,preview"; }}
+
+{preview_source}
+
+(async () => {{
+  const key = resultCardPreviewKey(payload);
+  studentState.resultCardPreviewErrorKey = key;
+  scheduleStudentResultCardPreview(payload);
+  assert.equal(timerCalls, 0, "poll rerenders must not automatically requeue a failed receipt");
+  assert.equal(studentEls.successLogout.disabled, false, "risk logout must remain continuously available");
+  assert.equal(studentEls.successLogout.textContent, "生成失败，风险退出");
+
+  const blob = await ensureStudentResultCardPreview(payload);
+  assert.equal(generationCalls, 1, "an explicit retry must still regenerate the receipt");
+  assert.equal(blob.kind, "receipt-png");
+  assert.equal(studentState.resultCardPreviewError, null);
+  assert.equal(studentState.resultCardPreviewErrorKey, null);
+  assert.equal(studentEls.resultCardProgress.dataset.state, "ready");
 }})().catch((error) => {{ console.error(error); process.exit(1); }});
 """
     completed = subprocess.run(
