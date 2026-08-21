@@ -123,7 +123,9 @@ const studentState = {
   resultCardPreviewPromise: null,
   resultCardPreviewScheduledKey: null,
   resultCardPreviewTimer: null,
+  resultCardProgressTimer: null,
   resultCardPreviewUrl: null,
+  resultCardDownloadedKey: null,
   serverClockEpochMs: null,
   serverClockMonotonicMs: null,
   serverClockSynchronized: false,
@@ -163,7 +165,12 @@ const studentEls = {
   successBadge: document.querySelector("#success-major-badge"),
   resultCardPreviewImage: document.querySelector("#result-card-preview-image"),
   resultCardPreviewStatus: document.querySelector("#result-card-preview-status"),
+  resultCardProgress: document.querySelector("#result-card-progress"),
+  resultCardProgressFill: document.querySelector("#result-card-progress-fill"),
+  resultCardProgressLabel: document.querySelector("#result-card-progress-label"),
+  resultCardProgressPercent: document.querySelector("#result-card-progress-percent"),
   downloadResultCard: document.querySelector("#download-result-card"),
+  successLogout: document.querySelector("#success-logout"),
   clock: document.querySelector("#student-clock"),
   clockStatus: document.querySelector("#student-clock-status"),
   clockTime: document.querySelector("#student-server-clock"),
@@ -702,11 +709,13 @@ function resultCardDataUrl(blob) {
   });
 }
 
-async function createResultCardBlob(payload) {
+async function createResultCardBlob(payload, onProgress = () => {}) {
   if (!payload?.selection || !payload?.student || !payload?.settings) {
     throw new Error("尚未读取到完整抢选结果，请刷新页面后重试");
   }
+  onProgress(30, "正在加载凭证字体与校徽…");
   if (document.fonts?.ready) await document.fonts.ready;
+  onProgress(38, "正在获取防伪二维码…");
   let verificationQr = null;
   let verificationQrReleaseRequested = false;
   const releaseVerificationQr = () => {
@@ -725,6 +734,7 @@ async function createResultCardBlob(payload) {
       return decodedQr;
     });
   const [logo] = await Promise.all([logoPromise, verificationQrPromise]);
+  onProgress(64, "防伪信息已确认，正在绘制凭证…");
   const receipt = payload.receipt || {};
   const verificationCode = String(receipt.verification_code || "").trim();
   const hasOnlineVerification = Boolean(verificationCode && receipt.verify_url);
@@ -927,7 +937,10 @@ async function createResultCardBlob(payload) {
   context.fillText("制作：Mikutea  ·  最终安排以学院正式发布结果为准", 540, 1861);
   context.textAlign = "start";
 
-  return await resultCardBlob(canvas);
+  onProgress(84, "凭证绘制完成，正在编码高清图片…");
+  const blob = await resultCardBlob(canvas);
+  onProgress(92, "高清图片已生成，正在准备预览…");
+  return blob;
   } finally {
     verificationQrReleaseRequested = true;
     releaseVerificationQr();
@@ -952,9 +965,50 @@ function resultCardPreviewKey(payload) {
 
 const RESULT_CARD_PREVIEW_SPREAD_MS = 15000;
 
+function setStudentResultCardProgress(value, message, state = "pending") {
+  const percent = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
+  if (studentEls.resultCardProgress) {
+    studentEls.resultCardProgress.dataset.state = state;
+    studentEls.resultCardProgress.setAttribute("aria-valuenow", String(percent));
+  }
+  if (studentEls.resultCardProgressFill) {
+    studentEls.resultCardProgressFill.style.width = `${percent}%`;
+  }
+  if (studentEls.resultCardProgressLabel) studentEls.resultCardProgressLabel.textContent = message;
+  if (studentEls.resultCardProgressPercent) studentEls.resultCardProgressPercent.textContent = `${percent}%`;
+
+  const ready = state === "ready";
+  const failed = state === "error";
+  const currentKey = resultCardPreviewKey(studentState.payload);
+  const downloaded = Boolean(currentKey && studentState.resultCardDownloadedKey === currentKey);
+  studentEls.downloadResultCard.disabled = !ready && !failed;
+  studentEls.downloadResultCard.textContent = ready
+    ? downloaded ? "再次下载抢选结果凭证" : "下载抢选结果凭证"
+    : failed
+      ? "重新生成凭证"
+      : `凭证准备中 ${percent}%`;
+  if (studentEls.successLogout) {
+    studentEls.successLogout.disabled = !downloaded;
+    studentEls.successLogout.textContent = downloaded
+      ? "安全退出"
+      : failed
+        ? "请先重试生成凭证"
+        : ready
+          ? "请先下载凭证"
+          : "凭证未完成，暂勿退出";
+  }
+}
+
+function studentResultCardIsReady(payload = studentState.payload) {
+  const key = resultCardPreviewKey(payload);
+  return Boolean(key && key === studentState.resultCardPreviewKey && studentState.resultCardPreviewBlob);
+}
+
 function clearStudentResultCardPreviewSchedule() {
   clearTimeout(studentState.resultCardPreviewTimer);
+  clearInterval(studentState.resultCardProgressTimer);
   studentState.resultCardPreviewTimer = null;
+  studentState.resultCardProgressTimer = null;
   studentState.resultCardPreviewScheduledKey = null;
 }
 
@@ -977,7 +1031,32 @@ function scheduleStudentResultCardPreview(payload) {
   studentEls.resultCardPreviewStatus.textContent = delay > 0
     ? "服务器已确认，防伪凭证预览将在 15 秒内自动生成…"
     : "正在生成 9:16 防伪凭证预览…";
+  const scheduledAt = studentMonotonicNow();
+  setStudentResultCardProgress(
+    delay > 0 ? 5 : 25,
+    delay > 0 ? `服务器已确认，正在排队生成凭证（预计 ${Math.ceil(delay / 1000)} 秒内开始）` : "正在启动防伪凭证生成…",
+  );
+  if (delay > 0) {
+    studentState.resultCardProgressTimer = setInterval(() => {
+      if (key !== studentState.resultCardPreviewScheduledKey) {
+        clearInterval(studentState.resultCardProgressTimer);
+        studentState.resultCardProgressTimer = null;
+        return;
+      }
+      const elapsed = Math.max(0, studentMonotonicNow() - scheduledAt);
+      const remainingSeconds = Math.max(0, Math.ceil((delay - elapsed) / 1000));
+      const queueProgress = 5 + Math.min(20, Math.floor((elapsed / delay) * 20));
+      setStudentResultCardProgress(
+        queueProgress,
+        remainingSeconds > 0
+          ? `服务器已确认，正在排队生成凭证（预计还需 ${remainingSeconds} 秒）`
+          : "排队完成，正在启动防伪凭证生成…",
+      );
+    }, 250);
+  }
   studentState.resultCardPreviewTimer = setTimeout(() => {
+    clearInterval(studentState.resultCardProgressTimer);
+    studentState.resultCardProgressTimer = null;
     studentState.resultCardPreviewTimer = null;
     studentState.resultCardPreviewScheduledKey = null;
     if (key !== resultCardPreviewKey(studentState.payload)) return;
@@ -996,13 +1075,21 @@ async function ensureStudentResultCardPreview(payload) {
   }
   studentState.resultCardPreviewPendingKey = key;
   studentState.resultCardPreviewError = null;
+  clearInterval(studentState.resultCardProgressTimer);
+  studentState.resultCardProgressTimer = null;
   studentEls.resultCardPreviewImage.hidden = true;
   studentEls.resultCardPreviewStatus.hidden = false;
   studentEls.resultCardPreviewStatus.textContent = "正在生成 9:16 凭证预览…";
+  setStudentResultCardProgress(28, "正在生成防伪凭证，请保持页面打开…");
   const previewPromise = (async () => {
     try {
-      const blob = await createResultCardBlob(payload);
+      const blob = await createResultCardBlob(payload, (progress, message) => {
+        if (key === resultCardPreviewKey(studentState.payload)) {
+          setStudentResultCardProgress(progress, message);
+        }
+      });
       if (key !== resultCardPreviewKey(studentState.payload)) return null;
+      setStudentResultCardProgress(96, "正在装载凭证预览…");
       const nextUrl = await resultCardDataUrl(blob);
       if (key !== resultCardPreviewKey(studentState.payload)) return null;
       studentState.resultCardPreviewBlob = blob;
@@ -1012,6 +1099,7 @@ async function ensureStudentResultCardPreview(payload) {
       studentEls.resultCardPreviewImage.src = nextUrl;
       studentEls.resultCardPreviewImage.hidden = false;
       studentEls.resultCardPreviewStatus.hidden = true;
+      setStudentResultCardProgress(100, "防伪凭证已就绪，请下载并妥善保存", "ready");
       return blob;
     } catch (error) {
       if (key !== resultCardPreviewKey(studentState.payload)) return null;
@@ -1019,6 +1107,7 @@ async function ensureStudentResultCardPreview(payload) {
       studentEls.resultCardPreviewImage.hidden = true;
       studentEls.resultCardPreviewStatus.hidden = false;
       studentEls.resultCardPreviewStatus.textContent = error.message || "凭证预览生成失败，可点击下方按钮重试下载";
+      setStudentResultCardProgress(0, "凭证生成失败，请点击重试；如需离开请确认未保存风险", "error");
       return null;
     } finally {
       if (studentState.resultCardPreviewPendingKey === key) {
@@ -1034,9 +1123,8 @@ async function ensureStudentResultCardPreview(payload) {
 async function downloadStudentResultCard() {
   if (studentState.resultCardInFlight) return;
   studentState.resultCardInFlight = true;
-  studentEls.downloadResultCard.disabled = true;
-  studentEls.downloadResultCard.textContent = "正在生成手机高清凭证…";
   clearStudentResultCardPreviewSchedule();
+  setStudentResultCardProgress(28, "正在生成手机高清防伪凭证，请暂勿退出…");
   try {
     const blob = await ensureStudentResultCardPreview(studentState.payload);
     if (!blob) {
@@ -1050,14 +1138,22 @@ async function downloadStudentResultCard() {
     document.body.append(anchor);
     anchor.click();
     anchor.remove();
+    studentState.resultCardDownloadedKey = resultCardPreviewKey(studentState.payload);
     setTimeout(() => URL.revokeObjectURL(objectUrl), 1500);
     showStudentMessage("抢选结果凭证已下载，请妥善保存", "success");
+    setStudentResultCardProgress(100, "凭证已下载，可安全退出；建议同时备份到相册或文件", "ready");
   } catch (error) {
     showStudentMessage(error.message || "结果卡下载失败，请稍后重试", "error");
   } finally {
     studentState.resultCardInFlight = false;
-    studentEls.downloadResultCard.disabled = false;
-    studentEls.downloadResultCard.textContent = "下载抢选结果凭证";
+    const currentKey = resultCardPreviewKey(studentState.payload);
+    if (currentKey && studentState.resultCardDownloadedKey === currentKey) {
+      setStudentResultCardProgress(100, "凭证已下载，可安全退出；建议同时备份到相册或文件", "ready");
+    } else if (studentResultCardIsReady()) {
+      setStudentResultCardProgress(100, "防伪凭证已就绪，请下载并妥善保存", "ready");
+    } else if (studentState.resultCardPreviewError) {
+      setStudentResultCardProgress(0, "凭证生成失败，请点击重试；如需离开请确认未保存风险", "error");
+    }
   }
 }
 
@@ -1472,6 +1568,17 @@ studentEls.confirmDialog.addEventListener("close", async () => {
 });
 
 async function studentLogout() {
+  if (studentState.payload?.selection && !studentResultCardIsReady()) {
+    showStudentMessage("防伪凭证仍在生成，请等待完成并下载后再退出", "error");
+    return;
+  }
+  if (
+    studentState.payload?.selection
+    && studentState.resultCardDownloadedKey !== resultCardPreviewKey(studentState.payload)
+  ) {
+    showStudentMessage("请先下载并保存抢选结果凭证，再安全退出", "error");
+    return;
+  }
   clearInterval(studentState.pollTimer);
   clearInterval(studentState.heartbeatTimer);
   clearStudentResultCardPreviewSchedule();
@@ -1509,6 +1616,14 @@ window.addEventListener("offline", () => {
 window.addEventListener("online", () => {
   renderStudentServerClock();
   showStudentMessage("网络已恢复，正在重新同步服务器状态", "info");
+});
+window.addEventListener("beforeunload", (event) => {
+  if (
+    !studentState.payload?.selection
+    || studentState.resultCardDownloadedKey === resultCardPreviewKey(studentState.payload)
+  ) return;
+  event.preventDefault();
+  event.returnValue = "";
 });
 window.addEventListener("resize", syncStudentViewportHeight, { passive: true });
 window.visualViewport?.addEventListener("resize", syncStudentViewportHeight, { passive: true });

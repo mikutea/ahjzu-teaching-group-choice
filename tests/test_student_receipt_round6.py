@@ -54,6 +54,30 @@ def test_student_result_receipt_is_mobile_portrait_and_never_contains_login_secr
     assert "证件号" not in card_source
 
 
+def test_receipt_generation_exposes_progress_and_blocks_early_exit() -> None:
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
+    css = (ROOT / "web" / "app.css").read_text(encoding="utf-8")
+    parser = ReceiptMarkupParser()
+    parser.feed(html)
+
+    progress = parser.by_id["result-card-progress"]
+    assert progress["role"] == "progressbar"
+    assert progress["aria-valuemin"] == "0"
+    assert progress["aria-valuemax"] == "100"
+    assert progress["aria-valuenow"] == "0"
+    assert "disabled" in parser.by_id["download-result-card"]
+    assert "disabled" in parser.by_id["success-logout"]
+    assert "setStudentResultCardProgress(100" in javascript
+    assert "resultCardDownloadedKey" in javascript
+    assert 'window.addEventListener("beforeunload"' in javascript
+    assert "请先下载并保存抢选结果凭证，再安全退出" in javascript
+    assert "正在获取防伪二维码" in javascript
+    assert "正在编码高清图片" in javascript
+    assert ".result-card-progress__track" in css
+    assert '.result-card-progress[data-state="ready"]' in css
+
+
 def test_result_preview_is_cached_and_uses_csp_compatible_data_url() -> None:
     javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
     css = (ROOT / "web" / "app.css").read_text(encoding="utf-8")
@@ -102,12 +126,19 @@ const studentState = {{
   resultCardPreviewPromise: null,
   resultCardPreviewScheduledKey: null,
   resultCardPreviewTimer: null,
+  resultCardProgressTimer: null,
   resultCardPreviewUrl: null,
+  resultCardDownloadedKey: null,
 }};
 const studentEls = {{
   downloadResultCard: {{ disabled: false, textContent: "下载抢选结果凭证" }},
   resultCardPreviewImage: {{ hidden: false, src: "" }},
   resultCardPreviewStatus: {{ hidden: true, textContent: "" }},
+  resultCardProgress: {{ dataset: {{}}, setAttribute(name, value) {{ this[name] = value; }} }},
+  resultCardProgressFill: {{ style: {{ width: "" }} }},
+  resultCardProgressLabel: {{ textContent: "" }},
+  resultCardProgressPercent: {{ textContent: "" }},
+  successLogout: {{ disabled: false, textContent: "安全退出" }},
 }};
 let generationCalls = 0;
 let releaseGeneration;
@@ -140,6 +171,8 @@ function showStudentMessage() {{}}
 (async () => {{
   const automaticPreview = ensureStudentResultCardPreview(payload);
   await Promise.resolve();
+  assert.equal(studentEls.downloadResultCard.disabled, true);
+  assert.equal(studentEls.successLogout.disabled, true);
   const manualDownload = downloadStudentResultCard();
   await Promise.resolve();
   assert.equal(generationCalls, 1, "download must join the in-flight preview render");
@@ -149,6 +182,14 @@ function showStudentMessage() {{}}
   assert.equal(studentState.resultCardPreviewBlob, generatedBlob);
   assert.equal(objectUrlCreates, 1);
   assert.equal(downloadClicks, 1);
+  assert.equal(studentState.resultCardDownloadedKey, resultCardPreviewKey(payload));
+  assert.equal(studentEls.resultCardProgress["aria-valuenow"], "100");
+  assert.equal(studentEls.resultCardProgressPercent.textContent, "100%");
+  assert.equal(studentEls.resultCardProgressLabel.textContent, "凭证已下载，可安全退出；建议同时备份到相册或文件");
+  assert.equal(studentEls.downloadResultCard.disabled, false);
+  assert.equal(studentEls.downloadResultCard.textContent, "再次下载抢选结果凭证");
+  assert.equal(studentEls.successLogout.disabled, false);
+  assert.equal(studentEls.successLogout.textContent, "安全退出");
   assert.equal(studentState.resultCardPreviewPendingKey, null);
   assert.equal(studentState.resultCardPreviewPromise, null);
 }})().catch((error) => {{ console.error(error); process.exit(1); }});
