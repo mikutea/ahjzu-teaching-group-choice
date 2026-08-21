@@ -101,6 +101,7 @@ const assert = require("node:assert/strict");
 const scheduled = [];
 let reloads = 0;
 let logoutCalls = 0;
+let logoutFailure = null;
 let riskPrompts = 0;
 let closeHandler = null;
 const listeners = {{}};
@@ -131,7 +132,11 @@ function clearStudentResultCardPreviewSchedule() {{}}
 function showStudentMessage() {{}}
 function resultCardPreviewKey() {{ return "receipt-key"; }}
 function studentResultCardIsReady() {{ return false; }}
-async function studentApi(path) {{ assert.equal(path, "/api/student/logout"); logoutCalls += 1; }}
+async function studentApi(path) {{
+  assert.equal(path, "/api/student/logout");
+  logoutCalls += 1;
+  if (logoutFailure) throw logoutFailure;
+}}
 
 {expiry_source}
 {logout_source}
@@ -147,6 +152,15 @@ async function studentApi(path) {{ assert.equal(path, "/api/student/logout"); lo
   await Promise.resolve();
   assert.equal(logoutCalls, 1);
   assert.equal(studentState.allowReceiptUnload, true);
+
+  studentState.allowReceiptUnload = false;
+  logoutFailure = Object.assign(new Error("offline"), {{status: 0}});
+  const scheduledBeforeFailure = scheduled.length;
+  const failedLogout = await performStudentLogout();
+  assert.equal(failedLogout, false);
+  assert.equal(studentState.allowReceiptUnload, false, "failed server logout must restore the unload guard");
+  assert.equal(scheduled.length, scheduledBeforeFailure, "failed server logout must not reload the page");
+  logoutFailure = null;
 
   studentState.allowReceiptUnload = false;
   studentState.sessionReloadTimer = null;

@@ -1571,20 +1571,24 @@ studentEls.confirmDialog.addEventListener("close", async () => {
 });
 
 async function performStudentLogout() {
+  let serverSessionClosed = false;
+  try {
+    await studentApi("/api/student/logout", { method: "POST", body: JSON.stringify({}) });
+    serverSessionClosed = true;
+  } catch (error) {
+    if (error.status === 401) serverSessionClosed = true;
+    else showStudentMessage(`${error.message}；注销尚未完成，请保持页面打开并重试`, "error");
+  }
+  if (!serverSessionClosed) {
+    studentState.allowReceiptUnload = false;
+    return false;
+  }
   studentState.allowReceiptUnload = true;
   clearInterval(studentState.pollTimer);
   clearInterval(studentState.heartbeatTimer);
   clearStudentResultCardPreviewSchedule();
-  let reloadDelay = 0;
-  try {
-    await studentApi("/api/student/logout", { method: "POST", body: JSON.stringify({}) });
-  } catch (error) {
-    if (error.status !== 401) {
-      reloadDelay = 900;
-      showStudentMessage(`${error.message}；本机页面仍将退出`, "error");
-    }
-  }
-  setTimeout(() => window.location.reload(), reloadDelay);
+  setTimeout(() => window.location.reload(), 0);
+  return true;
 }
 
 async function studentLogout() {
