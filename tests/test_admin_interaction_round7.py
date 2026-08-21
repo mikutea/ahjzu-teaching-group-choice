@@ -46,6 +46,14 @@ def test_origin_keep_alive_outlives_cloudflare_tunnel_idle_pool() -> None:
     assert '"--timeout-keep-alive", "95"' in dockerfile
 
 
+def test_update_public_health_gate_uses_the_persisted_student_origin() -> None:
+    script = (ROOT / "deploy" / "update.sh").read_text(encoding="utf-8")
+
+    assert 'SELECT public_base_url FROM settings WHERE id=1' in script
+    assert "normalize_public_base_url(row[0] if row and row[0] else cfg.public_base_url)" in script
+    assert '"${PUBLIC_HEALTH_BASE}/api/health"' in script
+
+
 def test_bootstrap_never_persists_the_plaintext_admin_password() -> None:
     script = (ROOT / "deploy" / "bootstrap.sh").read_text(encoding="utf-8")
 
