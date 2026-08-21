@@ -158,6 +158,18 @@
     </form>
   </dialog>
 
+  <dialog id="receipt-exit-dialog" class="confirm-dialog">
+    <form method="dialog">
+      <p class="eyebrow">SAVE WARNING</p>
+      <h2>凭证尚未保存，仍要退出？</h2>
+      <p>当前设备无法生成防伪凭证。退出会注销本机登录，但不会撤销已经提交的选择；请尽快联系老师，以系统导出记录为准。</p>
+      <div class="dialog-actions">
+        <button class="button button--quiet" value="cancel">返回重试</button>
+        <button id="confirm-receipt-exit" class="button button--danger" value="confirm">确认注销并退出</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="/assets/student.js?v=20260821-round8" defer></script>
 </body>
 </html>

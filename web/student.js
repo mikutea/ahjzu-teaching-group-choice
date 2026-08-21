@@ -113,6 +113,7 @@ const studentState = {
   connectionInterrupted: false,
   lastBackgroundErrorAt: 0,
   sessionReloadTimer: null,
+  allowReceiptUnload: false,
   lastPhase: null,
   resultCardInFlight: false,
   resultCardLogoPromise: null,
@@ -160,6 +161,7 @@ const studentEls = {
   message: document.querySelector("#student-message"),
   confirmDialog: document.querySelector("#confirm-dialog"),
   confirmGroupName: document.querySelector("#confirm-group-name"),
+  receiptExitDialog: document.querySelector("#receipt-exit-dialog"),
   successMessage: document.querySelector("#success-message"),
   successTime: document.querySelector("#success-time"),
   successBadge: document.querySelector("#success-major-badge"),
@@ -361,6 +363,7 @@ function handleStudentSessionExpired() {
   clearInterval(studentState.pollTimer);
   clearInterval(studentState.heartbeatTimer);
   studentState.csrf = "";
+  studentState.allowReceiptUnload = true;
   showStudentMessage("登录会话已失效，即将返回身份核验页", "error");
   studentState.sessionReloadTimer = setTimeout(() => window.location.reload(), 1200);
 }
@@ -988,11 +991,11 @@ function setStudentResultCardProgress(value, message, state = "pending") {
       ? "重新生成凭证"
       : `凭证准备中 ${percent}%`;
   if (studentEls.successLogout) {
-    studentEls.successLogout.disabled = !downloaded;
+    studentEls.successLogout.disabled = !downloaded && !failed;
     studentEls.successLogout.textContent = downloaded
       ? "安全退出"
       : failed
-        ? "请先重试生成凭证"
+        ? "生成失败，风险退出"
         : ready
           ? "请先下载凭证"
           : "凭证未完成，暂勿退出";
@@ -1567,18 +1570,8 @@ studentEls.confirmDialog.addEventListener("close", async () => {
   }
 });
 
-async function studentLogout() {
-  if (studentState.payload?.selection && !studentResultCardIsReady()) {
-    showStudentMessage("防伪凭证仍在生成，请等待完成并下载后再退出", "error");
-    return;
-  }
-  if (
-    studentState.payload?.selection
-    && studentState.resultCardDownloadedKey !== resultCardPreviewKey(studentState.payload)
-  ) {
-    showStudentMessage("请先下载并保存抢选结果凭证，再安全退出", "error");
-    return;
-  }
+async function performStudentLogout() {
+  studentState.allowReceiptUnload = true;
   clearInterval(studentState.pollTimer);
   clearInterval(studentState.heartbeatTimer);
   clearStudentResultCardPreviewSchedule();
@@ -1593,6 +1586,29 @@ async function studentLogout() {
   }
   setTimeout(() => window.location.reload(), reloadDelay);
 }
+
+async function studentLogout() {
+  if (studentState.payload?.selection && studentState.resultCardPreviewError) {
+    studentEls.receiptExitDialog.showModal();
+    return;
+  }
+  if (studentState.payload?.selection && !studentResultCardIsReady()) {
+    showStudentMessage("防伪凭证仍在生成，请等待完成并下载后再退出", "error");
+    return;
+  }
+  if (
+    studentState.payload?.selection
+    && studentState.resultCardDownloadedKey !== resultCardPreviewKey(studentState.payload)
+  ) {
+    showStudentMessage("请先下载并保存抢选结果凭证，再安全退出", "error");
+    return;
+  }
+  await performStudentLogout();
+}
+
+studentEls.receiptExitDialog.addEventListener("close", () => {
+  if (studentEls.receiptExitDialog.returnValue === "confirm") void performStudentLogout();
+});
 
 function syncStudentViewportHeight() {
   const viewportHeight = Math.round(window.visualViewport?.height || window.innerHeight || 0);
@@ -1619,6 +1635,8 @@ window.addEventListener("online", () => {
 });
 window.addEventListener("beforeunload", (event) => {
   if (
+    studentState.allowReceiptUnload
+    ||
     !studentState.payload?.selection
     || studentState.resultCardDownloadedKey === resultCardPreviewKey(studentState.payload)
   ) return;

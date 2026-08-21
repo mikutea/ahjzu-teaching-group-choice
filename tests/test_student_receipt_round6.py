@@ -68,14 +68,111 @@ def test_receipt_generation_exposes_progress_and_blocks_early_exit() -> None:
     assert progress["aria-valuenow"] == "0"
     assert "disabled" in parser.by_id["download-result-card"]
     assert "disabled" in parser.by_id["success-logout"]
+    assert parser.by_id["receipt-exit-dialog"]["tag"] == "dialog"
+    assert parser.by_id["confirm-receipt-exit"]["value"] == "confirm"
     assert "setStudentResultCardProgress(100" in javascript
     assert "resultCardDownloadedKey" in javascript
+    assert "studentState.allowReceiptUnload = true" in javascript
+    assert "studentState.resultCardPreviewError" in javascript
+    assert "receiptExitDialog.showModal()" in javascript
+    assert "void performStudentLogout()" in javascript
     assert 'window.addEventListener("beforeunload"' in javascript
+    assert "studentState.allowReceiptUnload" in javascript
     assert "请先下载并保存抢选结果凭证，再安全退出" in javascript
     assert "正在获取防伪二维码" in javascript
     assert "正在编码高清图片" in javascript
     assert ".result-card-progress__track" in css
     assert '.result-card-progress[data-state="ready"]' in css
+
+
+def test_receipt_failure_allows_confirmed_logout_and_session_expiry_bypasses_unload_guard() -> None:
+    javascript = (ROOT / "web" / "student.js").read_text(encoding="utf-8")
+    expiry_source = "function handleStudentSessionExpired" + javascript.split(
+        "function handleStudentSessionExpired", 1
+    )[1].split("function studentField", 1)[0]
+    logout_source = "async function performStudentLogout" + javascript.split(
+        "async function performStudentLogout", 1
+    )[1].split("function syncStudentViewportHeight", 1)[0]
+    unload_source = 'window.addEventListener("beforeunload"' + javascript.split(
+        'window.addEventListener("beforeunload"', 1
+    )[1].split('window.addEventListener("resize"', 1)[0]
+    harness = rf"""
+const assert = require("node:assert/strict");
+const scheduled = [];
+let reloads = 0;
+let logoutCalls = 0;
+let riskPrompts = 0;
+let closeHandler = null;
+const listeners = {{}};
+const window = {{
+  location: {{ reload() {{ reloads += 1; }} }},
+  addEventListener(name, handler) {{ listeners[name] = handler; }},
+}};
+const studentState = {{
+  sessionReloadTimer: null,
+  pollTimer: 1,
+  heartbeatTimer: 2,
+  csrf: "csrf",
+  allowReceiptUnload: false,
+  payload: {{ selection: {{ group_id: 1 }} }},
+  resultCardPreviewError: new Error("qr failed"),
+  resultCardDownloadedKey: null,
+}};
+const studentEls = {{
+  receiptExitDialog: {{
+    returnValue: "",
+    showModal() {{ riskPrompts += 1; }},
+    addEventListener(name, handler) {{ assert.equal(name, "close"); closeHandler = handler; }},
+  }},
+}};
+function clearInterval() {{}}
+function setTimeout(handler, delay) {{ scheduled.push({{handler, delay}}); return scheduled.length; }}
+function clearStudentResultCardPreviewSchedule() {{}}
+function showStudentMessage() {{}}
+function resultCardPreviewKey() {{ return "receipt-key"; }}
+function studentResultCardIsReady() {{ return false; }}
+async function studentApi(path) {{ assert.equal(path, "/api/student/logout"); logoutCalls += 1; }}
+
+{expiry_source}
+{logout_source}
+{unload_source}
+
+(async () => {{
+  await studentLogout();
+  assert.equal(riskPrompts, 1, "a failed receipt must offer an explicit risk confirmation");
+  assert.equal(logoutCalls, 0, "opening the confirmation must not log out yet");
+  studentEls.receiptExitDialog.returnValue = "confirm";
+  closeHandler();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(logoutCalls, 1);
+  assert.equal(studentState.allowReceiptUnload, true);
+
+  studentState.allowReceiptUnload = false;
+  studentState.sessionReloadTimer = null;
+  handleStudentSessionExpired();
+  assert.equal(studentState.allowReceiptUnload, true, "expiry recovery must bypass the receipt unload warning");
+  assert.equal(studentState.csrf, "");
+
+  studentState.allowReceiptUnload = false;
+  const blocked = {{ prevented: false, returnValue: null, preventDefault() {{ this.prevented = true; }} }};
+  listeners.beforeunload(blocked);
+  assert.equal(blocked.prevented, true);
+  studentState.allowReceiptUnload = true;
+  const allowed = {{ prevented: false, returnValue: null, preventDefault() {{ this.prevented = true; }} }};
+  listeners.beforeunload(allowed);
+  assert.equal(allowed.prevented, false);
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+    completed = subprocess.run(
+        ["node", "-e", harness],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 def test_result_preview_is_cached_and_uses_csp_compatible_data_url() -> None:
