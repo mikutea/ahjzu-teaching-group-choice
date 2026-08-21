@@ -14,7 +14,7 @@
 
 **无需安装 App · 服务端统一倒计时 · 原子名额判定 · 防伪结果凭证 · WPS 友好导出**
 
-[在线入口](https://class.miyuo.net/) · [部署手册](docs/deployment.md) · [并发架构](docs/architecture.md) · [安全说明](SECURITY.md)
+[在线入口](https://class.miyuo.net/) · [学生端操作说明](docs/manuals/student-guide.md) · [管理端操作说明](docs/manuals/admin-guide.md) · [部署手册](docs/deployment.md) · [并发架构](docs/architecture.md) · [安全说明](SECURITY.md)
 
 </div>
 
@@ -50,6 +50,18 @@
     </td>
   </tr>
 </table>
+
+## 图文操作手册
+
+仓库提供两份按实际角色拆分的详细说明，界面风格沿用系统的学院酒红、米白与暖灰红视觉体系：
+
+| 手册 | 内容 | 截图基准 |
+| --- | --- | --- |
+| [学生端操作说明](docs/manuals/student-guide.md) | 身份核验、候场、统一倒计时、选组、二次确认、凭证生成进度与下载保存 | iPhone 15 Pro，1179 × 2556 输出 |
+| [管理端操作说明](docs/manuals/admin-guide.md) | 活动准备、配额、名单、激活码、候场、倒计时、实时大屏、补位撤销、导出与手机管理 | 4K 3840 × 2160 + iPhone 15 Pro |
+
+> [!NOTE]
+> 操作手册截图均采自隔离演示环境，全部姓名、学号、激活码和选择结果均为虚构数据。每张图片带有固定演示水印，即使图片被单独转发也不会被误认为真实业务记录。
 
 ## 一次完整抢选如何运行
 
@@ -299,7 +311,7 @@ docker compose exec app python -m server.maintenance check
 ├─ assets/brand/           学院品牌素材（不属于 MIT 授权范围）
 ├─ deploy/                 首次部署、Cloudflare Tunnel、备份与更新脚本
 ├─ design/                 README 使用的当前真实界面截图
-├─ docs/                   需求、并发架构与独立虚拟机部署文档
+├─ docs/                   操作手册、需求、并发架构与独立虚拟机部署文档
 ├─ server/                 FastAPI、SQLite、名单解析、导出、安全与维护逻辑
 ├─ tests/                  运行时生成虚构数据的回归与并发测试
 ├─ web/                    学生端、管理端、实时大屏和凭证核验前端
